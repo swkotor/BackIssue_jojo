@@ -682,13 +682,23 @@
             {/each}
             {#if isTrusted()}
               {@const ws = s.watchState || (s.monitored ? 'watched' : 'paused')}
-              <span class="wstate-chip wstate-chip--{ws}"
-                title={ws === 'watched' ? 'Watched — new issues are wanted automatically'
-                  : ws === 'paused' ? 'Paused — issues already wanted stay wanted, new ones are not added'
-                  : 'Unwatched — nothing in this series is wanted'}>
-                <span class="wstate-chip__sym">{#if ws === 'watched'}▶{:else if ws === 'paused'}❚❚{:else}▬{/if}</span>
-                {ws}
-              </span>
+              {#if can('library.manage')}
+                <div class="wsbtns" role="group" aria-label="Series status">
+                  <button class="wsbtn wsbtn--watched" class:is-on={ws === 'watched'}
+                    title="Watched — new issues are wanted automatically and searched for"
+                    onclick={() => setWatchState('watched')}><span class="wsbtn__sym">▶</span> Watched</button>
+                  <button class="wsbtn wsbtn--paused" class:is-on={ws === 'paused'}
+                    title="Paused — issues already wanted stay wanted, new ones are not added"
+                    onclick={() => setWatchState('paused')}><span class="wsbtn__sym wsbtn__sym--pause">❚❚</span> Paused</button>
+                  <button class="wsbtn wsbtn--unwatched" class:is-on={ws === 'unwatched'}
+                    title="Unwatched — nothing in this series is wanted"
+                    onclick={() => setWatchState('unwatched')}><span class="wsbtn__sym">▬</span> Unwatched</button>
+                </div>
+              {:else}
+                <span class="wstate-chip wstate-chip--{ws}">
+                  <span class="wstate-chip__sym">{#if ws === 'watched'}▶{:else if ws === 'paused'}❚❚{:else}▬{/if}</span>{ws}
+                </span>
+              {/if}
               <button id="follow-btn" class="btn btn--ghost" class:is-following={!!s.followed} onclick={toggleFollow}>{#if s.followed}<Icon name="star" fill /> Following{:else}<Icon name="star" /> Follow{/if}</button>
             {/if}
             <!-- Secondary/destructive actions live in one overflow menu — the
@@ -700,17 +710,7 @@
                 {#if moreOpen}
                   <div class="series-more__menu" role="menu">
                     {#if !isLocal && can('library.manage')}
-                      {@const ws = s.watchState || (s.monitored ? 'watched' : 'paused')}
-                      <div class="menu__label">Status</div>
-                      <button class="menu__item" role="menuitem" class:is-on={ws === 'watched'}
-                        title="Watched — new issues are automatically wanted and will be searched for"
-                        onclick={() => { moreOpen = false; setWatchState('watched'); }}><Icon name="download" /> Watched{ws === 'watched' ? ' ✓' : ''}</button>
-                      <button class="menu__item" role="menuitem" class:is-on={ws === 'paused'}
-                        title="Paused — issues already wanted stay wanted, but new issues are not added"
-                        onclick={() => { moreOpen = false; setWatchState('paused'); }}><Icon name="clock" /> Paused{ws === 'paused' ? ' ✓' : ''}</button>
-                      <button class="menu__item" role="menuitem" class:is-on={ws === 'unwatched'}
-                        title="Unwatched — no issue of this series is wanted"
-                        onclick={() => { moreOpen = false; setWatchState('unwatched'); }}><Icon name="x" /> Unwatched{ws === 'unwatched' ? ' ✓' : ''}</button>
+
                     {/if}
                     {#if isTrusted()}
                       {#if !isLocal}
@@ -910,7 +910,8 @@
                       ? (i.wantOverride === 'wanted' ? 'Wanted (pinned on this issue) — click to stop wanting it' : 'Wanted via the series status — click to skip this issue')
                       : (i.wantOverride === 'skipped' ? 'Not wanted (pinned) — click to want it' : 'Not wanted — click to want this issue')}
                     onclick={(e) => { e.stopPropagation(); toggleWanted(i); }}>
-                    <Icon name="star" fill={!!i.wanted} size={14} />
+                    <Icon name="star" fill={!!i.wanted} size={13} />
+                    <span class="issue__want-lbl">{i.wanted ? 'Wanted' : 'Want'}</span>
                   </button>
                 {/if}
                 {#if i.corrupt && can('downloads.grab')}
@@ -960,7 +961,26 @@
 </section>
 
 <style>
-  /* fork: series watch-state chip */
+  /* fork: series status buttons — green ▶ watched, amber ❚❚ paused, red ▬ unwatched */
+  .wsbtns { display: inline-flex; gap: 6px; align-self: center; margin-right: 8px; }
+  .wsbtn {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 9px 15px; border-radius: 10px; cursor: pointer;
+    font-size: 12.5px; font-weight: 700; letter-spacing: .03em; text-transform: uppercase;
+    border: 2px solid var(--line, #2a2e3b); background: transparent; color: var(--muted, #8b90a0);
+  }
+  .wsbtn__sym { font-size: 16px; line-height: 1; }
+  .wsbtn__sym--pause { font-size: 12px; letter-spacing: -1px; }
+  .wsbtn:hover { color: var(--text, #e8eaf0); }
+  .wsbtn--watched:hover { border-color: rgba(52,211,153,.55); color: #34d399; }
+  .wsbtn--paused:hover { border-color: rgba(251,191,36,.55); color: #fbbf24; }
+  .wsbtn--unwatched:hover { border-color: rgba(248,113,113,.55); color: #f87171; }
+  /* active state: solid colour so the current status reads at a glance */
+  .wsbtn--watched.is-on { background: #34d399; border-color: #34d399; color: #06281d; }
+  .wsbtn--paused.is-on { background: #fbbf24; border-color: #fbbf24; color: #3b2a05; }
+  .wsbtn--unwatched.is-on { background: #f87171; border-color: #f87171; color: #3d0d0d; }
+
+  /* fork: series watch-state chip (read-only fallback) */
   .wstate-chip {
     display: inline-flex; align-items: center; gap: 6px; align-self: center;
     font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
@@ -974,13 +994,15 @@
 
   /* fork: per-issue wanted toggle */
   .issue__want {
-    display: inline-flex; align-items: center; justify-content: center;
-    width: 26px; height: 26px; flex-shrink: 0;
-    border: 1px solid var(--line, #2a2e3b); border-radius: 7px;
+    display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+    height: 26px; padding: 0 10px; flex-shrink: 0;
+    border: 1.5px solid var(--line, #2a2e3b); border-radius: 8px;
     background: transparent; color: var(--muted, #8b90a0); cursor: pointer;
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
   }
-  .issue__want:hover { color: var(--text, #e8eaf0); border-color: var(--accent, #7c5cff); }
-  .issue__want.is-on { color: #fbbf24; border-color: rgba(251,191,36,.45); background: rgba(251,191,36,.10); }
+  .issue__want-lbl { line-height: 1; }
+  .issue__want:hover { color: #fbbf24; border-color: rgba(251,191,36,.5); }
+  .issue__want.is-on { color: #3b2a05; border-color: #fbbf24; background: #fbbf24; }
   .icard__btn.is-want { color: #fbbf24; }
   .icard__wanted {
     position: absolute; top: 4px; right: 4px; z-index: 2;

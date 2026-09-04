@@ -21,6 +21,8 @@
     { key: 'followed', label: 'Followed' },
     { key: 'unmonitored', label: 'Not monitored' },
     { key: 'problems', label: 'Problems' },
+    { key: 'ongoing', label: 'Continuing' },
+    { key: 'ended', label: 'Finished' },
     { key: 'unmatched', label: 'Unmatched' },
   ];
 
@@ -456,6 +458,10 @@
               <div class="libx-card__title" title={s.title}>{s.title}{#if s.year}<span class="libx-card__year"> ({s.year})</span>{/if}</div>
               <div class="libx-card__meta">
                 <span class="libx-card__count">{s.owned}/{s.total}</span>
+                {#if s.pub_status && s.pub_status !== 'unknown'}
+                  <span class="pubchip pubchip--{s.pub_status}"
+                    title={s.pub_status === 'ongoing' ? 'Continuing — still publishing' : 'Finished — no longer publishing'}>{s.pub_status === 'ongoing' ? 'cont.' : 'fin.'}</span>
+                {/if}
                 {#if s.on_demand}<span class="libx-badge libx-badge--avail" title="{fmt(s.available)} available on demand"><Icon name="download" size={11} /> {fmt(s.available)}</span>{/if}
                 {#if s.corrupt > 0}<span class="libx-card__flag libx-card__flag--bad" title="{fmt(s.corrupt)} corrupt file(s)">!</span>{/if}
               </div>
@@ -482,17 +488,12 @@
                 title="Select (shift-click to select a range)"
                 onclick={(e) => { e.stopPropagation(); pickSeries(s, e); }} />
             {/if}
-            {#if s.watch_state}
-              <span class="wsym wsym--{s.watch_state} libx-row__wsym"
-                title={s.watch_state === 'watched' ? 'Watched — new issues are wanted automatically'
-                  : s.watch_state === 'paused' ? 'Paused — existing wanted issues kept, new ones not added'
-                  : 'Unwatched — nothing in this series is wanted'}>
-                {#if s.watch_state === 'watched'}▶{:else if s.watch_state === 'paused'}❚❚{:else}▬{/if}
-              </span>
-            {/if}
             <Cover coverUrl={s.matched ? s.cover_url : null} title={s.matched ? s.title : (s.folder || 'Unidentified series')} />
             <div class="libx-row__main">
-              <div class="libx-row__title" class:is-unmatched={!s.matched}>{s.matched ? s.title : (s.folder || 'Unidentified series')}{#if s.matched && s.year}<span class="libx-row__year"> ({s.year})</span>{/if}</div>
+              <div class="libx-row__title" class:is-unmatched={!s.matched}>{s.matched ? s.title : (s.folder || 'Unidentified series')}{#if s.matched && s.year}<span class="libx-row__year"> ({s.year})</span>{/if}{#if s.watch_state}<span class="wsym wsym--{s.watch_state} libx-row__wsym"
+                  title={s.watch_state === 'watched' ? 'Watched — new issues are wanted automatically'
+                    : s.watch_state === 'paused' ? 'Paused — existing wanted issues kept, new ones not added'
+                    : 'Unwatched — nothing in this series is wanted'}>{#if s.watch_state === 'watched'}▶{:else if s.watch_state === 'paused'}❚❚{:else}▬{/if}</span>{/if}</div>
               <div class="libx-row__badges">
                 {#if !s.matched}
                   <span class="libx-badge libx-badge--warn">needs match</span>
@@ -516,6 +517,10 @@
             <span class="libx-row__dim libx-col--wide" title="Newest known issue's cover date">{s.matched ? (s.latest || '—') : '—'}</span>
             <span class="libx-row__dim libx-col--wide libx-col--right">{s.size ? humanBytes(s.size) : '—'}</span>
             {#if isTrusted()}
+              {#if s.pub_status && s.pub_status !== 'unknown'}
+                <span class="pubchip pubchip--{s.pub_status}"
+                  title={s.pub_status === 'ongoing' ? 'Continuing — still publishing' : 'Finished — no longer publishing'}>{s.pub_status === 'ongoing' ? 'continuing' : 'finished'}</span>
+              {/if}
               {#if s.last_issue_date || s.next_issue_date}
                 <span class="libx-row__dates">
                   {#if s.last_issue_date}
@@ -623,12 +628,13 @@
   .wsym--unwatched { color: #f87171; }
 
   .libx-row__wsym {
-    width: 30px; height: 30px; font-size: 17px; margin-right: 8px;
-    background: rgba(148,163,184,.10);
+    display: inline-flex; vertical-align: middle;
+    width: 24px; height: 24px; font-size: 14px; margin-left: 9px;
+    background: rgba(148,163,184,.16);
   }
-  .libx-row__wsym.wsym--watched { background: rgba(52,211,153,.14); }
-  .libx-row__wsym.wsym--paused { background: rgba(251,191,36,.14); font-size: 13px; }
-  .libx-row__wsym.wsym--unwatched { background: rgba(248,113,113,.14); }
+  .libx-row__wsym.wsym--watched { background: rgba(52,211,153,.20); }
+  .libx-row__wsym.wsym--paused { background: rgba(251,191,36,.20); font-size: 10px; }
+  .libx-row__wsym.wsym--unwatched { background: rgba(248,113,113,.20); }
 
   /* whole-row tint + a status stripe down the left edge */
   .libx-row.ws-watched { background: rgba(52,211,153,.055); box-shadow: inset 3px 0 0 #34d399; }
@@ -649,6 +655,14 @@
     box-shadow: 0 1px 4px rgba(0,0,0,.5);
   }
   .libx-card__wsym.wsym--paused { font-size: 11px; }
+  .pubchip {
+    font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+    padding: 2px 7px; border-radius: 20px; flex-shrink: 0; margin-right: 6px;
+    border: 1px solid transparent;
+  }
+  .pubchip--ongoing { background: rgba(96,165,250,.14); color: #60a5fa; border-color: rgba(96,165,250,.3); }
+  .pubchip--ended { background: rgba(148,163,184,.14); color: #94a3b8; border-color: rgba(148,163,184,.28); }
+
   .libx-row__dates { display: inline-flex; align-items: center; gap: 8px; margin-right: 8px; flex-shrink: 0; }
   .libx-row__date { display: inline-flex; align-items: center; gap: 3px; font-size: 11.5px; color: var(--muted, #8b90a0); white-space: nowrap; }
   .libx-row__date.is-next { color: #60a5fa; }

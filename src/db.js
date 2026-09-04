@@ -944,18 +944,11 @@ function collFullCols(guard) {
       CASE WHEN COALESCE(lf.file_count, 0) = 0 THEN NULL ELSE
         (SELECT g.dir FROM library_files g WHERE g.series_id=s.id AND g.valid=1 GROUP BY g.dir ORDER BY COUNT(*) DESC LIMIT 1) END file_dir,
       CASE WHEN s.cv_id IS NULL THEN NULL ELSE (SELECT MAX(ci.cover_date) FROM cv_issues ci WHERE ci.cv_series_id=s.cv_id) END cv_latest,
-      -- fork: newest issue already released, and the next one due. Store date is
-      -- the real shelf date; cover dates run weeks ahead, so prefer store_date.
-      CASE WHEN s.cv_id IS NULL THEN NULL ELSE (
-        SELECT MAX(COALESCE(ci.store_date, ci.cover_date)) FROM cv_issues ci
-         WHERE ci.cv_series_id=s.cv_id
-           AND COALESCE(ci.store_date, ci.cover_date) IS NOT NULL
-           AND date(COALESCE(ci.store_date, ci.cover_date)) <= date('now')) END last_issue_date,
-      CASE WHEN s.cv_id IS NULL THEN NULL ELSE (
-        SELECT MIN(COALESCE(ci.store_date, ci.cover_date)) FROM cv_issues ci
-         WHERE ci.cv_series_id=s.cv_id
-           AND COALESCE(ci.store_date, ci.cover_date) IS NOT NULL
-           AND date(COALESCE(ci.store_date, ci.cover_date)) > date('now')) END next_issue_date,
+      -- fork: newest issue already released, the next one due, and whether the
+      -- volume is still running (Metron status, else a date heuristic).
+      CASE WHEN s.cv_id IS NULL THEN NULL ELSE ${LAST_ISSUE_DATE_SQL} END last_issue_date,
+      CASE WHEN s.cv_id IS NULL THEN NULL ELSE ${NEXT_ISSUE_DATE_SQL} END next_issue_date,
+      ${PUB_STATUS_SQL} pub_status,
       CASE WHEN ${guard} THEN 0 ELSE COALESCE(iss.active, 0) END active,
       COALESCE(lf.size_bytes, 0) size_bytes`;
 }
@@ -966,15 +959,10 @@ function collFullCols(guard) {
 // drives id-selection (for a page) and the fused chip counts.
 function collLeanCols(guard) {
   return `SELECT s.id, s.title, s.type, s.cv_id, s.followed, s.watch_state, s.year,
-      -- fork: needed by the 'latest' / 'next' sorts on the paged CTE path
-      CASE WHEN s.cv_id IS NULL THEN NULL ELSE (
-        SELECT MAX(COALESCE(ci.store_date, ci.cover_date)) FROM cv_issues ci
-         WHERE ci.cv_series_id=s.cv_id AND COALESCE(ci.store_date, ci.cover_date) IS NOT NULL
-           AND date(COALESCE(ci.store_date, ci.cover_date)) <= date('now')) END last_issue_date,
-      CASE WHEN s.cv_id IS NULL THEN NULL ELSE (
-        SELECT MIN(COALESCE(ci.store_date, ci.cover_date)) FROM cv_issues ci
-         WHERE ci.cv_series_id=s.cv_id AND COALESCE(ci.store_date, ci.cover_date) IS NOT NULL
-           AND date(COALESCE(ci.store_date, ci.cover_date)) > date('now')) END next_issue_date,
+      -- fork: needed by the 'latest'/'next' sorts and the continuing/finished chips
+      CASE WHEN s.cv_id IS NULL THEN NULL ELSE ${LAST_ISSUE_DATE_SQL} END last_issue_date,
+      CASE WHEN s.cv_id IS NULL THEN NULL ELSE ${NEXT_ISSUE_DATE_SQL} END next_issue_date,
+      ${PUB_STATUS_SQL} pub_status,
       (mf.series_id IS NOT NULL) my_follow,
       CASE WHEN ${guard} THEN 0 ELSE COALESCE(lf.untagged, 0) END untagged,
       CASE WHEN COALESCE(lf.invalid_count, 0) = 0 THEN 0 ELSE
@@ -1008,6 +996,29 @@ function membershipWhere({ guard, selfTypesLen, includeRestricted = true, librar
 // Sort clauses over OUTPUT columns (id/title/cv_total/cv_owned) — valid whether
 // applied to the flat base query or the wrapped `coll` CTE. `title` == s.title
 // (the catalog title), matching the historical ORDER BY s.title exactly.
+// fork: publication status of a volume.
+// Metron (via cvEnrich) carries a real status field — use it when present.
+// Otherwise fall back to ComicVine's issue dates: a volume whose newest issue
+// shipped within the last ~6 months is treated as still running, an older one
+// as finished. Volumes with no dated issues stay 'unknown' rather than guess.
+const LAST_ISSUE_DATE_SQL = `(SELECT MAX(COALESCE(ci.store_date, ci.cover_date)) FROM cv_issues ci
+   WHERE ci.cv_series_id=s.cv_id AND COALESCE(ci.store_date, ci.cover_date) IS NOT NULL
+     AND date(COALESCE(ci.store_date, ci.cover_date)) <= date('now'))`;
+
+const NEXT_ISSUE_DATE_SQL = `(SELECT MIN(COALESCE(ci.store_date, ci.cover_date)) FROM cv_issues ci
+   WHERE ci.cv_series_id=s.cv_id AND COALESCE(ci.store_date, ci.cover_date) IS NOT NULL
+     AND date(COALESCE(ci.store_date, ci.cover_date)) > date('now'))`;
+
+const PUB_STATUS_SQL = `CASE
+    WHEN s.cv_id IS NULL THEN 'unknown'
+    WHEN cv.metron_status IS NOT NULL AND TRIM(cv.metron_status) <> ''
+      THEN CASE WHEN LOWER(cv.metron_status) IN ('ongoing','hiatus') THEN 'ongoing' ELSE 'ended' END
+    WHEN ${NEXT_ISSUE_DATE_SQL} IS NOT NULL THEN 'ongoing'
+    WHEN ${LAST_ISSUE_DATE_SQL} IS NULL THEN 'unknown'
+    WHEN date(${LAST_ISSUE_DATE_SQL}) >= date('now','-183 days') THEN 'ongoing'
+    ELSE 'ended'
+  END`;
+
 const COLL_ORDERS = {
   title: 'ORDER BY title',
   added: 'ORDER BY id DESC',
@@ -1035,6 +1046,9 @@ function chipPredicateSql(filter, { guardOuter, seriesTypeList, params }) {
   if (filter === 'followed') return 'my_follow = 1';                                 // per-user star
   if (filter === 'unmonitored') return 'COALESCE(followed,0) = 0';                   // !monitored
   if (filter === 'problems') return 'untagged > 0 OR corrupt > 0';
+  // fork: publication status chips
+  if (filter === 'ongoing') return "pub_status = 'ongoing'";
+  if (filter === 'ended') return "pub_status = 'ended'";
   if (filter === 'unmatched') return `cv_id IS NULL AND COALESCE(${guardOuter},0) = 0`; // !matched
   if (filter === 'comics') return `${effType} NOT IN (${seriesTypeList}) OR ${effType} = 'comic'`;
   if (SERIES_TYPES.includes(filter)) { params['lane_' + filter] = filter; return `${effType} = @lane_${filter}`; }
@@ -1117,6 +1131,8 @@ function mapCollectionRow(r) {
         folder: dirBaseName(r.file_dir), files: r.file_count,
         total: r.bc_total, owned, missing: 0, available, on_demand: available > 0, untagged: 0, corrupt: r.corrupt,
         latest: null, active: 0, size: r.size_bytes,
+        watch_state: r.watch_state || 'watched', pub_status: r.pub_status || 'unknown',
+        last_issue_date: r.last_issue_date || null, next_issue_date: r.next_issue_date || null,
       };
     }
     return {
@@ -1125,6 +1141,8 @@ function mapCollectionRow(r) {
       folder: dirBaseName(r.file_dir), files: r.file_count,
       total: 0, owned: 0, missing: 0, available: 0, on_demand: false, untagged: r.untagged, corrupt: r.corrupt,
       latest: null, active: r.active, size: r.size_bytes,
+      watch_state: r.watch_state || 'watched', pub_status: r.pub_status || 'unknown',
+      last_issue_date: r.last_issue_date || null, next_issue_date: r.next_issue_date || null,
     };
   }
   const total = r.cv_total;
@@ -1135,9 +1153,11 @@ function mapCollectionRow(r) {
     cv_name: r.cv_name, cv_year: r.cv_year, restricted: !!r.restricted, type: r.type || 'comic',
     total, owned, missing: Math.max(0, total - owned), available: 0, on_demand: false, untagged: r.untagged, corrupt: r.corrupt,
     latest: r.cv_latest, active: r.active, size: r.size_bytes,
-    // fork: dates for the list view's Latest / Next columns
+    // fork: watch state, publication status and the Latest/Next issue dates
+    watch_state: r.watch_state || 'watched',
     last_issue_date: r.last_issue_date || null,
     next_issue_date: r.next_issue_date || null,
+    pub_status: r.pub_status || 'unknown',
   };
 }
 
@@ -1236,7 +1256,7 @@ export function collectionPage(db, { keys = [], filter = 'all', limit = null, of
     if (filter === 'unmatched') return `s.cv_id IS NULL AND COALESCE(${guard},0) = 0`;
     if (filter === 'comics') return `${effType} NOT IN (${seriesTypeList}) OR ${effType} = 'comic'`;
     if (SERIES_TYPES.includes(filter)) return `${effType} = @lane_${filter}`;
-    return null; // incomplete / problems
+    return null; // incomplete / problems / ongoing / ended
   })();
   const fastPath = fastChipPred != null && FAST_ORDERS[sort];
   // Index steering: a title sort should ride idx_series_lib_title (walk in
@@ -1284,6 +1304,9 @@ export function seriesMatchesFilter(r, filter) {
     : filter === 'followed' ? !!r.followed
     : filter === 'unmonitored' ? !r.monitored
     : filter === 'problems' ? (r.untagged > 0 || r.corrupt > 0)
+    // fork: publication status
+    : filter === 'ongoing' ? r.pub_status === 'ongoing'
+    : filter === 'ended' ? r.pub_status === 'ended'
     // Self-described rows are matched by construction — never "unmatched".
     : filter === 'unmatched' ? !r.matched
     // Library-type lanes. The comics lane means "not any other known type",
@@ -1332,6 +1355,19 @@ export function seriesCollectionDetail(db, id, userId = null) {
       : 0,
     monitored: series.followed,
     watchState: series.watch_state || (series.followed ? 'watched' : 'paused'),
+    // fork: is the volume still running? Metron status wins; else CV dates.
+    pubStatus: (() => {
+      const ms = (cvRow && cvRow.metron_status || '').trim().toLowerCase();
+      if (ms) return ['ongoing', 'hiatus'].includes(ms) ? 'ongoing' : 'ended';
+      if (!series.cv_id) return 'unknown';
+      const dates = cvIssues.map((ci) => ci.store_date || ci.cover_date).filter(Boolean).sort();
+      if (!dates.length) return 'unknown';
+      const today = new Date().toISOString().slice(0, 10);
+      if (dates[dates.length - 1] > today) return 'ongoing';       // an issue is still to come
+      const cutoff = new Date(Date.now() - 183 * 86400000).toISOString().slice(0, 10);
+      return dates[dates.length - 1] >= cutoff ? 'ongoing' : 'ended';
+    })(),
+    metronStatus: (cvRow && cvRow.metron_status) || null,
     cv_id: series.cv_id, cv_locked: series.cv_locked, sourced, path: series.path,
     restricted: !!series.restricted,
     type: series.type || 'comic',
