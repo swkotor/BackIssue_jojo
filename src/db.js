@@ -642,11 +642,33 @@ export function recordImport(db, { seriesId = null, seriesTitle = null, issueTit
     VALUES (?,?,?,?,?,?,?,?)`).run(Date.now(), seriesId, seriesTitle, issueTitle, issueNumber, cvIssueId, source, path);
 }
 
+// fork: orderings for the Wanted page. Issues stay grouped by series (the page
+// renders one card per series), so every sort keys on a series-level value
+// first and then walks the issues in number order.
+// `missing` counts the series' still-wanted, still-unowned issues — the same
+// number the card's "N missing" pill shows.
+const WANTED_MISSING_SQL = `(SELECT COUNT(*) FROM cv_issues ci2
+   WHERE ci2.cv_series_id = s.cv_id
+     AND NOT EXISTS (SELECT 1 FROM library_files lf3 WHERE lf3.cv_issue_id = ci2.comicvine_id AND lf3.valid=1)
+     AND COALESCE((SELECT iw2.wanted FROM issue_wants iw2 WHERE iw2.cv_issue_id = ci2.comicvine_id),
+                  CASE WHEN s.watch_state='watched' THEN 1 ELSE 0 END) = 1)`;
+
+const WANTED_ORDERS = {
+  series: 'ORDER BY series_title, CAST(ci.issue_number AS REAL), ci.issue_number',
+  missing: `ORDER BY ${WANTED_MISSING_SQL} DESC, series_title, CAST(ci.issue_number AS REAL), ci.issue_number`,
+  'missing-asc': `ORDER BY ${WANTED_MISSING_SQL} ASC, series_title, CAST(ci.issue_number AS REAL), ci.issue_number`,
+  // newest releases first, across every series
+  newest: `ORDER BY (COALESCE(ci.store_date, ci.cover_date) IS NULL),
+    date(COALESCE(ci.store_date, ci.cover_date)) DESC, series_title, CAST(ci.issue_number AS REAL)`,
+  oldest: `ORDER BY (COALESCE(ci.store_date, ci.cover_date) IS NULL),
+    date(COALESCE(ci.store_date, ci.cover_date)) ASC, series_title, CAST(ci.issue_number AS REAL)`,
+};
+
 // Wanted = every ComicVine issue of a collection series (followed, or owned via a
 // valid file) that has NO valid file yet. `queue_status` carries the in-flight
 // state (queued/grabbed/failed…) when the issue has already been sent for
 // download, so the page can show a badge instead of a Download button.
-export function listWantedIssues(db, { limit = 200, offset = 0, followedOnly = false, userFollowedOnly = false, hideUnreleased = false, releasedWithinDays = 0, search = '', includeRestricted = true, userId = 0 } = {}) {
+export function listWantedIssues(db, { limit = 200, offset = 0, followedOnly = false, userFollowedOnly = false, hideUnreleased = false, releasedWithinDays = 0, search = '', includeRestricted = true, userId = 0, sort = 'series' } = {}) {
   // Two DISTINCT "follow" systems meet here:
   //  - s.followed = GLOBAL automation flag (set on add, toggled as
   //    "Auto-download"). `followedOnly` filters on it and is what the RSS
@@ -697,9 +719,10 @@ export function listWantedIssues(db, { limit = 200, offset = 0, followedOnly = f
       ci.comicvine_id cv_issue_id, ci.issue_number, ci.name issue_name, ci.cover_date,
       (SELECT i.status FROM issues i WHERE i.url = 'cvissue:' || ci.comicvine_id) queue_status,
       s.watch_state,
+      ${WANTED_MISSING_SQL} series_missing,
       COALESCE((SELECT iw.wanted FROM issue_wants iw WHERE iw.cv_issue_id = ci.comicvine_id), s.watch_state='watched') wanted
     ${from}
-    ORDER BY series_title, CAST(ci.issue_number AS REAL), ci.issue_number
+    ${WANTED_ORDERS[sort] || WANTED_ORDERS.series}
     LIMIT @limit OFFSET @offset`).all({ ...args, limit, offset });
   return { items, total };
 }

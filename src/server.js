@@ -1149,6 +1149,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
       search: String(req.query.q || '').trim(),
       includeRestricted: canRestricted(req),
       userId: req.user?.id ?? 0, // drives the ☆ badge column too
+      sort: String(req.query.sort || 'series'),
     }));
   });
   app.get('/api/tools', (req, res) => res.json(toolsState()));

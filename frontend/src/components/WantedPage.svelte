@@ -24,7 +24,7 @@
 
   async function renderWanted({ append = false } = {}) {
     const offset = append ? items.length : 0;
-    const qs = `limit=200&offset=${offset}` + (followed ? '&followed=1' : '') + (hideUnreleased ? '&hideUnreleased=1' : '') + (q ? `&q=${encodeURIComponent(q)}` : '');
+    const qs = `limit=200&offset=${offset}` + (followed ? '&followed=1' : '') + (hideUnreleased ? '&hideUnreleased=1' : '') + (q ? `&q=${encodeURIComponent(q)}` : '') + (sort && sort !== 'series' ? `&sort=${sort}` : '');
     let w;
     try { w = await apiGet('/api/wanted?' + qs); } catch { return; }
     items = append ? items.concat(w.items) : w.items;
@@ -41,6 +41,7 @@
     untrack(() => {
       followed = p.get('wf') === 'followed';
       hideUnreleased = p.get('hide') === '1';
+      sort = p.get('sort') || 'series';
       if (q !== (p.get('find') || '')) q = p.get('find') || '';
       renderWanted();
     });
@@ -69,6 +70,9 @@
     notify(`Queued ${fmt(r.queued || 0)} issue(s).`, 'ok');
     renderWanted();
   }
+
+  // fork: server-side ordering for the whole list (not just the loaded page)
+  let sort = $state('series');
 
   // fork: multi-select + explicit wanted flags
   let selected = $state(new Set());
@@ -146,11 +150,13 @@
   // Group the flat, pre-sorted item list into per-series cards, enriching each
   // with owned/total from the rail store when the series is loaded there (the
   // completion bar is progressive enhancement — the missing count is primary).
+  // Groups follow the order the server returned rows in, so the chosen sort
+  // survives grouping (a client-side re-sort would undo it).
   const groups = $derived.by(() => {
     const out = []; const byId = new Map();
     for (const it of items) {
       let g = byId.get(it.series_id);
-      if (!g) { g = { id: it.series_id, title: it.series_title, cover: it.series_cover, followed: it.followed, issues: [] }; byId.set(it.series_id, g); out.push(g); }
+      if (!g) { g = { id: it.series_id, title: it.series_title, cover: it.series_cover, followed: it.followed, seriesMissing: it.series_missing, issues: [] }; byId.set(it.series_id, g); out.push(g); }
       g.issues.push(it);
     }
     for (const g of out) {
@@ -203,6 +209,14 @@
     </div>
 
     <div class="wx__chips">
+      <select class="wx__sort" title="Sort the wanted list" value={sort}
+        onchange={(e) => setQuery({ sort: e.currentTarget.value === 'series' ? null : e.currentTarget.value })}>
+        <option value="series">A–Z by series</option>
+        <option value="missing">Most missing</option>
+        <option value="missing-asc">Fewest missing</option>
+        <option value="newest">Newest released</option>
+        <option value="oldest">Oldest released</option>
+      </select>
       <button class="wx__chip" class:is-active={!followed} onclick={() => setQuery({ wf: null })}>All series</button>
       <button class="wx__chip" class:is-active={followed} onclick={() => setQuery({ wf: 'followed' })} title="Series you follow (the ☆ on a series page)">Following</button>
       <button id="wanted-unreleased" class="wx__chip wx__chip--hide" class:is-active={hideUnreleased}
@@ -260,7 +274,7 @@
                 </div>
               {/if}
             </div>
-            <span class="wx__misspill">{fmt(g.missing)} missing</span>
+            <span class="wx__misspill">{fmt(g.seriesMissing ?? g.missing)} missing</span>
             <button class="wx__unwant wx__unwant--series" title="Unwant this series — sets it Unwatched and clears its queue"
               onclick={(e) => { e.stopPropagation(); unwantSeries(g); }}>▬ Unwant series</button>
             <span class="wx__chev" class:is-open={open}><Icon name="chevron-right" size={16} /></span>
@@ -317,6 +331,13 @@
   .wx__bulk-btn.is-want { background: var(--accent, #7c5cff); border-color: transparent; color: #fff; }
   .wx__bulk-btn.is-plain { opacity: .7; }
   .wx__row.is-picked { background: color-mix(in srgb, var(--accent, #7c5cff) 12%, transparent); }
+  .wx__sort {
+    height: 30px; padding: 0 10px; border-radius: 8px; cursor: pointer;
+    background: var(--ink, #0f1117); border: 1px solid var(--line, #2a2e3b);
+    color: inherit; font-size: 12.5px;
+  }
+  .wx__sort:focus { outline: none; border-color: var(--accent, #7c5cff); }
+
   .wx__unwant {
     display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0;
     height: 26px; padding: 0 10px; border-radius: 8px; cursor: pointer;
