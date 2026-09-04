@@ -26,6 +26,13 @@
     { key: 'unmatched', label: 'Unmatched' },
   ];
 
+  // fork: the chip rail is long enough to squeeze the sort/view/action controls
+  // off a narrow window, so it collapses to just the active chip. Device
+  // preference, like the view toggle.
+  let chipsOpen = $state(localStorage.getItem('libraryChips') !== '0');
+  function toggleChips() { chipsOpen = !chipsOpen; localStorage.setItem('libraryChips', chipsOpen ? '1' : '0'); }
+  const activeFilter = $derived(FILTERS.find((f) => f.key === rail.filter) || FILTERS[0]);
+
   // Grid ⊞ / list ≣ — a device preference, not a URL one.
   let view = $state(localStorage.getItem('libraryView') || 'grid');
   function setView(v) { view = v; localStorage.setItem('libraryView', v); }
@@ -333,12 +340,23 @@
   <div class="libx__bar">
     <span class="libx__count">{isCollections ? 'Collections' : 'Library'} <span id="series-count">{rail.loaded ? fmt(rail.total) : ''}</span></span>
     <div class="libx__filters">
-      {#each FILTERS as f (f.key)}
-        {@const n = rail.counts?.[f.key]}
-        <button class="libx__chip" class:is-active={rail.filter === f.key} onclick={() => pickFilter(f.key)}>
-          {f.label}{#if n}<span class="libx__chip-count">{fmt(n)}</span>{/if}
+      <button class="libx__chiptoggle" title={chipsOpen ? 'Collapse the filters' : 'Show all filters'}
+        aria-expanded={chipsOpen} aria-label={chipsOpen ? 'Collapse filters' : 'Expand filters'} onclick={toggleChips}>
+        <Icon name={chipsOpen ? 'chevron-left' : 'chevron-right'} size={14} />
+      </button>
+      {#if chipsOpen}
+        {#each FILTERS as f (f.key)}
+          {@const n = rail.counts?.[f.key]}
+          <button class="libx__chip" class:is-active={rail.filter === f.key} onclick={() => pickFilter(f.key)}>
+            {f.label}{#if n}<span class="libx__chip-count">{fmt(n)}</span>{/if}
+          </button>
+        {/each}
+      {:else}
+        {@const n = rail.counts?.[activeFilter.key]}
+        <button class="libx__chip" class:is-active={rail.filter !== 'all'} title="Filters (collapsed) — click the arrow to show them all" onclick={toggleChips}>
+          {activeFilter.label}{#if n}<span class="libx__chip-count">{fmt(n)}</span>{/if}
         </button>
-      {/each}
+      {/if}
     </div>
     <!-- fork: watch-state narrowing — independent of the chips above, so
          "Incomplete + Watched" is expressible. -->
@@ -486,7 +504,8 @@
       <div class="libx-list">
         <div class="libx-list__head">
           <span></span><span>Title</span><span>Progress</span>
-          <span class="libx-col--wide">Latest</span><span class="libx-col--wide libx-col--right">Size</span><span></span>
+          <span class="libx-col--wide">Latest</span><span class="libx-col--wide libx-col--right">Size</span>
+          <span class="libx-col--wide">Status</span><span class="libx-col--wide">Dates</span><span></span><span></span>
         </div>
         {#if range.padTop > 0}<div style="height:{range.padTop}px"></div>{/if}
         {#each rail.rows.slice(range.start, range.end) as s (s.id)}
@@ -527,11 +546,11 @@
             <span class="libx-row__dim libx-col--wide libx-col--right">{s.size ? humanBytes(s.size) : '—'}</span>
             {#if isTrusted()}
               {#if s.pub_status && s.pub_status !== 'unknown'}
-                <span class="pubchip pubchip--{s.pub_status}"
+                <span class="pubchip pubchip--{s.pub_status} libx-col--wide"
                   title={s.pub_status === 'ongoing' ? 'Continuing — still publishing' : 'Finished — no longer publishing'}>{s.pub_status === 'ongoing' ? 'continuing' : 'finished'}</span>
-              {/if}
+              {:else}<span class="libx-col--wide"></span>{/if}
               {#if s.last_issue_date || s.next_issue_date}
-                <span class="libx-row__dates">
+                <span class="libx-row__dates libx-col--wide">
                   {#if s.last_issue_date}
                     <span class="libx-row__date" title="Most recent released issue: {s.last_issue_date}">
                       <Icon name="clock" size={11} /> {shortDate(s.last_issue_date)}
@@ -543,10 +562,10 @@
                     </span>
                   {/if}
                 </span>
-              {/if}
-
+              {:else}<span class="libx-col--wide"></span>{/if}
+              <span></span>
               <button class="libx-row__star" class:is-on={s.followed} title={s.followed ? 'Followed — click to unfollow' : 'Not followed — click to follow'} aria-label={s.followed ? 'Unfollow' : 'Follow'} onclick={(e) => { e.stopPropagation(); toggleMon(s); }}><Icon name="star" fill={!!s.followed} size={15} /></button>
-            {:else}<span></span>{/if}
+            {:else}<span class="libx-col--wide"></span><span class="libx-col--wide"></span><span></span><span></span>{/if}
           </div>
         {/each}
         {#if range.padBottom > 0}<div style="height:{range.padBottom}px"></div>{/if}
@@ -565,6 +584,12 @@
   .libx__count { font: 13px var(--font-mono); color: var(--faint); white-space: nowrap; flex: none; }
   .libx__count span { color: var(--text); }
   .libx__filters { display: flex; align-items: center; gap: 6px; flex: none; }
+  .libx__chiptoggle {
+    width: 26px; height: 32px; flex: none; display: grid; place-items: center;
+    border: 1px solid var(--line); border-radius: 8px; background: transparent;
+    color: var(--faint); cursor: pointer;
+  }
+  .libx__chiptoggle:hover { color: var(--text); border-color: var(--muted); }
   /* fork: series-status narrowing select */
   .libx__ws { flex: none; }
   .libx__ws.is-on { border-color: rgba(52,211,153,.55); color: #34d399; font-weight: 600; }
@@ -621,7 +646,12 @@
 
   /* list */
   .libx-list { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: rgba(255,255,255,.012); }
-  .libx-list__head, .libx-row { display: grid; grid-template-columns: 46px minmax(160px, 1.8fr) 150px 90px 80px 40px; align-items: center; gap: 12px; padding: 9px 14px; }
+  /* fork: the title column used to be 1.8fr, so on a wide window it swallowed
+     every spare pixel and shoved status/dates/star off the right edge (those
+     three had no column of their own and landed in implicit ones). Cap the
+     title, give every trailing cell a real column, and park the slack in a
+     filler column just before the star. */
+  .libx-list__head, .libx-row { display: grid; grid-template-columns: 46px minmax(170px, 34ch) 132px 86px 78px 74px 148px 1fr 34px; align-items: center; gap: 12px; padding: 9px 14px; }
   .libx-list__head { border-bottom: 1px solid var(--line); font: 600 10.5px var(--font-body); text-transform: uppercase; letter-spacing: .06em; color: var(--faint); background: rgba(255,255,255,.02); }
   .libx-col--right { text-align: right; }
   .libx-row { border-bottom: 1px solid #2a2536; cursor: pointer; }
@@ -669,13 +699,13 @@
   .libx-card__wsym.wsym--paused { font-size: 11px; }
   .pubchip {
     font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
-    padding: 2px 7px; border-radius: 20px; flex-shrink: 0; margin-right: 6px;
+    padding: 2px 7px; border-radius: 20px; flex-shrink: 0; justify-self: start;
     border: 1px solid transparent;
   }
   .pubchip--ongoing { background: rgba(96,165,250,.14); color: #60a5fa; border-color: rgba(96,165,250,.3); }
   .pubchip--ended { background: rgba(148,163,184,.14); color: #94a3b8; border-color: rgba(148,163,184,.28); }
 
-  .libx-row__dates { display: inline-flex; align-items: center; gap: 8px; margin-right: 8px; flex-shrink: 0; }
+  .libx-row__dates { display: inline-flex; align-items: center; gap: 8px; flex-shrink: 0; min-width: 0; overflow: hidden; }
   .libx-row__date { display: inline-flex; align-items: center; gap: 3px; font-size: 11.5px; color: var(--muted, #8b90a0); white-space: nowrap; }
   .libx-row__date.is-next { color: #60a5fa; }
   .libx-row__cb, .libx-card__cb { width: 16px; height: 16px; accent-color: var(--accent, #7c5cff); cursor: pointer; flex-shrink: 0; }
@@ -738,7 +768,7 @@
 
   @media (max-width: 760px) {
     .libx-grid { grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 14px; }
-    .libx-list__head, .libx-row { grid-template-columns: 46px 1fr auto 40px; }
+    .libx-list__head, .libx-row { grid-template-columns: 46px 1fr auto 1fr 34px; }
     .libx-col--wide { display: none; }
   }
 </style>
