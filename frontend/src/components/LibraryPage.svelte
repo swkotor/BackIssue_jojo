@@ -431,7 +431,7 @@
       <div class="libx-grid">
         {#if range.padTop > 0}<div class="libx-grid__pad" style="height:{range.padTop}px"></div>{/if}
         {#each rail.rows.slice(range.start, range.end) as s (s.id)}
-          <div class="libx-card" class:is-selected={rail.selecting && railSelect.has(s.id)}
+          <div class="libx-card ws-{s.watch_state || 'watched'}" class:is-selected={rail.selecting && railSelect.has(s.id)}
             onclick={(e) => open(s, e)} role="button" tabindex="0" onkeydown={(e) => { if (e.key === 'Enter') open(s, e); }}>
             <div class="libx-card__art" class:is-unmatched={!s.matched}>
               <Cover coverUrl={s.matched ? s.cover_url : null} title={s.matched ? s.title : (s.folder || '?')} />
@@ -440,11 +440,13 @@
                   title="Select (shift-click to select a range)"
                   onclick={(e) => { e.stopPropagation(); pickSeries(s, e); }} />
               {/if}
-              {#if s.watch_state && s.watch_state !== 'watched'}
-                <span class="libx-card__wstate" class:is-paused={s.watch_state === 'paused'}
-                  title={s.watch_state === 'paused' ? 'Paused — existing wanted issues kept, new ones not added' : 'Unwatched — nothing wanted'}>{s.watch_state === 'paused' ? 'paused' : 'unwatched'}</span>
-              {:else if s.watch_state === 'watched'}
-                <span class="libx-card__wstate is-watched" title="Watched — new issues are wanted automatically">watched</span>
+              {#if s.watch_state}
+                <span class="wsym wsym--{s.watch_state} libx-card__wsym"
+                  title={s.watch_state === 'watched' ? 'Watched — new issues are wanted automatically'
+                    : s.watch_state === 'paused' ? 'Paused — existing wanted issues kept, new ones not added'
+                    : 'Unwatched — nothing in this series is wanted'}>
+                  {#if s.watch_state === 'watched'}▶{:else if s.watch_state === 'paused'}❚❚{:else}▬{/if}
+                </span>
               {/if}
               {#if s.followed}<span class="libx-card__star" title="Followed"><Icon name="star" fill size={15} /></span>{/if}
               {#if !s.matched}<span class="libx-card__matchchip">match…</span>{/if}
@@ -473,12 +475,20 @@
         </div>
         {#if range.padTop > 0}<div style="height:{range.padTop}px"></div>{/if}
         {#each rail.rows.slice(range.start, range.end) as s (s.id)}
-          <div class="libx-row" class:is-selected={rail.selecting && railSelect.has(s.id)}
+          <div class="libx-row ws-{s.watch_state || 'watched'}" class:is-selected={rail.selecting && railSelect.has(s.id)}
             onclick={(e) => open(s, e)} role="button" tabindex="0" onkeydown={(e) => { if (e.key === 'Enter') open(s, e); }}>
             {#if rail.selecting}
               <input type="checkbox" class="libx-row__cb" checked={railSelect.has(s.id)}
                 title="Select (shift-click to select a range)"
                 onclick={(e) => { e.stopPropagation(); pickSeries(s, e); }} />
+            {/if}
+            {#if s.watch_state}
+              <span class="wsym wsym--{s.watch_state} libx-row__wsym"
+                title={s.watch_state === 'watched' ? 'Watched — new issues are wanted automatically'
+                  : s.watch_state === 'paused' ? 'Paused — existing wanted issues kept, new ones not added'
+                  : 'Unwatched — nothing in this series is wanted'}>
+                {#if s.watch_state === 'watched'}▶{:else if s.watch_state === 'paused'}❚❚{:else}▬{/if}
+              </span>
             {/if}
             <Cover coverUrl={s.matched ? s.cover_url : null} title={s.matched ? s.title : (s.folder || 'Unidentified series')} />
             <div class="libx-row__main">
@@ -520,12 +530,7 @@
                   {/if}
                 </span>
               {/if}
-              {#if s.watch_state}
-                <span class="libx-row__wstate" class:is-paused={s.watch_state === 'paused'} class:is-watched={s.watch_state === 'watched'}
-                  title={s.watch_state === 'watched' ? 'Watched — new issues are wanted automatically'
-                    : s.watch_state === 'paused' ? 'Paused — existing wanted issues kept, new ones not added'
-                    : 'Unwatched — nothing in this series is wanted'}>{s.watch_state}</span>
-              {/if}
+
               <button class="libx-row__star" class:is-on={s.followed} title={s.followed ? 'Followed — click to unfollow' : 'Not followed — click to follow'} aria-label={s.followed ? 'Unfollow' : 'Follow'} onclick={(e) => { e.stopPropagation(); toggleMon(s); }}><Icon name="star" fill={!!s.followed} size={15} /></button>
             {:else}<span></span>{/if}
           </div>
@@ -606,26 +611,50 @@
   .libx-row:last-child { border-bottom: none; }
   .libx-row.is-selected { background: rgba(255,45,111,.08); }
   /* fork: watch-state pill */
-  .libx-row__wstate {
-    font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
-    padding: 2px 7px; border-radius: 20px; margin-right: 6px; flex-shrink: 0;
-    background: rgba(148,163,184,.16); color: #94a3b8;
+  /* fork: watch-state symbols + colour coding.
+     ▶ green = watched, ❚❚ amber = paused, ▬ red = unwatched. */
+  .wsym {
+    display: inline-flex; align-items: center; justify-content: center;
+    flex-shrink: 0; line-height: 1; font-weight: 700;
+    border-radius: 50%;
   }
-  .libx-row__wstate.is-paused { background: rgba(251,191,36,.16); color: #fbbf24; }
-  .libx-row__wstate.is-watched { background: rgba(52,211,153,.16); color: #34d399; }
+  .wsym--watched { color: #34d399; }
+  .wsym--paused { color: #fbbf24; letter-spacing: -1px; }
+  .wsym--unwatched { color: #f87171; }
+
+  .libx-row__wsym {
+    width: 30px; height: 30px; font-size: 17px; margin-right: 8px;
+    background: rgba(148,163,184,.10);
+  }
+  .libx-row__wsym.wsym--watched { background: rgba(52,211,153,.14); }
+  .libx-row__wsym.wsym--paused { background: rgba(251,191,36,.14); font-size: 13px; }
+  .libx-row__wsym.wsym--unwatched { background: rgba(248,113,113,.14); }
+
+  /* whole-row tint + a status stripe down the left edge */
+  .libx-row.ws-watched { background: rgba(52,211,153,.055); box-shadow: inset 3px 0 0 #34d399; }
+  .libx-row.ws-paused { background: rgba(251,191,36,.06); box-shadow: inset 3px 0 0 #fbbf24; }
+  .libx-row.ws-unwatched { background: rgba(248,113,113,.06); box-shadow: inset 3px 0 0 #f87171; }
+  .libx-row.ws-watched:hover { background: rgba(52,211,153,.10); }
+  .libx-row.ws-paused:hover { background: rgba(251,191,36,.11); }
+  .libx-row.ws-unwatched:hover { background: rgba(248,113,113,.11); }
+
+  /* grid: coloured border round the cover + a big symbol badge */
+  .libx-card.ws-watched .libx-card__art { border: 2px solid #34d399; }
+  .libx-card.ws-paused .libx-card__art { border: 2px solid #fbbf24; }
+  .libx-card.ws-unwatched .libx-card__art { border: 2px solid #f87171; }
+  .libx-card__wsym {
+    position: absolute; left: 6px; bottom: 6px; z-index: 2;
+    width: 26px; height: 26px; font-size: 15px;
+    background: rgba(0,0,0,.62); backdrop-filter: blur(2px);
+    box-shadow: 0 1px 4px rgba(0,0,0,.5);
+  }
+  .libx-card__wsym.wsym--paused { font-size: 11px; }
   .libx-row__dates { display: inline-flex; align-items: center; gap: 8px; margin-right: 8px; flex-shrink: 0; }
   .libx-row__date { display: inline-flex; align-items: center; gap: 3px; font-size: 11.5px; color: var(--muted, #8b90a0); white-space: nowrap; }
   .libx-row__date.is-next { color: #60a5fa; }
   .libx-row__cb, .libx-card__cb { width: 16px; height: 16px; accent-color: var(--accent, #7c5cff); cursor: pointer; flex-shrink: 0; }
   .libx-card__cb { position: absolute; top: 6px; left: 6px; z-index: 3; }
-  .libx-card__wstate {
-    position: absolute; left: 6px; bottom: 6px; z-index: 2;
-    font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
-    padding: 2px 6px; border-radius: 20px;
-    background: rgba(148,163,184,.22); color: #cbd5e1; backdrop-filter: blur(2px);
-  }
-  .libx-card__wstate.is-paused { background: rgba(251,191,36,.22); color: #fde68a; }
-  .libx-card__wstate.is-watched { background: rgba(52,211,153,.22); color: #a7f3d0; }
+
   .libx-row :global(.cover) { width: 38px; height: 52px; }
   .libx-row__main { min-width: 0; }
   .libx-row__title { font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -685,7 +685,10 @@
               <span class="wstate-chip wstate-chip--{ws}"
                 title={ws === 'watched' ? 'Watched — new issues are wanted automatically'
                   : ws === 'paused' ? 'Paused — issues already wanted stay wanted, new ones are not added'
-                  : 'Unwatched — nothing in this series is wanted'}>{ws}</span>
+                  : 'Unwatched — nothing in this series is wanted'}>
+                <span class="wstate-chip__sym">{#if ws === 'watched'}▶{:else if ws === 'paused'}❚❚{:else}▬{/if}</span>
+                {ws}
+              </span>
               <button id="follow-btn" class="btn btn--ghost" class:is-following={!!s.followed} onclick={toggleFollow}>{#if s.followed}<Icon name="star" fill /> Following{:else}<Icon name="star" /> Follow{/if}</button>
             {/if}
             <!-- Secondary/destructive actions live in one overflow menu — the
@@ -959,11 +962,13 @@
 <style>
   /* fork: series watch-state chip */
   .wstate-chip {
-    display: inline-flex; align-items: center; align-self: center;
-    font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
-    padding: 4px 10px; border-radius: 20px; margin-right: 6px;
-    background: rgba(148,163,184,.16); color: #94a3b8;
+    display: inline-flex; align-items: center; gap: 6px; align-self: center;
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+    padding: 5px 12px; border-radius: 20px; margin-right: 6px;
+    background: rgba(248,113,113,.14); color: #f87171;
   }
+  .wstate-chip__sym { font-size: 15px; line-height: 1; }
+  .wstate-chip--paused .wstate-chip__sym { font-size: 11px; letter-spacing: -1px; }
   .wstate-chip--watched { background: rgba(52,211,153,.16); color: #34d399; }
   .wstate-chip--paused { background: rgba(251,191,36,.16); color: #fbbf24; }
 
