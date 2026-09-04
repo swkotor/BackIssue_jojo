@@ -347,13 +347,20 @@
   // An explicit flag overrides the series' watch state in both directions.
   async function toggleWanted(i) {
     const next = !i.wanted;
-    i.wanted = next;                       // optimistic
+    // Optimistic: flip the row, then persist. The issue list lives at
+    // detail.det.issues — reassign that array so Svelte re-renders.
+    i.wanted = next;
     i.wantOverride = next ? 'wanted' : 'skipped';
-    detail.issues = [...detail.issues];
-    const r = await apiPost('/api/issues/wanted', { cvIssueIds: [i.cv_issue_id], wanted: next });
-    if (r?.error) {
-      i.wanted = !next; i.wantOverride = null; detail.issues = [...detail.issues];
-      notify(r.error, 'error');
+    if (detail.det?.issues) detail.det.issues = [...detail.det.issues];
+    try {
+      const r = await apiPost('/api/issues/wanted', { cvIssueIds: [i.cv_issue_id], wanted: next });
+      if (r?.error) throw new Error(r.error);
+      notify(next ? 'Marked wanted.' : 'Marked not wanted — removed from the queue.', 'ok');
+    } catch (e) {
+      i.wanted = !next;
+      i.wantOverride = null;
+      if (detail.det?.issues) detail.det.issues = [...detail.det.issues];
+      notify(String(e?.message || e) || 'Could not update this issue', 'error');
     }
   }
 
