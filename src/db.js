@@ -2036,9 +2036,10 @@ export function setSeriesWatchState(db, seriesIds, state) {
       // alone decides.
       db.prepare(`DELETE FROM issue_wants WHERE series_id IN (${placeholders})`).run(...ids);
       if (state === 'unwatched') {
-        // nothing in the series is wanted any more — clear its queued rows
-        db.prepare(`UPDATE issues SET status='skipped'
-           WHERE series_id IN (${placeholders}) AND status IN ('queued','pending')`).run(...ids);
+        // nothing in the series is wanted any more — clear its queue rows
+        // (including failed attempts, which the Queue page also lists)
+        db.prepare(`UPDATE issues SET status='skipped', error=NULL
+           WHERE series_id IN (${placeholders}) AND status IN ('queued','pending','failed')`).run(...ids);
       }
     }
     db.prepare(`UPDATE series SET watch_state=?, followed=? WHERE id IN (${placeholders})`)
@@ -2071,8 +2072,12 @@ export function dequeueUnwantedIssues(db, cvIssueIds) {
   const ph = ids.map(() => '?').join(',');
   // Issue rows are keyed to CV issues by the 'cvissue:<id>' url the queue uses.
   const urls = ids.map((id) => 'cvissue:' + id);
-  const n = db.prepare(`UPDATE issues SET status='skipped'
-     WHERE url IN (${ph}) AND status IN ('queued','pending')`).run(...urls).changes;
+  // The Queue page lists queued/pending AND failed rows, so a failed attempt at
+  // something you no longer want has to go too. In-flight rows
+  // (downloading/grabbed/tagging) are left alone — those are already with a
+  // download client and must be cancelled from the Queue page.
+  const n = db.prepare(`UPDATE issues SET status='skipped', error=NULL
+     WHERE url IN (${ph}) AND status IN ('queued','pending','failed')`).run(...urls).changes;
   return n;
 }
 
