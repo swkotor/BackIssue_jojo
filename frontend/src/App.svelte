@@ -107,14 +107,16 @@ import EditMetadataModal from './components/EditMetadataModal.svelte';
     const library = p.get('library') || '';
     const facet = p.get('facet') || '';
     const collections = p.get('collections') === '1';
-    if (lastRail === filter + '\n' + q + '\n' + sort + '\n' + library + '\n' + facet + '\n' + collections) return;
-    lastRail = filter + '\n' + q + '\n' + sort + '\n' + library + '\n' + facet + '\n' + collections;
+    const ws = p.get('ws') || '';   // fork: watch-state narrowing
+    if (lastRail === filter + '\n' + q + '\n' + sort + '\n' + library + '\n' + facet + '\n' + collections + '\n' + ws) return;
+    lastRail = filter + '\n' + q + '\n' + sort + '\n' + library + '\n' + facet + '\n' + collections + '\n' + ws;
     rail.filter = filter;
     rail.search = q;
     rail.sort = sort;
     rail.library = library ? Number(library) : null;
     rail.facet = facet;
     rail.collections = collections;
+    rail.ws = ws;
     untrack(() => loadCollection());
   });
 

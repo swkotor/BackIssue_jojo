@@ -36,7 +36,7 @@
   // search, or the all-items view. The grid + its toolbar render only then.
   const browsing = $derived.by(() => {
     const p = new URLSearchParams(route.search);
-    return !!(p.get('library') || p.get('filter') || p.get('q') || p.get('all') || p.get('collections'));
+    return !!(p.get('library') || p.get('filter') || p.get('q') || p.get('all') || p.get('collections') || p.get('ws'));
   });
   const homeMode = $derived(!browsing);
   // "Collections" view: the library grid restricted to multi-volume book/
@@ -81,7 +81,7 @@
   function libParams() {
     const cur = new URLSearchParams(route.search);
     const p = new URLSearchParams();
-    for (const k of ['filter', 'q', 'sort', 'collections']) { const v = cur.get(k); if (v) p.set(k, v); }
+    for (const k of ['filter', 'q', 'sort', 'collections', 'ws']) { const v = cur.get(k); if (v) p.set(k, v); }
     const s = p.toString();
     return s ? '?' + s : '';
   }
@@ -340,6 +340,15 @@
         </button>
       {/each}
     </div>
+    <!-- fork: watch-state narrowing — independent of the chips above, so
+         "Incomplete + Watched" is expressible. -->
+    <select id="coll-ws" class="libx__ws" class:is-on={!!rail.ws} title="Filter by series status" aria-label="Series status"
+      value={rail.ws || ''} onchange={(e) => setQuery({ ws: e.currentTarget.value || null })}>
+      <option value="">All statuses</option>
+      <option value="watched">▶ Watched</option>
+      <option value="paused">❚❚ Paused</option>
+      <option value="unwatched">▬ Unwatched</option>
+    </select>
     <div class="libx__spacer"></div>
     <select id="coll-sort" class="libx__sort" title="Sort the collection" value={rail.sort}
       onchange={(e) => setQuery({ sort: e.currentTarget.value === 'title' ? null : e.currentTarget.value })}>
@@ -556,6 +565,9 @@
   .libx__count { font: 13px var(--font-mono); color: var(--faint); white-space: nowrap; flex: none; }
   .libx__count span { color: var(--text); }
   .libx__filters { display: flex; align-items: center; gap: 6px; flex: none; }
+  /* fork: series-status narrowing select */
+  .libx__ws { flex: none; }
+  .libx__ws.is-on { border-color: rgba(52,211,153,.55); color: #34d399; font-weight: 600; }
   .libx__chip { display: flex; align-items: center; gap: 6px; height: 32px; padding: 0 13px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: var(--muted); font: 600 12.5px var(--font-body); cursor: pointer; white-space: nowrap; flex: none; }
   .libx__chip.is-active { background: var(--accent); border-color: var(--accent); color: #fff; }
   .libx__chip-count { font: 600 10.5px var(--font-mono); background: var(--panel-2); color: var(--faint); border-radius: 999px; padding: 1px 6px; }

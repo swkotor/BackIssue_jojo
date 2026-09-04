@@ -214,6 +214,24 @@
     refresh(); // every item of that series resolves its series_id now
   }
 
+  // fork: mark every issue on this list wanted. Series the list references but
+  // the library doesn't track yet get added and parked as UNWATCHED, so only
+  // the list's own issues end up wanted — not the rest of the volume.
+  let wantBusy = $state(false);
+  async function wantList(wanted) {
+    wantBusy = true;
+    const r = await apiPost(`/api/lists/${det.id}/want`, { wanted, addMissingSeries: wanted });
+    wantBusy = false;
+    if (r?.error) return notify(r.error, 'error');
+    const bits = [`${wanted ? 'Wanted' : 'Un-wanted'} ${fmt(r.updated)} issue(s)`];
+    if (r.seriesAdded?.length) bits.push(`added ${fmt(r.seriesAdded.length)} series (unwatched)`);
+    if (r.dequeued) bits.push(`removed ${fmt(r.dequeued)} from the queue`);
+    if (r.skipped) bits.push(`${fmt(r.skipped)} skipped (series not in the library)`);
+    notify(bits.join(' · '), 'ok');
+    for (const e of r.errors || []) notify(e, 'error');
+    refresh();
+  }
+
   async function downloadItem(it) {
     const r = await apiPost(`/api/collection/${it.series_id}/download`, { cvIssueIds: [it.cv_issue_id] });
     if (r.error) return notify(r.error, 'error');
@@ -594,6 +612,16 @@
           <div class="listx__dsummary">{ownedCount}/{rows.length} owned{det.arc_cv_id ? ' · from a ComicVine arc' : det.source ? ' · from a CBL reading list' : ''}{det.mine === false ? ` · shared by ${det.owner || 'another user'}` : ''}{det.public && det.mine !== false ? ' · shared with everyone' : ''}</div>
         </div>
         <div class="listx__dactions">
+          {#if rows.length && can('library.manage')}
+            <button class="listx__want" disabled={wantBusy} onclick={() => wantList(true)}
+              title="Mark every issue on this list as wanted. Series not in the library are added and left unwatched, so only these issues get wanted.">
+              <Icon name="star" size={15} fill /> {wantBusy ? 'Working…' : `Want all (${fmt(rows.length)})`}
+            </button>
+            <button class="listx__unwant" disabled={wantBusy} onclick={() => wantList(false)}
+              title="Mark every issue on this list as not wanted (also removes them from the download queue)">
+              <Icon name="star" size={15} /> Unwant all
+            </button>
+          {/if}
           {#if missing.length && can('downloads.grab')}
             <button class="listx__dl" onclick={downloadMissing}><Icon name="download" size={15} /> Download missing ({fmt(missing.length)})</button>
           {/if}
@@ -658,6 +686,18 @@
 </section>
 
 <style>
+  /* fork: want-the-whole-list actions */
+  .listx__want, .listx__unwant {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 7px 13px; border-radius: 8px; cursor: pointer;
+    font-size: 12px; font-weight: 700; letter-spacing: .03em;
+    border: 1.5px solid rgba(251,191,36,.5); background: transparent; color: #fbbf24;
+  }
+  .listx__want { background: #fbbf24; color: #3b2a05; border-color: #fbbf24; }
+  .listx__want:hover:not(:disabled) { filter: brightness(1.08); }
+  .listx__unwant:hover:not(:disabled) { background: rgba(251,191,36,.12); }
+  .listx__want:disabled, .listx__unwant:disabled { opacity: .5; cursor: default; }
+
   .listx { display: grid; grid-template-columns: 300px 1fr; flex: 1; min-height: 0; }
   .listx__rail { border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
   .listx__rail-head { flex: none; padding: 16px 16px 12px; }

@@ -999,7 +999,7 @@ function collLeanCols(guard) {
 // A collection MEMBER = followed OR owns a valid file OR the caller personally
 // follows OR (self-described) has catalog issue rows. The optional scope narrows
 // by mature-visibility / library / search. Returns the WHERE fragment + its params.
-function membershipWhere({ guard, selfTypesLen, includeRestricted = true, library = null, search = '', restrictIds = null, collectionsOnly = false }) {
+function membershipWhere({ guard, selfTypesLen, includeRestricted = true, library = null, search = '', restrictIds = null, collectionsOnly = false, ws = null }) {
   const sql = `WHERE (s.followed=1 OR COALESCE(lf.file_count, 0) > 0
            OR mf.series_id IS NOT NULL
            ${selfTypesLen ? `OR (${guard} AND COALESCE(iss.bc_total, 0) > 0)` : ''})
@@ -1007,8 +1007,10 @@ function membershipWhere({ guard, selfTypesLen, includeRestricted = true, librar
       ${library != null ? 'AND s.library_id = @lib' : ''}
       ${restrictIds ? 'AND s.id IN (SELECT value FROM json_each(@restrictIds))' : ''}
       ${collectionsOnly && selfTypesLen ? `AND ${guard} AND COALESCE(iss.bc_total, 0) >= 2` : ''}
-      ${search ? 'AND (s.title LIKE @q OR cv.name LIKE @q OR cv.publisher LIKE @q)' : ''}`;
+      ${search ? 'AND (s.title LIKE @q OR cv.name LIKE @q OR cv.publisher LIKE @q)' : ''}
+      ${ws ? "AND COALESCE(NULLIF(s.watch_state,''),'watched') = @ws" : ''}`;
   const params = {
+    ...(ws ? { ws } : {}),
     ...(library != null ? { lib: library } : {}),
     ...(restrictIds ? { restrictIds: JSON.stringify(restrictIds) } : {}),
     ...(search ? { q: `%${search}%` } : {}),
@@ -1083,13 +1085,13 @@ function chipPredicateSql(filter, { guardOuter, seriesTypeList, params }) {
 // thread: better-sqlite3 is synchronous, and this is the app's heaviest read —
 // at 320k series it blocks the event loop for ~0.5-1s, stalling every other
 // request (pages, covers) behind it.
-export function buildCollCountSql({ keys = [], filter = 'all', search = '', includeRestricted = true, userId = null, library = null, restrictIds = null, collectionsOnly = false } = {}) {
+export function buildCollCountSql({ keys = [], filter = 'all', search = '', includeRestricted = true, userId = null, library = null, restrictIds = null, collectionsOnly = false, ws = null } = {}) {
   const { selfTypes, params: selfParams, guard } = selfTypeGuard('s.');
   const { guard: guardOuter } = selfTypeGuard('');
   const seriesTypes = [...SERIES_TYPES];
   const stParams = {}; seriesTypes.forEach((t, i) => { stParams['ktype' + i] = t; });
   const seriesTypeList = seriesTypes.length ? seriesTypes.map((_, i) => '@ktype' + i).join(',') : `''`;
-  const mem = membershipWhere({ guard, selfTypesLen: selfTypes.length, includeRestricted, library, search, restrictIds, collectionsOnly });
+  const mem = membershipWhere({ guard, selfTypesLen: selfTypes.length, includeRestricted, library, search, restrictIds, collectionsOnly, ws });
   const params = { uid: userId ?? -1, ...selfParams, ...stParams, ...mem.params };
   const predCtx = { guardOuter, seriesTypeList, params };
   const selects = keys.map((k) => k === 'all'
@@ -1223,13 +1225,15 @@ export function collectionSeries(db, { filter = 'all', excludeSelfDescribed = fa
 export function collectionPage(db, { keys = [], filter = 'all', limit = null, offset = 0, ...opts } = {}) {
   if (limit == null) {
     // Legacy fused path: map the whole set once, tally chips + rows in JS.
-    const all = mapCollection(db, opts);
+    let all = mapCollection(db, opts);
+    // fork: watch-state narrowing applies to the legacy fused path too
+    if (opts.ws) all = all.filter((r) => (r.watch_state || 'watched') === opts.ws);
     const counts = {};
     for (const k of keys) counts[k] = k === 'all' ? all.length : all.filter((r) => seriesMatchesFilter(r, k)).length;
     const rows = filter && filter !== 'all' ? all.filter((r) => seriesMatchesFilter(r, filter)) : all;
     return { rows, counts, total: rows.length };
   }
-  const { search = '', sort = 'title', includeRestricted = true, userId = null, library = null, restrictIds = null, collectionsOnly = false } = opts;
+  const { search = '', sort = 'title', includeRestricted = true, userId = null, library = null, restrictIds = null, collectionsOnly = false, ws = null } = opts;
   const cap = Math.max(1, Math.min(500, Number(limit) || 200));
   const off = Math.max(0, Number(offset) || 0);
   // Chip counts + this filter's total, one lean pass — but ONLY when chips are
@@ -1237,7 +1241,7 @@ export function collectionPage(db, { keys = [], filter = 'all', limit = null, of
   // scan (the total/counts don't change between pages of the same filter, and the
   // client already holds them). total is null then; the client keeps page 1's.
   const { counts, total } = keys.length
-    ? collCountPass(db, { keys, filter, search, includeRestricted, userId, library, restrictIds, collectionsOnly })
+    ? collCountPass(db, { keys, filter, search, includeRestricted, userId, library, restrictIds, collectionsOnly, ws })
     : { counts: {}, total: null };
   // Select the page's ids in sort order (lean scan), then hydrate the full shape.
   const { selfTypes, params: selfParams, guard } = selfTypeGuard('s.');
@@ -1245,7 +1249,7 @@ export function collectionPage(db, { keys = [], filter = 'all', limit = null, of
   const seriesTypes = [...SERIES_TYPES];
   const stParams = {}; seriesTypes.forEach((t, i) => { stParams['ktype' + i] = t; });
   const seriesTypeList = seriesTypes.length ? seriesTypes.map((_, i) => '@ktype' + i).join(',') : `''`;
-  const mem = membershipWhere({ guard, selfTypesLen: selfTypes.length, includeRestricted, library, search, restrictIds, collectionsOnly });
+  const mem = membershipWhere({ guard, selfTypesLen: selfTypes.length, includeRestricted, library, search, restrictIds, collectionsOnly, ws });
   const idParams = { uid: userId ?? -1, ...selfParams, ...stParams, ...mem.params, lim: cap, off };
   const pred = chipPredicateSql(filter, { guardOuter, seriesTypeList, params: idParams });
   const orderBy = COLL_ORDERS[sort] || COLL_ORDERS.title;
@@ -1310,6 +1314,7 @@ export function collectionPage(db, { keys = [], filter = 'all', limit = null, of
         ${libTerm}
         ${restrictIds ? 'AND s.id IN (SELECT value FROM json_each(@restrictIds))' : ''}
         ${search ? 'AND (s.title LIKE @q OR cv.name LIKE @q OR cv.publisher LIKE @q)' : ''}
+        ${ws ? "AND COALESCE(NULLIF(s.watch_state,''),'watched') = @ws" : ''}
         AND (${fastChipPred})
         ${FAST_ORDERS[sort]} LIMIT @lim OFFSET @off`).all(idParams)
     : db.prepare(`WITH ${collCtes(libraryScopeSql(library))},

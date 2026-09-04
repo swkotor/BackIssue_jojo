@@ -697,6 +697,52 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     try { lists.deleteList(db, req.user.id, Number(req.params.id)); res.json({ ok: true }); }
     catch (e) { listErr(res, e); }
   });
+  // --- fork: "want everything on this list" -------------------------------
+  // Marks every issue on the list explicitly wanted, and (optionally) adds any
+  // series the list references that we don't track yet. Newly added series are
+  // parked as UNWATCHED so nothing beyond the list's own issues gets wanted —
+  // the per-issue overrides written afterwards are what make the list issues
+  // wanted. Series already in the library keep their own watch state.
+  app.post('/api/lists/:id/want', async (req, res) => {
+    if (!users.roleGrants(db, req.user.role, 'library.manage', permCatalog)) {
+      return res.status(403).json({ error: "your role doesn't include the permission: Manage the library" });
+    }
+    const id = Number(req.params.id);
+    const body = req.body || {};
+    const addMissing = body.addMissingSeries !== false;
+    const load = () => lists.getList(db, req.user.id, id, { includeRestricted: canRestricted(req) });
+    let l = load();
+    if (!l) return res.status(404).json({ error: 'no such list' });
+
+    const errors = [];
+    const addedSeries = [];
+    if (addMissing) {
+      const need = [...new Set(l.items.filter((it) => !it.series_id && it.cv_series_id).map((it) => it.cv_series_id))];
+      for (const cvId of need) {
+        try {
+          const r = await addFromCv(cvId);
+          if (r?.seriesId != null) {
+            // Park it: only the list's own issues should be wanted.
+            setSeriesWatchState(db, r.seriesId, 'unwatched');
+            addedSeries.push({ id: r.seriesId, cv_id: cvId, title: r.title || null });
+          }
+        } catch (e) { errors.push(`series ${cvId}: ${String(e?.message || e)}`); }
+      }
+      if (addedSeries.length) l = load() || l;
+    }
+
+    // Only issues whose series we actually track can be wanted (an override on
+    // an untracked volume has nothing to download from).
+    const ids = l.items.filter((it) => it.series_id).map((it) => it.cv_issue_id);
+    const skipped = l.items.length - ids.length;
+    try {
+      const wanted = body.wanted === false ? false : true;
+      const n = setIssuesWanted(db, ids, wanted);
+      const dequeued = wanted ? 0 : dequeueUnwantedIssues(db, ids);
+      res.json({ updated: n, wanted, skipped, seriesAdded: addedSeries, dequeued, errors });
+    } catch (e) { res.status(500).json({ error: String(e?.message || e) }); }
+  });
+
   app.post('/api/lists/:id/items', (req, res) => {
     try { res.json({ added: lists.addItems(db, req.user.id, Number(req.params.id), (req.body || {}).cvIssueIds) }); }
     catch (e) { listErr(res, e); }
@@ -1320,7 +1366,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   // count recompute; the TTL is just the refresh cadence for the badges.
   const countsFor = (opts) => {
     const key = JSON.stringify([opts.userId, opts.includeRestricted, opts.library ?? null, opts.search || '',
-      opts.filter || 'all', opts.restrictIds || null, opts.collectionsOnly || false]);
+      opts.filter || 'all', opts.restrictIds || null, opts.collectionsOnly || false, opts.ws || null]);
     const hit = countsCache.get(key);
     if (hit) {
       if (Date.now() - hit.at >= COUNTS_TTL_MS && !hit.refreshing) {
@@ -1355,7 +1401,10 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   };
   app.get('/api/collection', async (req, res) => {
     const opts = { filter: req.query.filter, search: req.query.search, sort: req.query.sort, includeRestricted: canRestricted(req), userId: req.user.id, library: req.query.library ? Number(req.query.library) : null,
-      collectionsOnly: req.query.collections === '1' || req.query.collections === 'true' };
+      collectionsOnly: req.query.collections === '1' || req.query.collections === 'true',
+      // fork: narrow to one watch state (watched / paused / unwatched). Independent
+      // of the filter chips, so "Incomplete + Watched" is expressible.
+      ws: WATCH_STATES.includes(String(req.query.ws || '')) ? String(req.query.ws) : null };
     // Faceted filtering: a plugin (Shelves) resolves the opaque ?facet= selection
     // into matching series ids that narrow the real grid. Empty/no selection →
     // null (no restriction); a selection matching nothing → [] (no rows).
@@ -1410,6 +1459,8 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
       search: req.query.search, includeRestricted: canRestricted(req), userId: req.user.id,
       library: req.query.library ? Number(req.query.library) : null,
       collectionsOnly: req.query.collections === '1' || req.query.collections === 'true',
+      // fork: chip badges must reflect the active watch-state narrowing
+      ws: WATCH_STATES.includes(String(req.query.ws || '')) ? String(req.query.ws) : null,
     };
     if (req.query.facet) {
       try {
