@@ -150,6 +150,22 @@ export async function openVolume(id) {
     issue_count: cv ? cv.issue_count : (det.issues ? det.issues.length : 0),
     followed: sr.followed,
     type: sr.type || null,
+    // fork: the header's status buttons and publication chip read these — this
+    // object is a hand-picked subset of the payload, so anything omitted here
+    // silently falls back to a wrong default (missing watchState read as
+    // "paused" even when the series was set to unwatched).
+    monitored: sr.monitored,
+    watchState: sr.watchState,
+    pubStatus: sr.pubStatus,
+    metronStatus: sr.metronStatus,
+    restricted: sr.restricted,
+    library_id: sr.library_id ?? null,
+    cv_id: sr.cv_id ?? null,
+    cv_locked: sr.cv_locked ?? 0,
+    sourced: sr.sourced,
+    path: sr.path ?? null,
+    aliases: sr.aliases ?? '',
+    cv_aliases: sr.cv_aliases,
   };
   detail.det = det;
   detail.failed = false;

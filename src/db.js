@@ -1957,13 +1957,19 @@ export function listQueue(db, limit = 200) {
      FROM issues i JOIN series s ON s.id = i.series_id
      LEFT JOIN cv_series cv ON cv.comicvine_id = s.cv_id
      WHERE i.status IN ('queued','downloading','grabbed','tagging','failed')
+       -- fork: never list an issue the user has explicitly unwanted
+       AND NOT EXISTS (SELECT 1 FROM issue_wants iw
+                        WHERE iw.wanted = 0 AND 'cvissue:' || iw.cv_issue_id = i.url)
      ORDER BY CASE i.status WHEN 'downloading' THEN 0 WHEN 'grabbed' THEN 1 WHEN 'tagging' THEN 2 WHEN 'queued' THEN 3 ELSE 4 END, i.id
      LIMIT ?`
   ).all(limit);
 }
 
 export function countQueue(db) {
-  return db.prepare("SELECT COUNT(*) n FROM issues WHERE status IN ('queued','downloading','grabbed')").get().n;
+  return db.prepare(`SELECT COUNT(*) n FROM issues i
+     WHERE i.status IN ('queued','downloading','grabbed')
+       AND NOT EXISTS (SELECT 1 FROM issue_wants iw
+                        WHERE iw.wanted = 0 AND 'cvissue:' || iw.cv_issue_id = i.url)`).get().n;
 }
 
 export function queuedCount(db) {
@@ -2076,9 +2082,53 @@ export function dequeueUnwantedIssues(db, cvIssueIds) {
   // something you no longer want has to go too. In-flight rows
   // (downloading/grabbed/tagging) are left alone — those are already with a
   // download client and must be cancelled from the Queue page.
-  const n = db.prepare(`UPDATE issues SET status='skipped', error=NULL
-     WHERE url IN (${ph}) AND status IN ('queued','pending','failed')`).run(...urls).changes;
+  const CLEARABLE = "status IN ('queued','pending','failed')";
+  let n = db.prepare(`UPDATE issues SET status='skipped', error=NULL
+     WHERE url IN (${ph}) AND ${CLEARABLE}`).run(...urls).changes;
+
+  // A queue row is linked to its CV issue by NUMBER as well as by url — the row
+  // can carry an older cv id (re-matched volume, sibling edition), in which case
+  // the url match above misses it. Clear those too: same series, same number.
+  const byNum = db.prepare(`SELECT i.id, i.issue_number FROM issues i
+      JOIN series s ON s.id = i.series_id
+      JOIN cv_issues ci ON ci.cv_series_id = s.cv_id
+     WHERE ci.comicvine_id = ? AND ${CLEARABLE}`);
+  const numOf = db.prepare('SELECT issue_number FROM cv_issues WHERE comicvine_id = ?');
+  const clear = db.prepare("UPDATE issues SET status='skipped', error=NULL WHERE id = ?");
+  for (const id of ids) {
+    const want = numOf.get(id);
+    if (!want) continue;
+    const target = normalizeNumber(want.issue_number);
+    if (!target) continue;
+    for (const row of byNum.all(id)) {
+      if (normalizeNumber(row.issue_number) === target) n += clear.run(row.id).changes;
+    }
+  }
   return n;
+}
+
+// fork: the Queue page works in `issues` row ids, not ComicVine ids. Map a set
+// of queue rows to the CV issues they represent (by url, else by number within
+// the row's series), so "unwant" from the queue writes the same override the
+// series page does.
+export function cvIssueIdsForIssueRows(db, issueIds) {
+  const ids = (Array.isArray(issueIds) ? issueIds : [issueIds]).map(Number).filter(Boolean);
+  if (!ids.length) return [];
+  const rows = db.prepare(`SELECT i.id, i.url, i.issue_number, s.cv_id
+      FROM issues i JOIN series s ON s.id = i.series_id
+     WHERE i.id IN (${ids.map(() => '?').join(',')})`).all(...ids);
+  const out = new Set();
+  const byNum = db.prepare('SELECT comicvine_id, issue_number FROM cv_issues WHERE cv_series_id = ?');
+  for (const r of rows) {
+    const m = /^cvissue:(\d+)$/.exec(String(r.url || ''));
+    if (m) { out.add(Number(m[1])); continue; }
+    if (!r.cv_id) continue;
+    const target = normalizeNumber(r.issue_number);
+    for (const ci of byNum.all(r.cv_id)) {
+      if (normalizeNumber(ci.issue_number) === target) { out.add(ci.comicvine_id); break; }
+    }
+  }
+  return [...out];
 }
 
 // Drop explicit overrides so the issues follow their series state again.

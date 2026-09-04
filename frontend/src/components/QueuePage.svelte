@@ -145,6 +145,71 @@
     notify('Download cancelled — removed from the client.', 'ok');
     renderQueue();
   }
+  // fork: multi-select over the queue rows (shift-click selects a range).
+  let picked = $state(new Set());
+  let lastPicked = $state(null);
+  let bulkBusy = $state(false);
+  const pickedCount = $derived(picked.size);
+  const allShown = $derived(visibleItems.length > 0 && visibleItems.every((i) => picked.has(i.id)));
+
+  function togglePick(it, e) {
+    const next = new Set(picked);
+    if (e?.shiftKey && lastPicked != null) {
+      const order = visibleItems.map((i) => i.id);
+      const a = order.indexOf(lastPicked); const b = order.indexOf(it.id);
+      if (a !== -1 && b !== -1) {
+        const [from, to] = a < b ? [a, b] : [b, a];
+        const on = !next.has(it.id);
+        for (let i = from; i <= to; i++) { if (on) next.add(order[i]); else next.delete(order[i]); }
+        picked = next; lastPicked = it.id; return;
+      }
+    }
+    if (next.has(it.id)) next.delete(it.id); else next.add(it.id);
+    picked = next; lastPicked = it.id;
+  }
+  function toggleAll() {
+    picked = allShown ? new Set() : new Set(visibleItems.map((i) => i.id));
+    lastPicked = null;
+  }
+  const pickedRows = () => visibleItems.filter((i) => picked.has(i.id));
+
+  // Retry every selected failed row.
+  async function retrySelected() {
+    bulkBusy = true;
+    try {
+      for (const it of pickedRows()) if (it.status === 'failed') await apiPost(`/api/queue/retry/${it.id}`);
+      picked = new Set();
+      await renderQueue();
+    } finally { bulkBusy = false; }
+  }
+
+  // Remove selected rows from the queue: queued ones are cancelled, in-flight
+  // ones are cancelled on the download client too, failed ones are cleared.
+  async function removeSelected() {
+    bulkBusy = true;
+    try {
+      for (const it of pickedRows()) {
+        if (it.grab_id && ['grabbed', 'downloading'].includes(it.status)) await apiPost(`/api/grabs/${it.grab_id}/cancel`);
+        else if (it.status === 'queued') await apiPost(`/api/queue/cancel/${it.id}`);
+        else if (it.status === 'failed') await apiPost('/api/issues/wanted', { issueIds: [it.id], wanted: false, keepWant: true });
+      }
+      picked = new Set();
+      await renderQueue();
+    } finally { bulkBusy = false; }
+  }
+
+  // Stop wanting the selected issues entirely — they leave the queue and won't
+  // be searched for again.
+  async function unwantSelected() {
+    bulkBusy = true;
+    try {
+      const ids = pickedRows().map((i) => i.id);
+      if (ids.length) await apiPost('/api/issues/wanted', { issueIds: ids, wanted: false });
+      picked = new Set();
+      await renderQueue();
+    } finally { bulkBusy = false; }
+  }
+
   async function retryOne(id) {
     const r = await apiPost(`/api/queue/retry/${id}`);
     if (r?.error) notify(r.error, 'error');
@@ -216,6 +281,21 @@
       {/if}
     </div>
 
+    {#if visibleItems.length && can('downloads.grab')}
+      <div class="qx__band qx__bulk">
+        <label class="qx__selall"><input type="checkbox" checked={allShown} onchange={toggleAll} /> Select all shown</label>
+        {#if pickedCount}
+          <span class="qx__bulkcount">{pickedCount} selected</span>
+          <button class="qx__bulkbtn" disabled={bulkBusy} onclick={retrySelected}><Icon name="refresh" size={14} /> Retry</button>
+          <button class="qx__bulkbtn" disabled={bulkBusy} onclick={removeSelected}><Icon name="close" size={14} /> Remove from queue</button>
+          <button class="qx__bulkbtn qx__bulkbtn--unwant" disabled={bulkBusy} onclick={unwantSelected}>▬ Unwant</button>
+          <button class="qx__bulkbtn qx__bulkbtn--plain" onclick={() => { picked = new Set(); }}>Clear</button>
+        {:else}
+          <span class="qx__bulkhint">Tick rows to retry, remove or unwant them in bulk · shift-click selects a range</span>
+        {/if}
+      </div>
+    {/if}
+
     <!-- Scrolling list -->
     <div class="qx__scroll">
       <div class="qx__list">
@@ -249,7 +329,11 @@
           </div>
         {/each}
         {#each visibleItems as it (it.id)}
-          <div class="qx__row" class:qx__row--failed={it.status === 'failed'}>
+          <div class="qx__row" class:qx__row--failed={it.status === 'failed'} class:is-picked={picked.has(it.id)}>
+            {#if can('downloads.grab')}
+              <input type="checkbox" class="qx__check" checked={picked.has(it.id)}
+                onclick={(e) => { e.stopPropagation(); togglePick(it, e); }} />
+            {/if}
             <div class="qx__cover">{#if rowNum(it)}<span class="qx__num">#{rowNum(it)}</span>{:else}<Icon name="download" size={16} />{/if}</div>
             <div class="qx__main">
               <div class="qx__toprow">

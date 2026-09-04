@@ -7,7 +7,7 @@ import fssync from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import config from './config.js';
 import { initCountWorker, workerGetRow } from './countWorker.js';
-import { listSeries, listIssues, queueIssues, countByStatus, requeueFailed, clearFailed, setFollowed, listQueue, cancelQueued, cancelIssue, collectionSeries, collectionCounts, collectionPage, buildCollCountSql, collCountRowToResult, seriesCollectionDetail, setSeriesPath, getSeriesById, getSeriesByCvId, getCvIssue, ensureCvIssueRow, clearIssuesForRedownload, listImportHistory, listFailedGrabs, listBlacklist, deleteBlacklistEntry, clearBlacklist, listWantedIssues, activePackGrabs, listCvIssues, setSeriesRestricted, isSeriesRestricted, setSeriesType, restrictedSeriesIds, isCvIssueRestricted, createLibrary, listLibraries, libraryFolders, updateLibrary, deleteLibrary, assignSeriesLibrary, setUserFollow, updateCvSeriesUser, updateCvIssueUser, resetCvSeriesUser, resetCvIssueUser, setSeriesWatchState, setIssuesWanted, clearIssueWants, seriesWantedCounts, dequeueUnwantedIssues, WATCH_STATES } from './db.js';
+import { listSeries, listIssues, queueIssues, countByStatus, requeueFailed, clearFailed, setFollowed, listQueue, cancelQueued, cancelIssue, collectionSeries, collectionCounts, collectionPage, buildCollCountSql, collCountRowToResult, seriesCollectionDetail, setSeriesPath, getSeriesById, getSeriesByCvId, getCvIssue, ensureCvIssueRow, clearIssuesForRedownload, listImportHistory, listFailedGrabs, listBlacklist, deleteBlacklistEntry, clearBlacklist, listWantedIssues, activePackGrabs, listCvIssues, setSeriesRestricted, isSeriesRestricted, setSeriesType, restrictedSeriesIds, isCvIssueRestricted, createLibrary, listLibraries, libraryFolders, updateLibrary, deleteLibrary, assignSeriesLibrary, setUserFollow, updateCvSeriesUser, updateCvIssueUser, resetCvSeriesUser, resetCvIssueUser, setSeriesWatchState, setIssuesWanted, clearIssueWants, seriesWantedCounts, dequeueUnwantedIssues, cvIssueIdsForIssueRows, WATCH_STATES } from './db.js';
 import { resolveSeriesDir, defaultRootedDir } from './paths.js';
 import { planSeries, refileSeries, planLibrary, canRefile } from './refile.js';
 import { seriesFolderFromPattern, fileStemFromPattern } from './naming.js';
@@ -1663,8 +1663,19 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   // { cvIssueIds: [..], clear: true }         → follow the series state again
   app.post('/api/issues/wanted', (req, res) => {
     const body = req.body || {};
-    const ids = Array.isArray(body.cvIssueIds) ? body.cvIssueIds
+    let ids = Array.isArray(body.cvIssueIds) ? body.cvIssueIds
       : (body.cvIssueId != null ? [body.cvIssueId] : []);
+    // The Queue page passes `issues` row ids — resolve them to CV issue ids.
+    if (!ids.length && Array.isArray(body.issueIds) && body.issueIds.length) {
+      ids = cvIssueIdsForIssueRows(db, body.issueIds);
+      if (!ids.length) {
+        // No CV identity (unmatched series): just clear the rows themselves.
+        const rows = body.issueIds.map(Number).filter(Boolean);
+        const n = rows.length ? db.prepare(`UPDATE issues SET status='skipped', error=NULL
+             WHERE id IN (${rows.map(() => '?').join(',')}) AND status IN ('queued','pending','failed')`).run(...rows).changes : 0;
+        return res.json({ updated: 0, dequeued: n });
+      }
+    }
     if (!ids.length) return res.status(400).json({ error: 'no issue ids' });
     try {
       if (body.clear) return res.json({ cleared: clearIssueWants(db, ids) });
