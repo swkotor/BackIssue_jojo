@@ -93,6 +93,19 @@
     if (railSelect.has(s.id)) railSelect.delete(s.id); else railSelect.add(s.id);
   }
 
+  // fork: bulk watch state for the selected series
+  async function setWatchState(state) {
+    const ids = [...railSelect];
+    if (!ids.length) return;
+    const r = await apiPost('/api/series/watch-state', { ids, state });
+    if (r?.error) { notify(r.error, 'error'); return; }
+    for (const row of rail.rows || []) {
+      if (railSelect.has(row.id)) { row.watch_state = state; row.followed = state === 'watched' ? 1 : row.followed; }
+    }
+    rail.rows = [...(rail.rows || [])];
+    notify(`${ids.length} series set to ${state}.`, 'ok');
+  }
+
   async function toggleMon(s) {
     const follow = !s.followed;
     s.followed = follow ? 1 : 0; // optimistic — personal follow, not the monitor flag
@@ -316,6 +329,13 @@
       <button class="libx__link" onclick={() => bulk('follow')}><Icon name="star" fill size={14} /> Follow</button>
       <button class="libx__link" onclick={() => bulk('unfollow')}><Icon name="star" size={14} /> Unfollow</button>
       <button class="libx__link" onclick={() => bulk('download-missing')}><Icon name="download" size={14} /> Download missing</button>
+      <select class="libx__movesel" title="Watched: new issues are wanted automatically. Paused: keep current wants, don't add new ones. Unwatched: want nothing."
+        onchange={(e) => { const v = e.currentTarget.value; e.currentTarget.value = ''; if (v) setWatchState(v); }}>
+        <option value="">Status…</option>
+        <option value="watched">Watched</option>
+        <option value="paused">Paused</option>
+        <option value="unwatched">Unwatched</option>
+      </select>
       {#if (status.libraries || []).length}
         <select class="libx__movesel" title="Move the selected series into a library"
           onchange={(e) => { const v = e.currentTarget.value; e.currentTarget.value = ''; if (v !== '') moveSelected(v === 'default' ? null : Number(v)); }}>
@@ -429,6 +449,9 @@
             <span class="libx-row__dim libx-col--wide" title="Newest known issue's cover date">{s.matched ? (s.latest || '—') : '—'}</span>
             <span class="libx-row__dim libx-col--wide libx-col--right">{s.size ? humanBytes(s.size) : '—'}</span>
             {#if isTrusted()}
+              {#if s.watch_state && s.watch_state !== 'watched'}
+                <span class="libx-row__wstate" class:is-paused={s.watch_state === 'paused'} title={s.watch_state === 'paused' ? 'Paused — existing wants kept, new issues not auto-wanted' : 'Unwatched — nothing is wanted'}>{s.watch_state}</span>
+              {/if}
               <button class="libx-row__star" class:is-on={s.followed} title={s.followed ? 'Followed — click to unfollow' : 'Not followed — click to follow'} aria-label={s.followed ? 'Unfollow' : 'Follow'} onclick={(e) => { e.stopPropagation(); toggleMon(s); }}><Icon name="star" fill={!!s.followed} size={15} /></button>
             {:else}<span></span>{/if}
           </div>
@@ -508,6 +531,13 @@
   .libx-row { border-bottom: 1px solid #2a2536; cursor: pointer; }
   .libx-row:last-child { border-bottom: none; }
   .libx-row.is-selected { background: rgba(255,45,111,.08); }
+  /* fork: watch-state pill */
+  .libx-row__wstate {
+    font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+    padding: 2px 7px; border-radius: 20px; margin-right: 6px; flex-shrink: 0;
+    background: rgba(148,163,184,.16); color: #94a3b8;
+  }
+  .libx-row__wstate.is-paused { background: rgba(251,191,36,.16); color: #fbbf24; }
   .libx-row :global(.cover) { width: 38px; height: 52px; }
   .libx-row__main { min-width: 0; }
   .libx-row__title { font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -343,6 +343,26 @@
     loadCollection();
   }
 
+  // fork: tri-state watch selector.
+  //   watched   — new issues are wanted automatically
+  //   paused    — keep the issues already wanted, don't add new ones
+  //   unwatched — nothing in this series is wanted
+  async function setWatchState(state) {
+    if (!s) return;
+    try {
+      const r = await apiPost('/api/series/watch-state', { ids: [s.id], state });
+      if (r?.error) return notify(r.error, 'error');
+    } catch { return notify('Could not update — is the app reachable?', 'error'); }
+    detail.series.watchState = state;
+    detail.series.monitored = state === 'watched' ? 1 : 0;
+    notify({
+      watched: 'Watched — new issues will be wanted automatically.',
+      paused: 'Paused — existing wanted issues kept, new ones will not be added.',
+      unwatched: 'Unwatched — nothing in this series is wanted.',
+    }[state], 'ok');
+    loadCollection();
+  }
+
   // Move the series into an explicit library (or back to the default). The
   // library's type comes along — its members behave like the library says.
   async function moveToLibrary(libraryId) {
@@ -642,8 +662,17 @@
                 {#if moreOpen}
                   <div class="series-more__menu" role="menu">
                     {#if !isLocal && can('library.manage')}
-                      <button class="menu__item" role="menuitem" title="Auto-download: should the system search for and fetch this series' new/missing issues?"
-                        onclick={() => { moreOpen = false; toggleMonitored(); }}><Icon name="download" /> {s.monitored ? 'Auto-download: on' : 'Auto-download: off'}</button>
+                      {@const ws = s.watchState || (s.monitored ? 'watched' : 'paused')}
+                      <div class="menu__label">Status</div>
+                      <button class="menu__item" role="menuitem" class:is-on={ws === 'watched'}
+                        title="Watched — new issues are automatically wanted and will be searched for"
+                        onclick={() => { moreOpen = false; setWatchState('watched'); }}><Icon name="download" /> Watched{ws === 'watched' ? ' ✓' : ''}</button>
+                      <button class="menu__item" role="menuitem" class:is-on={ws === 'paused'}
+                        title="Paused — issues already wanted stay wanted, but new issues are not added"
+                        onclick={() => { moreOpen = false; setWatchState('paused'); }}><Icon name="clock" /> Paused{ws === 'paused' ? ' ✓' : ''}</button>
+                      <button class="menu__item" role="menuitem" class:is-on={ws === 'unwatched'}
+                        title="Unwatched — no issue of this series is wanted"
+                        onclick={() => { moreOpen = false; setWatchState('unwatched'); }}><Icon name="x" /> Unwatched{ws === 'unwatched' ? ' ✓' : ''}</button>
                     {/if}
                     {#if isTrusted()}
                       {#if !isLocal}
@@ -878,6 +907,10 @@
 </section>
 
 <style>
+  /* fork: watch-state menu */
+  .menu__label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; padding: 8px 12px 2px; }
+  .menu__item.is-on { color: var(--accent, #7c5cff); font-weight: 600; }
+
   /* Completion overview in the hero: segmented bar + per-state legend. */
   .sx-comp { max-width: 600px; margin: 4px 0 16px; }
   .sx-comp__top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }

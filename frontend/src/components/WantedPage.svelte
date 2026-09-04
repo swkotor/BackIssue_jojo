@@ -70,6 +70,39 @@
     renderWanted();
   }
 
+  // fork: multi-select + explicit wanted flags
+  let selected = $state(new Set());
+  let bulkBusy = $state(false);
+  const selCount = $derived(selected.size);
+
+  function toggleSel(id) {
+    const next = new Set(selected);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    selected = next;
+  }
+  function selectGroup(g, on) {
+    const next = new Set(selected);
+    for (const it of g.issues) { if (on) next.add(it.cv_issue_id); else next.delete(it.cv_issue_id); }
+    selected = next;
+  }
+  function clearSel() { selected = new Set(); }
+
+  async function markWanted(wanted) {
+    if (!selected.size) return;
+    bulkBusy = true;
+    try {
+      await apiPost('/api/issues/wanted', { cvIssueIds: [...selected], wanted });
+      clearSel();
+      await renderWanted();
+    } finally { bulkBusy = false; }
+  }
+
+  async function downloadSelected() {
+    const ids = new Set(selected);
+    clearSel();
+    for (const it of items) if (ids.has(it.cv_issue_id)) await download(it);
+  }
+
   const IN_FLIGHT = ['queued', 'downloading', 'grabbed', 'tagging'];
   async function download(it) {
     it._busy = true;
@@ -161,12 +194,27 @@
         </div>
       {/if}
 
+      {#if selCount}
+        <div class="wx__bulk">
+          <span class="wx__bulk-count">{selCount} selected</span>
+          <button class="wx__bulk-btn is-want" disabled={bulkBusy} onclick={() => markWanted(true)}>Mark wanted</button>
+          <button class="wx__bulk-btn" disabled={bulkBusy} onclick={() => markWanted(false)}>Not wanted</button>
+          {#if can('downloads.grab')}
+            <button class="wx__bulk-btn" disabled={bulkBusy} onclick={downloadSelected}>Download selected</button>
+          {/if}
+          <button class="wx__bulk-btn is-plain" onclick={clearSel}>Clear</button>
+        </div>
+      {/if}
+
       {#each groups as g (g.id)}
         {@const open = !collapsed[g.id]}
         <div class="wx__card">
           <div class="wx__series" role="button" tabindex="0"
             onclick={() => { collapsed = { ...collapsed, [g.id]: open }; }}
             onkeydown={(e) => { if (e.key === 'Enter') collapsed = { ...collapsed, [g.id]: open }; }}>
+            <input type="checkbox" class="wx__check" title="Select every issue shown for this series"
+              checked={g.issues.every((i) => selected.has(i.cv_issue_id))}
+              onclick={(e) => { e.stopPropagation(); selectGroup(g, e.currentTarget.checked); }} />
             <div class="wx__cover"><Cover coverUrl={g.cover} title={g.title || '?'} /></div>
             <div class="wx__series-main">
               <div class="wx__series-title">
@@ -186,9 +234,12 @@
           {#if open}
             <div class="wx__issues">
               {#each g.issues as it (it.cv_issue_id)}
-                <div class="wx__row">
+                <div class="wx__row" class:is-picked={selected.has(it.cv_issue_id)}>
+                  <input type="checkbox" class="wx__check" checked={selected.has(it.cv_issue_id)}
+                    onclick={() => toggleSel(it.cv_issue_id)} />
                   <span class="wx__num">#{it.issue_number ?? '?'}</span>
                   <span class="wx__name">{it.issue_name || '—'}</span>
+                  {#if it.wanted}<span class="wx__wantpill" title="Wanted — will be searched for">wanted</span>{/if}
                   {#if it.queue_status && IN_FLIGHT.includes(it.queue_status)}
                     <Badge status={it.queue_status} />
                   {:else if it._busy}
@@ -211,6 +262,31 @@
 </main>
 
 <style>
+  /* fork: multi-select */
+  .wx__check { width: 15px; height: 15px; accent-color: var(--accent, #7c5cff); cursor: pointer; flex-shrink: 0; }
+  .wx__bulk {
+    position: sticky; top: 0; z-index: 3;
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 10px 12px; margin-bottom: 10px;
+    border: 1px solid var(--line, #2a2e3b); border-radius: 10px;
+    background: var(--panel, #1a1d27);
+  }
+  .wx__bulk-count { font-weight: 600; font-size: 13px; margin-right: 4px; }
+  .wx__bulk-btn {
+    border: 1px solid var(--line, #2a2e3b); background: transparent; color: inherit;
+    border-radius: 8px; padding: 6px 12px; font-size: 12.5px; font-weight: 600; cursor: pointer;
+  }
+  .wx__bulk-btn:hover:not(:disabled) { border-color: var(--accent, #7c5cff); }
+  .wx__bulk-btn:disabled { opacity: .5; cursor: wait; }
+  .wx__bulk-btn.is-want { background: var(--accent, #7c5cff); border-color: transparent; color: #fff; }
+  .wx__bulk-btn.is-plain { opacity: .7; }
+  .wx__row.is-picked { background: color-mix(in srgb, var(--accent, #7c5cff) 12%, transparent); }
+  .wx__wantpill {
+    font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+    padding: 2px 7px; border-radius: 20px; flex-shrink: 0;
+    background: color-mix(in srgb, var(--accent, #7c5cff) 18%, transparent); color: var(--accent, #7c5cff);
+  }
+
   /* Layout (display:flex, column, height:100%) comes from the route reveal
      rule `body.wanted .wanted-page` — the page must NOT set its own display
      here or it overrides the `.scan-page { display:none }` hide and shows on

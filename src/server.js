@@ -7,7 +7,7 @@ import fssync from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import config from './config.js';
 import { initCountWorker, workerGetRow } from './countWorker.js';
-import { listSeries, listIssues, queueIssues, countByStatus, requeueFailed, clearFailed, setFollowed, listQueue, cancelQueued, cancelIssue, collectionSeries, collectionCounts, collectionPage, buildCollCountSql, collCountRowToResult, seriesCollectionDetail, setSeriesPath, getSeriesById, getSeriesByCvId, getCvIssue, ensureCvIssueRow, clearIssuesForRedownload, listImportHistory, listFailedGrabs, listBlacklist, deleteBlacklistEntry, clearBlacklist, listWantedIssues, activePackGrabs, listCvIssues, setSeriesRestricted, isSeriesRestricted, setSeriesType, restrictedSeriesIds, isCvIssueRestricted, createLibrary, listLibraries, libraryFolders, updateLibrary, deleteLibrary, assignSeriesLibrary, setUserFollow, updateCvSeriesUser, updateCvIssueUser, resetCvSeriesUser, resetCvIssueUser } from './db.js';
+import { listSeries, listIssues, queueIssues, countByStatus, requeueFailed, clearFailed, setFollowed, listQueue, cancelQueued, cancelIssue, collectionSeries, collectionCounts, collectionPage, buildCollCountSql, collCountRowToResult, seriesCollectionDetail, setSeriesPath, getSeriesById, getSeriesByCvId, getCvIssue, ensureCvIssueRow, clearIssuesForRedownload, listImportHistory, listFailedGrabs, listBlacklist, deleteBlacklistEntry, clearBlacklist, listWantedIssues, activePackGrabs, listCvIssues, setSeriesRestricted, isSeriesRestricted, setSeriesType, restrictedSeriesIds, isCvIssueRestricted, createLibrary, listLibraries, libraryFolders, updateLibrary, deleteLibrary, assignSeriesLibrary, setUserFollow, updateCvSeriesUser, updateCvIssueUser, resetCvSeriesUser, resetCvIssueUser, setSeriesWatchState, setIssuesWanted, clearIssueWants, seriesWantedCounts, WATCH_STATES } from './db.js';
 import { resolveSeriesDir, defaultRootedDir } from './paths.js';
 import { planSeries, refileSeries, planLibrary, canRefile } from './refile.js';
 import { seriesFolderFromPattern, fileStemFromPattern } from './naming.js';
@@ -1625,6 +1625,45 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     const follow = !!(req.body && req.body.follow);
     setUserFollow(db, req.user.id, Number(req.params.id), follow);
     res.json({ followed: follow });
+  });
+
+  // --- fork: watch state (watched | paused | unwatched) --------------------
+  // Bulk-capable: the Library grid sends a list of ids, the series page sends
+  // one. 'watched' auto-wants new issues, 'paused' keeps existing wants but
+  // stops auto-wanting new ones, 'unwatched' wants nothing.
+  app.post('/api/series/watch-state', (req, res) => {
+    const body = req.body || {};
+    const state = String(body.state || '');
+    if (!WATCH_STATES.includes(state)) {
+      return res.status(400).json({ error: `state must be one of ${WATCH_STATES.join(', ')}` });
+    }
+    const ids = Array.isArray(body.ids) ? body.ids : (body.id != null ? [body.id] : []);
+    if (!ids.length) return res.status(400).json({ error: 'no series ids' });
+    try {
+      const n = setSeriesWatchState(db, ids, state);
+      res.json({ updated: n, state, wanted: seriesWantedCounts(db, ids) });
+    } catch (e) { res.status(500).json({ error: String(e?.message || e) }); }
+  });
+
+  // Wanted counts for a set of series (UI badges after a bulk change).
+  app.get('/api/series/wanted-counts', (req, res) => {
+    const ids = String(req.query.ids || '').split(',').map(Number).filter(Boolean);
+    res.json(seriesWantedCounts(db, ids));
+  });
+
+  // --- fork: explicit per-issue wanted flags -------------------------------
+  // { cvIssueIds: [..], wanted: true|false }  → mark issues wanted/not wanted
+  // { cvIssueIds: [..], clear: true }         → follow the series state again
+  app.post('/api/issues/wanted', (req, res) => {
+    const body = req.body || {};
+    const ids = Array.isArray(body.cvIssueIds) ? body.cvIssueIds
+      : (body.cvIssueId != null ? [body.cvIssueId] : []);
+    if (!ids.length) return res.status(400).json({ error: 'no issue ids' });
+    try {
+      if (body.clear) return res.json({ cleared: clearIssueWants(db, ids) });
+      const n = setIssuesWanted(db, ids, !!body.wanted);
+      res.json({ updated: n, wanted: !!body.wanted });
+    } catch (e) { res.status(500).json({ error: String(e?.message || e) }); }
   });
 
   // --- ComicVine metadata ---

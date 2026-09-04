@@ -211,6 +211,50 @@ function migrate(db) {
   db.exec('CREATE INDEX IF NOT EXISTS idx_series_title ON series(title)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_series_type ON series(type)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_series_followed ON series(followed) WHERE followed=1');
+
+  // --- fork: explicit watch state + per-issue wanted overrides ---------------
+  // series.watch_state is a tri-state monitor flag:
+  //   'watched'   — new issues are automatically wanted (classic followed=1)
+  //   'paused'    — existing wants are kept, new issues arrive NOT wanted
+  //   'unwatched' — nothing in the series is wanted
+  // series.followed is kept in sync (1 for watched) so plugins and any query
+  // that still reads it keep working.
+  if (!cols.includes('watch_state')) {
+    db.exec("ALTER TABLE series ADD COLUMN watch_state TEXT NOT NULL DEFAULT 'paused'");
+    // Preserve today's behaviour: followed series become 'watched'; the rest
+    // become 'paused' (their existing backlog stays wanted, see issue_wants).
+    db.exec("UPDATE series SET watch_state = CASE WHEN followed=1 THEN 'watched' ELSE 'paused' END");
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_series_watch_state ON series(watch_state)');
+
+  // Explicit per-issue overrides, keyed by ComicVine issue id (the identity the
+  // wanted list is built from). A row here always wins over the series state,
+  // so a single issue can be pulled from an unwatched series, or dropped from a
+  // watched one.
+  db.exec(`CREATE TABLE IF NOT EXISTS issue_wants (
+    cv_issue_id INTEGER PRIMARY KEY,
+    series_id INTEGER,
+    wanted INTEGER NOT NULL DEFAULT 1,
+    source TEXT NOT NULL DEFAULT 'manual', -- 'manual' | 'freeze' (set when pausing)
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_issue_wants_series ON issue_wants(series_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_issue_wants_wanted ON issue_wants(wanted)');
+
+  // One-time freeze for series that were NOT followed before this fork: their
+  // backlog was wanted purely because files exist on disk, so materialise it,
+  // otherwise flipping them to 'paused' above would silently un-want it.
+  const frozen = db.prepare("SELECT COUNT(*) n FROM issue_wants WHERE source='freeze'").get().n;
+  const needsFreeze = db.prepare("SELECT COUNT(*) n FROM series WHERE watch_state='paused'").get().n;
+  if (!frozen && needsFreeze) {
+    db.exec(`INSERT OR IGNORE INTO issue_wants (cv_issue_id, series_id, wanted, source)
+      SELECT ci.comicvine_id, s.id, 1, 'freeze'
+        FROM series s
+        JOIN cv_issues ci ON ci.cv_series_id = s.cv_id
+       WHERE s.watch_state='paused'
+         AND EXISTS(SELECT 1 FROM library_files lf WHERE lf.series_id=s.id AND lf.valid=1)
+         AND NOT EXISTS (SELECT 1 FROM library_files lf2 WHERE lf2.cv_issue_id = ci.comicvine_id AND lf2.valid=1)`);
+  }
   // restrictedSeriesIds runs per request for non-mature roles (and on several
   // queue/history routes unconditionally) — a partial index makes it an index
   // scan of the few restricted rows instead of a 320k-row table scan.
@@ -611,13 +655,19 @@ export function listWantedIssues(db, { limit = 200, offset = 0, followedOnly = f
   //    and is what the Wanted page's "Following" chip + the row badges use.
   // They must never be conflated: making `followedOnly` per-user once emptied
   // the auto-grab index (no user → no matches → automation silently stopped).
+  // fork: an explicit issue_wants row always wins; otherwise the series'
+  // watch_state decides ('watched' wants everything missing, 'paused' and
+  // 'unwatched' want nothing that isn't explicitly flagged).
   const conds = [
-    `(s.followed=1 OR EXISTS(SELECT 1 FROM library_files lf WHERE lf.series_id=s.id AND lf.valid=1))`,
+    WANTED_SQL,
     `NOT EXISTS (SELECT 1 FROM library_files lf2 WHERE lf2.cv_issue_id = ci.comicvine_id AND lf2.valid=1)`,
   ];
   const args = { uid: userId };
   if (!includeRestricted) conds.push('s.restricted = 0');
-  if (followedOnly) conds.push('s.followed=1');
+  // fork: automation used to filter on s.followed; wanted-ness is now the
+  // single source of truth, so a paused series' explicitly wanted issues still
+  // get searched. WANTED_SQL is already applied above, so this is a no-op.
+  if (followedOnly) conds.push('1=1');
   if (userFollowedOnly) conds.push('EXISTS(SELECT 1 FROM user_follows uf WHERE uf.series_id = s.id AND uf.user_id = @uid)');
   // Best-effort: most cached issues have no cover date (volume stubs don't carry
   // one), so this only hides issues we KNOW are future-dated — honest, not complete.
@@ -645,7 +695,9 @@ export function listWantedIssues(db, { limit = 200, offset = 0, followedOnly = f
       EXISTS(SELECT 1 FROM user_follows uf WHERE uf.series_id = s.id AND uf.user_id = @uid) followed,
       cv.image_url series_cover,
       ci.comicvine_id cv_issue_id, ci.issue_number, ci.name issue_name, ci.cover_date,
-      (SELECT i.status FROM issues i WHERE i.url = 'cvissue:' || ci.comicvine_id) queue_status
+      (SELECT i.status FROM issues i WHERE i.url = 'cvissue:' || ci.comicvine_id) queue_status,
+      s.watch_state,
+      COALESCE((SELECT iw.wanted FROM issue_wants iw WHERE iw.cv_issue_id = ci.comicvine_id), s.watch_state='watched') wanted
     ${from}
     ORDER BY series_title, CAST(ci.issue_number AS REAL), ci.issue_number
     LIMIT @limit OFFSET @offset`).all({ ...args, limit, offset });
@@ -876,7 +928,7 @@ const COLL_JOINS = `
 // (file_dir, cv_latest) live here, so this select is only ever run for a bounded
 // set of ids (a page), never the whole 150k membership set.
 function collFullCols(guard) {
-  return `SELECT s.id, s.title, s.publisher, s.year, s.cover_url, s.followed, s.cv_id, s.cv_locked, s.url, s.restricted, s.type,
+  return `SELECT s.id, s.title, s.publisher, s.year, s.cover_url, s.followed, s.watch_state, s.cv_id, s.cv_locked, s.url, s.restricted, s.type,
       (mf.series_id IS NOT NULL) my_follow,
       cv.name cv_name, cv.publisher cv_publisher, cv.start_year cv_year, cv.image_url cv_image,
       CASE WHEN ${guard} THEN COALESCE(iss.bc_total, 0) ELSE 0 END bc_total,
@@ -901,7 +953,7 @@ function collFullCols(guard) {
 // and corrupt, are gated to the handful of series that can be non-trivial), so it
 // drives id-selection (for a page) and the fused chip counts.
 function collLeanCols(guard) {
-  return `SELECT s.id, s.title, s.type, s.cv_id, s.followed, s.year,
+  return `SELECT s.id, s.title, s.type, s.cv_id, s.followed, s.watch_state, s.year,
       (mf.series_id IS NOT NULL) my_follow,
       CASE WHEN ${guard} THEN 0 ELSE COALESCE(lf.untagged, 0) END untagged,
       CASE WHEN COALESCE(lf.invalid_count, 0) = 0 THEN 0 ELSE
@@ -1249,6 +1301,7 @@ export function seriesCollectionDetail(db, id, userId = null) {
       ? (db.prepare('SELECT 1 FROM user_follows WHERE user_id=? AND series_id=?').get(userId, id) ? 1 : 0)
       : 0,
     monitored: series.followed,
+    watchState: series.watch_state || (series.followed ? 'watched' : 'paused'),
     cv_id: series.cv_id, cv_locked: series.cv_locked, sourced, path: series.path,
     restricted: !!series.restricted,
     type: series.type || 'comic',
@@ -1367,6 +1420,7 @@ export function seriesCollectionDetail(db, id, userId = null) {
         ? (db.prepare('SELECT 1 FROM user_follows WHERE user_id=? AND series_id=?').get(userId, id) ? 1 : 0)
         : 0,
       monitored: series.followed,
+    watchState: series.watch_state || (series.followed ? 'watched' : 'paused'),
       cv_id: null, cv_locked: 0, sourced, path: series.path,
       type: series.type || 'comic',
       library_id: series.library_id ?? null,
@@ -1860,3 +1914,88 @@ export function clearIssuesForRedownload(db, ids) {
 }
 
 
+
+
+// --- fork: watch state & explicit per-issue wants ---------------------------
+
+// Is this cv_issue wanted? An explicit issue_wants row wins; otherwise the
+// series must be 'watched'. Used by the wanted list and every automation lane
+// so "wanted" means the same thing everywhere.
+export const WANTED_SQL = `(
+  COALESCE(
+    (SELECT iw.wanted FROM issue_wants iw WHERE iw.cv_issue_id = ci.comicvine_id),
+    CASE WHEN s.watch_state='watched' THEN 1 ELSE 0 END
+  ) = 1
+)`;
+
+export const WATCH_STATES = ['watched', 'paused', 'unwatched'];
+
+// Set the watch state for one or more series.
+//   watched   → clear overrides; everything missing is wanted, new issues too
+//   paused    → freeze the current wanted set as explicit rows, then stop
+//               auto-wanting anything new
+//   unwatched → clear overrides; nothing is wanted
+// Returns the number of series updated.
+export function setSeriesWatchState(db, seriesIds, state) {
+  if (!WATCH_STATES.includes(state)) throw new Error(`invalid watch state: ${state}`);
+  const ids = (Array.isArray(seriesIds) ? seriesIds : [seriesIds]).map(Number).filter(Boolean);
+  if (!ids.length) return 0;
+  const placeholders = ids.map(() => '?').join(',');
+
+  const tx = db.transaction(() => {
+    if (state === 'paused') {
+      // Materialise what is wanted right now so it survives the switch.
+      db.prepare(`INSERT OR REPLACE INTO issue_wants (cv_issue_id, series_id, wanted, source)
+        SELECT ci.comicvine_id, s.id, 1, 'freeze'
+          FROM series s
+          JOIN cv_issues ci ON ci.cv_series_id = s.cv_id
+         WHERE s.id IN (${placeholders})
+           AND ${WANTED_SQL}
+           AND NOT EXISTS (SELECT 1 FROM library_files lf WHERE lf.cv_issue_id = ci.comicvine_id AND lf.valid=1)`
+      ).run(...ids);
+    } else {
+      // watched / unwatched are absolute: drop overrides so the series state
+      // alone decides.
+      db.prepare(`DELETE FROM issue_wants WHERE series_id IN (${placeholders})`).run(...ids);
+    }
+    db.prepare(`UPDATE series SET watch_state=?, followed=? WHERE id IN (${placeholders})`)
+      .run(state, state === 'watched' ? 1 : 0, ...ids);
+  });
+  tx();
+  return ids.length;
+}
+
+// Mark individual ComicVine issues wanted / not wanted. Explicit rows override
+// the series state in both directions.
+export function setIssuesWanted(db, cvIssueIds, wanted) {
+  const ids = (Array.isArray(cvIssueIds) ? cvIssueIds : [cvIssueIds]).map(Number).filter(Boolean);
+  if (!ids.length) return 0;
+  const ins = db.prepare(`INSERT INTO issue_wants (cv_issue_id, series_id, wanted, source)
+    VALUES (?, (SELECT s.id FROM series s JOIN cv_issues ci ON ci.cv_series_id = s.cv_id WHERE ci.comicvine_id=?), ?, 'manual')
+    ON CONFLICT(cv_issue_id) DO UPDATE SET wanted=excluded.wanted, source='manual'`);
+  const tx = db.transaction(() => { for (const id of ids) ins.run(id, id, wanted ? 1 : 0); });
+  tx();
+  return ids.length;
+}
+
+// Drop explicit overrides so the issues follow their series state again.
+export function clearIssueWants(db, cvIssueIds) {
+  const ids = (Array.isArray(cvIssueIds) ? cvIssueIds : [cvIssueIds]).map(Number).filter(Boolean);
+  if (!ids.length) return 0;
+  db.prepare(`DELETE FROM issue_wants WHERE cv_issue_id IN (${ids.map(() => '?').join(',')})`).run(...ids);
+  return ids.length;
+}
+
+// Per-series counts for the UI (how many issues are wanted right now).
+export function seriesWantedCounts(db, seriesIds) {
+  const ids = (Array.isArray(seriesIds) ? seriesIds : [seriesIds]).map(Number).filter(Boolean);
+  if (!ids.length) return {};
+  const rows = db.prepare(`SELECT s.id series_id, COUNT(*) n
+      FROM series s
+      JOIN cv_issues ci ON ci.cv_series_id = s.cv_id
+     WHERE s.id IN (${ids.map(() => '?').join(',')})
+       AND ${WANTED_SQL}
+       AND NOT EXISTS (SELECT 1 FROM library_files lf WHERE lf.cv_issue_id = ci.comicvine_id AND lf.valid=1)
+     GROUP BY s.id`).all(...ids);
+  return Object.fromEntries(rows.map((r) => [r.series_id, r.n]));
+}
