@@ -113,6 +113,22 @@
     } finally { bulkBusy = false; }
   }
 
+  // fork: drop a single issue from the wanted list (and the download queue).
+  async function unwantIssue(it) {
+    const r = await apiPost('/api/issues/wanted', { cvIssueIds: [it.cv_issue_id], wanted: false });
+    if (r?.error) return;
+    await renderWanted();
+  }
+
+  // fork: stop wanting a whole series — sets it Unwatched, which clears every
+  // want for it and takes its issues out of the queue.
+  async function unwantSeries(g) {
+    if (!confirm(`Stop wanting every issue of "${g.title || 'this series'}"?\n\nThe series is set to Unwatched: nothing in it will be wanted or downloaded.`)) return;
+    const r = await apiPost('/api/series/watch-state', { ids: [g.id], state: 'unwatched' });
+    if (r?.error) return;
+    await renderWanted();
+  }
+
   async function downloadSelected() {
     const ids = new Set(selected);
     clearSel();
@@ -245,6 +261,8 @@
               {/if}
             </div>
             <span class="wx__misspill">{fmt(g.missing)} missing</span>
+            <button class="wx__unwant wx__unwant--series" title="Unwant this series — sets it Unwatched and clears its queue"
+              onclick={(e) => { e.stopPropagation(); unwantSeries(g); }}>▬ Unwant series</button>
             <span class="wx__chev" class:is-open={open}><Icon name="chevron-right" size={16} /></span>
           </div>
           {#if open}
@@ -256,6 +274,8 @@
                   <span class="wx__num">#{it.issue_number ?? '?'}</span>
                   <span class="wx__name">{it.issue_name || '—'}</span>
                   {#if it.wanted}<span class="wx__wantpill" title="Wanted — will be searched for">wanted</span>{/if}
+                  <button class="wx__unwant" title="Unwant this issue — removes it from the wanted list and the queue"
+                    onclick={() => unwantIssue(it)}>▬ Unwant</button>
                   {#if it.queue_status && IN_FLIGHT.includes(it.queue_status)}
                     <Badge status={it.queue_status} />
                   {:else if it._busy}
@@ -297,6 +317,15 @@
   .wx__bulk-btn.is-want { background: var(--accent, #7c5cff); border-color: transparent; color: #fff; }
   .wx__bulk-btn.is-plain { opacity: .7; }
   .wx__row.is-picked { background: color-mix(in srgb, var(--accent, #7c5cff) 12%, transparent); }
+  .wx__unwant {
+    display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0;
+    height: 26px; padding: 0 10px; border-radius: 8px; cursor: pointer;
+    border: 1.5px solid rgba(248,113,113,.35); background: transparent; color: #f87171;
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+  }
+  .wx__unwant:hover { background: #f87171; border-color: #f87171; color: #3d0d0d; }
+  .wx__unwant--series { margin-left: 8px; }
+
   .wx__wantpill {
     font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
     padding: 2px 7px; border-radius: 20px; flex-shrink: 0;

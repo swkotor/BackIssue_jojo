@@ -2035,6 +2035,11 @@ export function setSeriesWatchState(db, seriesIds, state) {
       // watched / unwatched are absolute: drop overrides so the series state
       // alone decides.
       db.prepare(`DELETE FROM issue_wants WHERE series_id IN (${placeholders})`).run(...ids);
+      if (state === 'unwatched') {
+        // nothing in the series is wanted any more — clear its queued rows
+        db.prepare(`UPDATE issues SET status='skipped'
+           WHERE series_id IN (${placeholders}) AND status IN ('queued','pending')`).run(...ids);
+      }
     }
     db.prepare(`UPDATE series SET watch_state=?, followed=? WHERE id IN (${placeholders})`)
       .run(state, state === 'watched' ? 1 : 0, ...ids);
@@ -2054,6 +2059,21 @@ export function setIssuesWanted(db, cvIssueIds, wanted) {
   const tx = db.transaction(() => { for (const id of ids) ins.run(id, id, wanted ? 1 : 0); });
   tx();
   return ids.length;
+}
+
+// fork: when an issue stops being wanted, take it out of the download queue —
+// a queued/pending row for it is no longer something we intend to fetch.
+// Active grabs (already handed to a client) are left alone: cancelling those is
+// the Queue page's job and needs the client-side cancel.
+export function dequeueUnwantedIssues(db, cvIssueIds) {
+  const ids = (Array.isArray(cvIssueIds) ? cvIssueIds : [cvIssueIds]).map(Number).filter(Boolean);
+  if (!ids.length) return 0;
+  const ph = ids.map(() => '?').join(',');
+  // Issue rows are keyed to CV issues by the 'cvissue:<id>' url the queue uses.
+  const urls = ids.map((id) => 'cvissue:' + id);
+  const n = db.prepare(`UPDATE issues SET status='skipped'
+     WHERE url IN (${ph}) AND status IN ('queued','pending')`).run(...urls).changes;
+  return n;
 }
 
 // Drop explicit overrides so the issues follow their series state again.
