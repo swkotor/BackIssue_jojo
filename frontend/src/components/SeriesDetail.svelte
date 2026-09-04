@@ -343,6 +343,30 @@
     loadCollection();
   }
 
+  // fork: pin/unpin an individual issue as wanted (Mylar-style toggle).
+  // An explicit flag overrides the series' watch state in both directions.
+  async function toggleWanted(i) {
+    const next = !i.wanted;
+    i.wanted = next;                       // optimistic
+    i.wantOverride = next ? 'wanted' : 'skipped';
+    detail.issues = [...detail.issues];
+    const r = await apiPost('/api/issues/wanted', { cvIssueIds: [i.cv_issue_id], wanted: next });
+    if (r?.error) {
+      i.wanted = !next; i.wantOverride = null; detail.issues = [...detail.issues];
+      notify(r.error, 'error');
+    }
+  }
+
+  // Bulk version for the issues currently ticked on this page.
+  async function markSelectedWanted(wanted) {
+    const ids = [...detailSelected];
+    if (!ids.length) return;
+    const r = await apiPost('/api/issues/wanted', { cvIssueIds: ids, wanted });
+    if (r?.error) return notify(r.error, 'error');
+    notify(`${ids.length} issue${ids.length === 1 ? '' : 's'} marked ${wanted ? 'wanted' : 'not wanted'}.`, 'ok');
+    reloadDetail();
+  }
+
   // fork: tri-state watch selector.
   //   watched   — new issues are wanted automatically
   //   paused    — keep the issues already wanted, don't add new ones
@@ -632,6 +656,12 @@
                 <button id="download-series" class="btn btn--primary" disabled>Download missing</button>
               {/if}
             {/if}
+            {#if isCv && detailSelected.size}
+              <button class="btn btn--ghost" title="Mark the selected issues wanted — they'll be searched for"
+                onclick={() => markSelectedWanted(true)}><Icon name="star" fill /> Want ({fmt(detailSelected.size)})</button>
+              <button class="btn btn--ghost" title="Mark the selected issues not wanted"
+                onclick={() => markSelectedWanted(false)}><Icon name="star" /> Unwant</button>
+            {/if}
             {#if !isLocal && can('downloads.grab')}
               <!-- Selection now includes owned issues (read status, lists) — the
                    download acts on the downloadable subset only. -->
@@ -651,6 +681,11 @@
               {/if}
             {/each}
             {#if isTrusted()}
+              {@const ws = s.watchState || (s.monitored ? 'watched' : 'paused')}
+              <span class="wstate-chip wstate-chip--{ws}"
+                title={ws === 'watched' ? 'Watched — new issues are wanted automatically'
+                  : ws === 'paused' ? 'Paused — issues already wanted stay wanted, new ones are not added'
+                  : 'Unwatched — nothing in this series is wanted'}>{ws}</span>
               <button id="follow-btn" class="btn btn--ghost" class:is-following={!!s.followed} onclick={toggleFollow}>{#if s.followed}<Icon name="star" fill /> Following{:else}<Icon name="star" /> Follow{/if}</button>
             {/if}
             <!-- Secondary/destructive actions live in one overflow menu — the
@@ -804,6 +839,7 @@
                     <input class="icard__check" type="checkbox" checked={detailSelected.has(i.cv_issue_id)}
                       onclick={(e) => { e.stopPropagation(); toggleIssue(i, range.start + vi, e.shiftKey); }} />
                     <span class="icard__state icard__state--{state}" title={state}></span>
+                    {#if i.wanted && !i.owned}<span class="icard__wanted" title="Wanted">★</span>{/if}
                     <div class="icard__actions" onclick={(e) => e.stopPropagation()}>
                       {#each issueActions as a (a.id + ':' + issueActionsTick.n)}
                         {#if !a.when || a.when(i)}
@@ -811,6 +847,11 @@
                             onclick={() => a.run(i, detail.series)}>{@html typeof a.icon === 'function' ? a.icon(i) : a.icon}</button>
                         {/if}
                       {/each}
+                      {#if !i.owned}
+                        <button class="icard__btn" class:is-want={i.wanted}
+                          title={i.wanted ? 'Wanted — click to stop wanting it' : 'Not wanted — click to want this issue'}
+                          onclick={() => toggleWanted(i)}><Icon name="star" fill={!!i.wanted} /></button>
+                      {/if}
                       {#if can('downloads.grab')}
                         {#if i.corrupt}
                           <button class="icard__btn icard__btn--warn" title="File is corrupt — re-download" onclick={() => redownloadCvIssues([i.cv_issue_id])}><Icon name="refresh" /></button>
@@ -860,6 +901,15 @@
                     <button class="issue__dl" title={typeof a.title === 'function' ? a.title(i) : a.title} onclick={(e) => { e.stopPropagation(); a.run(i, detail.series); }}>{@html typeof a.icon === 'function' ? a.icon(i) : a.icon}</button>
                   {/if}
                 {/each}
+                {#if !i.owned}
+                  <button class="issue__want" class:is-on={i.wanted}
+                    title={i.wanted
+                      ? (i.wantOverride === 'wanted' ? 'Wanted (pinned on this issue) — click to stop wanting it' : 'Wanted via the series status — click to skip this issue')
+                      : (i.wantOverride === 'skipped' ? 'Not wanted (pinned) — click to want it' : 'Not wanted — click to want this issue')}
+                    onclick={(e) => { e.stopPropagation(); toggleWanted(i); }}>
+                    <Icon name="star" fill={!!i.wanted} size={14} />
+                  </button>
+                {/if}
                 {#if i.corrupt && can('downloads.grab')}
                   <button class="issue__dl issue__dl--warn" title="File is corrupt — re-download" onclick={(e) => { e.stopPropagation(); redownloadCvIssues([i.cv_issue_id]); }}><Icon name="refresh" /></button>
                 {:else if i.owned}
@@ -907,6 +957,32 @@
 </section>
 
 <style>
+  /* fork: series watch-state chip */
+  .wstate-chip {
+    display: inline-flex; align-items: center; align-self: center;
+    font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+    padding: 4px 10px; border-radius: 20px; margin-right: 6px;
+    background: rgba(148,163,184,.16); color: #94a3b8;
+  }
+  .wstate-chip--watched { background: rgba(52,211,153,.16); color: #34d399; }
+  .wstate-chip--paused { background: rgba(251,191,36,.16); color: #fbbf24; }
+
+  /* fork: per-issue wanted toggle */
+  .issue__want {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 26px; height: 26px; flex-shrink: 0;
+    border: 1px solid var(--line, #2a2e3b); border-radius: 7px;
+    background: transparent; color: var(--muted, #8b90a0); cursor: pointer;
+  }
+  .issue__want:hover { color: var(--text, #e8eaf0); border-color: var(--accent, #7c5cff); }
+  .issue__want.is-on { color: #fbbf24; border-color: rgba(251,191,36,.45); background: rgba(251,191,36,.10); }
+  .icard__btn.is-want { color: #fbbf24; }
+  .icard__wanted {
+    position: absolute; top: 4px; right: 4px; z-index: 2;
+    font-size: 13px; line-height: 1; color: #fbbf24;
+    text-shadow: 0 1px 3px rgba(0,0,0,.8); pointer-events: none;
+  }
+
   /* fork: watch-state menu */
   .menu__label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; opacity: .6; padding: 8px 12px 2px; }
   .menu__item.is-on { color: var(--accent, #7c5cff); font-weight: 600; }

@@ -88,9 +88,47 @@
     navigate(location.pathname + libQuery(key), { replace: true });
   }
 
-  function open(s) {
+  // fork: short, readable issue dates for the list view ("12 Mar 25").
+  function shortDate(d) {
+    if (!d) return '';
+    const t = new Date(d + 'T00:00:00');
+    if (Number.isNaN(t.getTime())) return String(d);
+    return t.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: '2-digit' });
+  }
+  // Days until an upcoming issue, for the tooltip.
+  function inDays(d) {
+    if (!d) return '';
+    const n = Math.round((new Date(d + 'T00:00:00') - new Date()) / 86400000);
+    return n <= 0 ? 'due' : n === 1 ? 'tomorrow' : `in ${n} days`;
+  }
+
+  // fork: remember the last row clicked so shift-click can select a range
+  let lastPicked = $state(null);
+
+  function open(s, e) {
     if (!rail.selecting) return navigate('/volume/' + s.id + libParams());
+    pickSeries(s, e);
+  }
+
+  // Toggle one series, or — with shift held — every series between the last
+  // one picked and this one (in the order they're displayed).
+  function pickSeries(s, e) {
+    const rows = rail.rows || [];
+    if (e?.shiftKey && lastPicked != null) {
+      const a = rows.findIndex((r) => r.id === lastPicked);
+      const b = rows.findIndex((r) => r.id === s.id);
+      if (a !== -1 && b !== -1) {
+        const [from, to] = a < b ? [a, b] : [b, a];
+        const on = !railSelect.has(s.id);
+        for (let i = from; i <= to; i++) {
+          if (on) railSelect.add(rows[i].id); else railSelect.delete(rows[i].id);
+        }
+        lastPicked = s.id;
+        return;
+      }
+    }
     if (railSelect.has(s.id)) railSelect.delete(s.id); else railSelect.add(s.id);
+    lastPicked = s.id;
   }
 
   // fork: bulk watch state for the selected series
@@ -306,6 +344,10 @@
       <option value="title">A–Z</option>
       <option value="added">Recently added</option>
       <option value="missing">Most missing</option>
+      <option value="latest">Latest issue (newest)</option>
+      <option value="latest-asc">Latest issue (oldest)</option>
+      <option value="next">Next issue (soonest)</option>
+      <option value="next-desc">Next issue (latest)</option>
     </select>
     <div class="libx__view" role="group" aria-label="View">
       <button class="libx__viewbtn" class:is-active={view === 'grid'} title="Poster grid" onclick={() => setView('grid')}><Icon name="grid" size={15} /></button>
@@ -390,10 +432,20 @@
         {#if range.padTop > 0}<div class="libx-grid__pad" style="height:{range.padTop}px"></div>{/if}
         {#each rail.rows.slice(range.start, range.end) as s (s.id)}
           <div class="libx-card" class:is-selected={rail.selecting && railSelect.has(s.id)}
-            onclick={() => open(s)} role="button" tabindex="0" onkeydown={(e) => { if (e.key === 'Enter') open(s); }}>
+            onclick={(e) => open(s, e)} role="button" tabindex="0" onkeydown={(e) => { if (e.key === 'Enter') open(s, e); }}>
             <div class="libx-card__art" class:is-unmatched={!s.matched}>
               <Cover coverUrl={s.matched ? s.cover_url : null} title={s.matched ? s.title : (s.folder || '?')} />
-              {#if rail.selecting}<span class="libx-card__check" class:is-on={railSelect.has(s.id)}>{#if railSelect.has(s.id)}<Icon name="check" size={14} />{/if}</span>{/if}
+              {#if rail.selecting}
+                <input type="checkbox" class="libx-card__cb" checked={railSelect.has(s.id)}
+                  title="Select (shift-click to select a range)"
+                  onclick={(e) => { e.stopPropagation(); pickSeries(s, e); }} />
+              {/if}
+              {#if s.watch_state && s.watch_state !== 'watched'}
+                <span class="libx-card__wstate" class:is-paused={s.watch_state === 'paused'}
+                  title={s.watch_state === 'paused' ? 'Paused — existing wanted issues kept, new ones not added' : 'Unwatched — nothing wanted'}>{s.watch_state === 'paused' ? 'paused' : 'unwatched'}</span>
+              {:else if s.watch_state === 'watched'}
+                <span class="libx-card__wstate is-watched" title="Watched — new issues are wanted automatically">watched</span>
+              {/if}
               {#if s.followed}<span class="libx-card__star" title="Followed"><Icon name="star" fill size={15} /></span>{/if}
               {#if !s.matched}<span class="libx-card__matchchip">match…</span>{/if}
               {#if s.matched}<div class="libx-card__bar"><div class="libx-card__fill" class:is-done={isDone(s)} style="width:{pct(s)}%"></div></div>{/if}
@@ -422,7 +474,12 @@
         {#if range.padTop > 0}<div style="height:{range.padTop}px"></div>{/if}
         {#each rail.rows.slice(range.start, range.end) as s (s.id)}
           <div class="libx-row" class:is-selected={rail.selecting && railSelect.has(s.id)}
-            onclick={() => open(s)} role="button" tabindex="0" onkeydown={(e) => { if (e.key === 'Enter') open(s); }}>
+            onclick={(e) => open(s, e)} role="button" tabindex="0" onkeydown={(e) => { if (e.key === 'Enter') open(s, e); }}>
+            {#if rail.selecting}
+              <input type="checkbox" class="libx-row__cb" checked={railSelect.has(s.id)}
+                title="Select (shift-click to select a range)"
+                onclick={(e) => { e.stopPropagation(); pickSeries(s, e); }} />
+            {/if}
             <Cover coverUrl={s.matched ? s.cover_url : null} title={s.matched ? s.title : (s.folder || 'Unidentified series')} />
             <div class="libx-row__main">
               <div class="libx-row__title" class:is-unmatched={!s.matched}>{s.matched ? s.title : (s.folder || 'Unidentified series')}{#if s.matched && s.year}<span class="libx-row__year"> ({s.year})</span>{/if}</div>
@@ -449,8 +506,25 @@
             <span class="libx-row__dim libx-col--wide" title="Newest known issue's cover date">{s.matched ? (s.latest || '—') : '—'}</span>
             <span class="libx-row__dim libx-col--wide libx-col--right">{s.size ? humanBytes(s.size) : '—'}</span>
             {#if isTrusted()}
-              {#if s.watch_state && s.watch_state !== 'watched'}
-                <span class="libx-row__wstate" class:is-paused={s.watch_state === 'paused'} title={s.watch_state === 'paused' ? 'Paused — existing wants kept, new issues not auto-wanted' : 'Unwatched — nothing is wanted'}>{s.watch_state}</span>
+              {#if s.last_issue_date || s.next_issue_date}
+                <span class="libx-row__dates">
+                  {#if s.last_issue_date}
+                    <span class="libx-row__date" title="Most recent released issue: {s.last_issue_date}">
+                      <Icon name="clock" size={11} /> {shortDate(s.last_issue_date)}
+                    </span>
+                  {/if}
+                  {#if s.next_issue_date}
+                    <span class="libx-row__date is-next" title="Next issue due: {s.next_issue_date} ({inDays(s.next_issue_date)})">
+                      → {shortDate(s.next_issue_date)}
+                    </span>
+                  {/if}
+                </span>
+              {/if}
+              {#if s.watch_state}
+                <span class="libx-row__wstate" class:is-paused={s.watch_state === 'paused'} class:is-watched={s.watch_state === 'watched'}
+                  title={s.watch_state === 'watched' ? 'Watched — new issues are wanted automatically'
+                    : s.watch_state === 'paused' ? 'Paused — existing wanted issues kept, new ones not added'
+                    : 'Unwatched — nothing in this series is wanted'}>{s.watch_state}</span>
               {/if}
               <button class="libx-row__star" class:is-on={s.followed} title={s.followed ? 'Followed — click to unfollow' : 'Not followed — click to follow'} aria-label={s.followed ? 'Unfollow' : 'Follow'} onclick={(e) => { e.stopPropagation(); toggleMon(s); }}><Icon name="star" fill={!!s.followed} size={15} /></button>
             {:else}<span></span>{/if}
@@ -538,6 +612,20 @@
     background: rgba(148,163,184,.16); color: #94a3b8;
   }
   .libx-row__wstate.is-paused { background: rgba(251,191,36,.16); color: #fbbf24; }
+  .libx-row__wstate.is-watched { background: rgba(52,211,153,.16); color: #34d399; }
+  .libx-row__dates { display: inline-flex; align-items: center; gap: 8px; margin-right: 8px; flex-shrink: 0; }
+  .libx-row__date { display: inline-flex; align-items: center; gap: 3px; font-size: 11.5px; color: var(--muted, #8b90a0); white-space: nowrap; }
+  .libx-row__date.is-next { color: #60a5fa; }
+  .libx-row__cb, .libx-card__cb { width: 16px; height: 16px; accent-color: var(--accent, #7c5cff); cursor: pointer; flex-shrink: 0; }
+  .libx-card__cb { position: absolute; top: 6px; left: 6px; z-index: 3; }
+  .libx-card__wstate {
+    position: absolute; left: 6px; bottom: 6px; z-index: 2;
+    font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+    padding: 2px 6px; border-radius: 20px;
+    background: rgba(148,163,184,.22); color: #cbd5e1; backdrop-filter: blur(2px);
+  }
+  .libx-card__wstate.is-paused { background: rgba(251,191,36,.22); color: #fde68a; }
+  .libx-card__wstate.is-watched { background: rgba(52,211,153,.22); color: #a7f3d0; }
   .libx-row :global(.cover) { width: 38px; height: 52px; }
   .libx-row__main { min-width: 0; }
   .libx-row__title { font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

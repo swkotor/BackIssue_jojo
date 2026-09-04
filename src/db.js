@@ -944,6 +944,18 @@ function collFullCols(guard) {
       CASE WHEN COALESCE(lf.file_count, 0) = 0 THEN NULL ELSE
         (SELECT g.dir FROM library_files g WHERE g.series_id=s.id AND g.valid=1 GROUP BY g.dir ORDER BY COUNT(*) DESC LIMIT 1) END file_dir,
       CASE WHEN s.cv_id IS NULL THEN NULL ELSE (SELECT MAX(ci.cover_date) FROM cv_issues ci WHERE ci.cv_series_id=s.cv_id) END cv_latest,
+      -- fork: newest issue already released, and the next one due. Store date is
+      -- the real shelf date; cover dates run weeks ahead, so prefer store_date.
+      CASE WHEN s.cv_id IS NULL THEN NULL ELSE (
+        SELECT MAX(COALESCE(ci.store_date, ci.cover_date)) FROM cv_issues ci
+         WHERE ci.cv_series_id=s.cv_id
+           AND COALESCE(ci.store_date, ci.cover_date) IS NOT NULL
+           AND date(COALESCE(ci.store_date, ci.cover_date)) <= date('now')) END last_issue_date,
+      CASE WHEN s.cv_id IS NULL THEN NULL ELSE (
+        SELECT MIN(COALESCE(ci.store_date, ci.cover_date)) FROM cv_issues ci
+         WHERE ci.cv_series_id=s.cv_id
+           AND COALESCE(ci.store_date, ci.cover_date) IS NOT NULL
+           AND date(COALESCE(ci.store_date, ci.cover_date)) > date('now')) END next_issue_date,
       CASE WHEN ${guard} THEN 0 ELSE COALESCE(iss.active, 0) END active,
       COALESCE(lf.size_bytes, 0) size_bytes`;
 }
@@ -954,6 +966,15 @@ function collFullCols(guard) {
 // drives id-selection (for a page) and the fused chip counts.
 function collLeanCols(guard) {
   return `SELECT s.id, s.title, s.type, s.cv_id, s.followed, s.watch_state, s.year,
+      -- fork: needed by the 'latest' / 'next' sorts on the paged CTE path
+      CASE WHEN s.cv_id IS NULL THEN NULL ELSE (
+        SELECT MAX(COALESCE(ci.store_date, ci.cover_date)) FROM cv_issues ci
+         WHERE ci.cv_series_id=s.cv_id AND COALESCE(ci.store_date, ci.cover_date) IS NOT NULL
+           AND date(COALESCE(ci.store_date, ci.cover_date)) <= date('now')) END last_issue_date,
+      CASE WHEN s.cv_id IS NULL THEN NULL ELSE (
+        SELECT MIN(COALESCE(ci.store_date, ci.cover_date)) FROM cv_issues ci
+         WHERE ci.cv_series_id=s.cv_id AND COALESCE(ci.store_date, ci.cover_date) IS NOT NULL
+           AND date(COALESCE(ci.store_date, ci.cover_date)) > date('now')) END next_issue_date,
       (mf.series_id IS NOT NULL) my_follow,
       CASE WHEN ${guard} THEN 0 ELSE COALESCE(lf.untagged, 0) END untagged,
       CASE WHEN COALESCE(lf.invalid_count, 0) = 0 THEN 0 ELSE
@@ -994,6 +1015,12 @@ const COLL_ORDERS = {
   // Publication year, newest first — books/audiobooks carry it; nulls sort last.
   year: 'ORDER BY CAST(year AS INTEGER) DESC, title',
   'year-asc': 'ORDER BY (year IS NULL), CAST(year AS INTEGER) ASC, title',
+  // fork: by the most recent released issue (newest first) and by the next
+  // issue due (soonest first). Series with no such date sort last in both.
+  latest: "ORDER BY (last_issue_date IS NULL), date(last_issue_date) DESC, title",
+  'latest-asc': "ORDER BY (last_issue_date IS NULL), date(last_issue_date) ASC, title",
+  next: "ORDER BY (next_issue_date IS NULL), date(next_issue_date) ASC, title",
+  'next-desc': "ORDER BY (next_issue_date IS NULL), date(next_issue_date) DESC, title",
 };
 
 // SQL translation of every seriesMatchesFilter chip, evaluated over the wrapped
@@ -1108,6 +1135,9 @@ function mapCollectionRow(r) {
     cv_name: r.cv_name, cv_year: r.cv_year, restricted: !!r.restricted, type: r.type || 'comic',
     total, owned, missing: Math.max(0, total - owned), available: 0, on_demand: false, untagged: r.untagged, corrupt: r.corrupt,
     latest: r.cv_latest, active: r.active, size: r.size_bytes,
+    // fork: dates for the list view's Latest / Next columns
+    last_issue_date: r.last_issue_date || null,
+    next_issue_date: r.next_issue_date || null,
   };
 }
 
@@ -1340,6 +1370,13 @@ export function seriesCollectionDetail(db, id, userId = null) {
       if (!filesByCv.has(f.cv_issue_id)) filesByCv.set(f.cv_issue_id, []);
       filesByCv.get(f.cv_issue_id).push(f);
     }
+    // fork: explicit want overrides for this series, so each issue row can show
+    // and toggle its own wanted state.
+    const wantById = new Map(
+      db.prepare('SELECT cv_issue_id, wanted FROM issue_wants WHERE series_id=?').all(id)
+        .map((r) => [r.cv_issue_id, !!r.wanted])
+    );
+    const seriesWatched = (series.watch_state || (series.followed ? 'watched' : 'paused')) === 'watched';
     const issues = cvIssues.map((ci) => {
       const fs = filesByCv.get(ci.comicvine_id) || [];
       const bc = bcByNum.get(normalizeNumber(ci.issue_number)); // an in-flight/queued row, if any
@@ -1360,6 +1397,11 @@ export function seriesCollectionDetail(db, id, userId = null) {
         untagged,
         status: bc ? bc.status : 'pending',
         downloadable: !owned,              // any un-owned issue can be grabbed; a source is found at download time
+        // fork: wanted = explicit override if present, else the series state.
+        // wantOverride tells the UI whether this row is pinned (so it can show
+        // a "follows series" vs "pinned" affordance).
+        wanted: !owned && (wantById.has(ci.comicvine_id) ? wantById.get(ci.comicvine_id) : seriesWatched),
+        wantOverride: wantById.has(ci.comicvine_id) ? (wantById.get(ci.comicvine_id) ? 'wanted' : 'skipped') : null,
         files: fs.map(asIssueFile),
       };
     });

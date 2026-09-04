@@ -75,10 +75,26 @@
   let bulkBusy = $state(false);
   const selCount = $derived(selected.size);
 
-  function toggleSel(id) {
+  let lastPickedIssue = $state(null);
+
+  // Toggle one issue, or shift-click to select every issue between the last
+  // one clicked and this one (in displayed order).
+  function toggleSel(id, e) {
     const next = new Set(selected);
+    const order = groups.flatMap((g) => g.issues.map((i) => i.cv_issue_id));
+    if (e?.shiftKey && lastPickedIssue != null) {
+      const a = order.indexOf(lastPickedIssue);
+      const b = order.indexOf(id);
+      if (a !== -1 && b !== -1) {
+        const [from, to] = a < b ? [a, b] : [b, a];
+        const on = !next.has(id);
+        for (let i = from; i <= to; i++) { if (on) next.add(order[i]); else next.delete(order[i]); }
+        selected = next; lastPickedIssue = id;
+        return;
+      }
+    }
     if (next.has(id)) next.delete(id); else next.add(id);
-    selected = next;
+    selected = next; lastPickedIssue = id;
   }
   function selectGroup(g, on) {
     const next = new Set(selected);
@@ -236,7 +252,7 @@
               {#each g.issues as it (it.cv_issue_id)}
                 <div class="wx__row" class:is-picked={selected.has(it.cv_issue_id)}>
                   <input type="checkbox" class="wx__check" checked={selected.has(it.cv_issue_id)}
-                    onclick={() => toggleSel(it.cv_issue_id)} />
+                    onclick={(e) => toggleSel(it.cv_issue_id, e)} />
                   <span class="wx__num">#{it.issue_number ?? '?'}</span>
                   <span class="wx__name">{it.issue_name || '—'}</span>
                   {#if it.wanted}<span class="wx__wantpill" title="Wanted — will be searched for">wanted</span>{/if}
