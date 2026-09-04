@@ -716,6 +716,14 @@
                   onclick={(e) => { e.stopPropagation(); moreOpen = !moreOpen; }}>⋯</button>
                 {#if moreOpen}
                   <div class="series-more__menu" role="menu">
+                    {#if isCv && detailSelected.size}
+                      <div class="menu__label">{fmt(detailSelected.size)} selected</div>
+                      <button class="menu__item" role="menuitem" title="Mark the selected issues as wanted"
+                        onclick={() => { moreOpen = false; markSelectedWanted(true); }}><Icon name="star" fill /> Mark wanted ({fmt(detailSelected.size)})</button>
+                      <button class="menu__item" role="menuitem" title="Mark the selected issues as not wanted (also removes them from the download queue)"
+                        onclick={() => { moreOpen = false; markSelectedWanted(false); }}><Icon name="star" /> Mark not wanted ({fmt(detailSelected.size)})</button>
+                      <div class="menu__sep"></div>
+                    {/if}
                     {#if !isLocal && can('library.manage')}
 
                     {/if}
@@ -890,7 +898,7 @@
               {@const state = issueState(i)}
               {@const bf = bestFile(i)}
               <div class="issue"
-                class:is-owned={i.owned} class:is-corrupt={i.corrupt}
+                class:is-owned={i.owned} class:is-corrupt={i.corrupt} class:is-wanted={!i.owned && i.wanted}
                 title={i.corrupt && corruptReason(i) ? 'Corrupt: ' + corruptReason(i) : undefined}
                 onclick={(e) => toggleIssue(i, range.start + vi, e.shiftKey)} role="button" tabindex="0"
                 onkeydown={(e) => { if (e.key === 'Enter') toggleIssue(i, range.start + vi, e.shiftKey); }}>
@@ -911,22 +919,22 @@
                     <button class="issue__dl" title={typeof a.title === 'function' ? a.title(i) : a.title} onclick={(e) => { e.stopPropagation(); a.run(i, detail.series); }}>{@html typeof a.icon === 'function' ? a.icon(i) : a.icon}</button>
                   {/if}
                 {/each}
-                {#if !i.owned}
-                  <button class="issue__want" class:is-on={i.wanted}
-                    title={i.wanted
-                      ? (i.wantOverride === 'wanted' ? 'Wanted (pinned on this issue) — click to stop wanting it' : 'Wanted via the series status — click to skip this issue')
-                      : (i.wantOverride === 'skipped' ? 'Not wanted (pinned) — click to want it' : 'Not wanted — click to want this issue')}
-                    onclick={(e) => { e.stopPropagation(); toggleWanted(i); }}>
-                    <Icon name="star" fill={!!i.wanted} size={13} />
-                    <span class="issue__want-lbl">{i.wanted ? 'Wanted' : 'Want'}</span>
-                  </button>
-                {/if}
                 {#if i.corrupt && can('downloads.grab')}
                   <button class="issue__dl issue__dl--warn" title="File is corrupt — re-download" onclick={(e) => { e.stopPropagation(); redownloadCvIssues([i.cv_issue_id]); }}><Icon name="refresh" /></button>
                 {:else if i.owned}
                   <button class="issue__dl" title={i.untagged ? 'Owned — no ComicVine tags yet (use “Tag files”)' : 'Owned'} disabled><Icon name="check" /></button>
                 {:else if !i.corrupt && can('downloads.grab')}
                   <button class="issue__dl" title="Download this issue" onclick={(e) => { e.stopPropagation(); downloadCvIssues([i.cv_issue_id]); }}><Icon name="download" /></button>
+                {/if}
+                {#if !i.owned}
+                  <button class="issue__want" class:is-on={i.wanted}
+                    aria-label={i.wanted ? 'Wanted' : 'Want'}
+                    title={i.wanted
+                      ? (i.wantOverride === 'wanted' ? 'Wanted (pinned on this issue) — click to stop wanting it' : 'Wanted via the series status — click to skip this issue')
+                      : (i.wantOverride === 'skipped' ? 'Not wanted (pinned) — click to want it' : 'Not wanted — click to want this issue')}
+                    onclick={(e) => { e.stopPropagation(); toggleWanted(i); }}>
+                    <Icon name="star" fill={!!i.wanted} size={15} />
+                  </button>
                 {/if}
               </div>
             {/each}
@@ -1002,14 +1010,24 @@
   /* fork: per-issue wanted toggle */
   .issue__want {
     display: inline-flex; align-items: center; justify-content: center; gap: 5px;
-    height: 26px; padding: 0 10px; flex-shrink: 0;
+    width: 28px; height: 28px; padding: 0; flex-shrink: 0;
     border: 1.5px solid var(--line, #2a2e3b); border-radius: 8px;
     background: transparent; color: var(--muted, #8b90a0); cursor: pointer;
     font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
   }
-  .issue__want-lbl { line-height: 1; }
   .issue__want:hover { color: #fbbf24; border-color: rgba(251,191,36,.5); }
   .issue__want.is-on { color: #3b2a05; border-color: #fbbf24; background: #fbbf24; }
+
+  /* fork: row tint — yellow while wanted-but-missing, green once owned.
+     Declared here (scoped, so +1 specificity) and ordered owned → wanted →
+     corrupt → checked so the later, more urgent state wins. */
+  .issue.is-owned { background: rgba(52,211,153,.09); border-color: rgba(52,211,153,.28); }
+  .issue.is-owned:hover { background: rgba(52,211,153,.15); }
+  .issue.is-wanted { background: rgba(251,191,36,.10); border-color: rgba(251,191,36,.35); }
+  .issue.is-wanted:hover { background: rgba(251,191,36,.17); }
+  .issue.is-corrupt { background: rgba(255,90,82,.10); border-color: rgba(255,90,82,.32); }
+  .issue.is-checked { background: rgba(255,45,111,.10); border-color: rgba(255,45,111,.4); }
+  .menu__sep { height: 1px; margin: 6px 0; background: var(--line, #2a2e3b); }
   .icard__btn.is-want { color: #fbbf24; }
   .icard__wanted {
     position: absolute; top: 4px; right: 4px; z-index: 2;
