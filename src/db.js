@@ -1134,6 +1134,11 @@ function mapCollectionByIds(db, ids, { userId = null } = {}) {
     ${collFullCols(guard)} ${COLL_JOINS}
     WHERE s.id IN (${ph})`).all({ uid: userId ?? -1, ...selfParams, ...idParams });
   const byId = new Map(rows.map((r) => [r.id, mapCollectionRow(r)]));
+  // fork: how many issues of each series the user has finished. Attached after
+  // mapping (rather than joined into the CTE) so the plugin-owned table can be
+  // absent without touching the main query plan.
+  const readBy = readCountsForSeries(db, ids, userId);
+  for (const [id, row] of byId) row.read = readBy.get(id) || 0;
   return ids.map((id) => byId.get(id)).filter(Boolean);
 }
 
@@ -1201,7 +1206,10 @@ function mapCollection(db, { search = '', sort = 'title', includeRestricted = tr
   const rows = db.prepare(`WITH ${collCtes(libraryScopeSql(library))},
     coll AS (${collFullCols(guard)} ${COLL_JOINS} ${mem.sql})
     SELECT * FROM coll ${orderBy}`).all({ uid: userId ?? -1, ...selfParams, ...mem.params });
-  return rows.map(mapCollectionRow);
+  const mapped = rows.map(mapCollectionRow);
+  const readBy = readCountsForSeries(db, mapped.map((r) => r.id), userId);
+  for (const r of mapped) r.read = readBy.get(r.id) || 0;
+  return mapped;
 }
 
 export function collectionSeries(db, { filter = 'all', excludeSelfDescribed = false, ...opts } = {}) {
@@ -1383,6 +1391,8 @@ export function seriesCollectionDetail(db, id, userId = null) {
       : 0,
     monitored: series.followed,
     watchState: series.watch_state || (series.followed ? 'watched' : 'paused'),
+    // fork: finished-issue count for the header's “x/y read · n%”
+    read: readCountsForSeries(db, [id], userId).get(id) || 0,
     // fork: is the volume still running? Metron status wins; else CV dates.
     pubStatus: (() => {
       const ms = (cvRow && cvRow.metron_status || '').trim().toLowerCase();
@@ -1441,6 +1451,8 @@ export function seriesCollectionDetail(db, id, userId = null) {
         .map((r) => [r.cv_issue_id, !!r.wanted])
     );
     const seriesWatched = (series.watch_state || (series.followed ? 'watched' : 'paused')) === 'watched';
+    // fork: read/reading per issue, for the read markers in the issue list.
+    const readById = readStateFor(db, cvIssues.map((ci) => ci.comicvine_id), userId);
     const issues = cvIssues.map((ci) => {
       const fs = filesByCv.get(ci.comicvine_id) || [];
       const bc = bcByNum.get(normalizeNumber(ci.issue_number)); // an in-flight/queued row, if any
@@ -1466,6 +1478,8 @@ export function seriesCollectionDetail(db, id, userId = null) {
         // a "follows series" vs "pinned" affordance).
         wanted: !owned && (wantById.has(ci.comicvine_id) ? wantById.get(ci.comicvine_id) : seriesWatched),
         wantOverride: wantById.has(ci.comicvine_id) ? (wantById.get(ci.comicvine_id) ? 'wanted' : 'skipped') : null,
+        // fork: 'read' | 'reading' | null
+        readState: readById.get(ci.comicvine_id) || null,
         files: fs.map(asIssueFile),
       };
     });
@@ -1527,6 +1541,8 @@ export function seriesCollectionDetail(db, id, userId = null) {
         : 0,
       monitored: series.followed,
     watchState: series.watch_state || (series.followed ? 'watched' : 'paused'),
+    // fork: finished-issue count for the header's “x/y read · n%”
+    read: readCountsForSeries(db, [id], userId).get(id) || 0,
       cv_id: null, cv_locked: 0, sourced, path: series.path,
       type: series.type || 'comic',
       library_id: series.library_id ?? null,
@@ -2039,6 +2055,67 @@ export const WANTED_SQL = `(
     CASE WHEN s.watch_state='watched' THEN 1 ELSE 0 END
   ) = 1
 )`;
+
+// fork: READ STATE. The reader plugin owns `reader_progress`
+// (user_id, issue_id, page, pages, completed), keyed by the ComicVine issue id
+// and scoped per user. Read status is a first-class thing to see next to an
+// issue, so core queries surface it — but the table belongs to a plugin that
+// may be disabled or absent, so every use is guarded and degrades to "no read
+// data" rather than throwing.
+let readerTablePresent = null;
+export function hasReadTable(db) {
+  if (readerTablePresent === null) {
+    try {
+      readerTablePresent = !!db.prepare(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='reader_progress'").get();
+    } catch { readerTablePresent = false; }
+  }
+  return readerTablePresent;
+}
+
+/** Read state for a set of CV issue ids → Map<cvIssueId, 'read'|'reading'>.
+ *  A completed row is read; a started-but-unfinished one is reading. */
+export function readStateFor(db, cvIssueIds, userId) {
+  const out = new Map();
+  if (!hasReadTable(db) || userId == null) return out;
+  const ids = (cvIssueIds || []).map(Number).filter(Boolean);
+  if (!ids.length) return out;
+  try {
+    // Chunked: SQLite caps host parameters, and a long run can hold thousands.
+    for (let i = 0; i < ids.length; i += 800) {
+      const chunk = ids.slice(i, i + 800);
+      const rows = db.prepare(`SELECT issue_id, page, pages, completed FROM reader_progress
+         WHERE user_id = ? AND issue_id IN (${chunk.map(() => '?').join(',')})`).all(userId, ...chunk);
+      for (const r of rows) {
+        if (r.completed) out.set(r.issue_id, 'read');
+        else if ((r.page || 0) > 0) out.set(r.issue_id, 'reading');
+      }
+    }
+  } catch { /* plugin table went away mid-flight — treat as no read data */ }
+  return out;
+}
+
+/** How many issues of each series the user has finished → Map<series_id, n>. */
+export function readCountsForSeries(db, seriesIds, userId) {
+  const out = new Map();
+  if (!hasReadTable(db) || userId == null) return out;
+  const ids = (seriesIds || []).map(Number).filter(Boolean);
+  if (!ids.length) return out;
+  try {
+    for (let i = 0; i < ids.length; i += 800) {
+      const chunk = ids.slice(i, i + 800);
+      const rows = db.prepare(`SELECT s.id series_id, COUNT(*) n
+          FROM series s
+          JOIN cv_issues ci ON ci.cv_series_id = s.cv_id
+          JOIN reader_progress rp ON rp.issue_id = ci.comicvine_id
+         WHERE rp.user_id = ? AND rp.completed = 1
+           AND s.id IN (${chunk.map(() => '?').join(',')})
+         GROUP BY s.id`).all(userId, ...chunk);
+      for (const r of rows) out.set(r.series_id, r.n);
+    }
+  } catch { /* ignore */ }
+  return out;
+}
 
 export const WATCH_STATES = ['watched', 'paused', 'unwatched'];
 

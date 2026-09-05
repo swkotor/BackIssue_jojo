@@ -33,6 +33,11 @@
   function toggleChips() { chipsOpen = !chipsOpen; localStorage.setItem('libraryChips', chipsOpen ? '1' : '0'); }
   const activeFilter = $derived(FILTERS.find((f) => f.key === rail.filter) || FILTERS[0]);
 
+  // fork: read progress for a series row. `read` counts FINISHED issues; the
+  // denominator is the CV issue count, so it answers "how much of this series
+  // have I read", not "how much of what I own".
+  const readPct = (r) => (r.total ? Math.round(((r.read || 0) / r.total) * 100) : 0);
+
   // Grid ⊞ / list ≣ — a device preference, not a URL one.
   let view = $state(localStorage.getItem('libraryView') || 'grid');
   function setView(v) { view = v; localStorage.setItem('libraryView', v); }
@@ -485,6 +490,10 @@
               <div class="libx-card__title" title={s.title}>{s.title}{#if s.year}<span class="libx-card__year"> ({s.year})</span>{/if}</div>
               <div class="libx-card__meta">
                 <span class="libx-card__count">{s.owned}/{s.total}</span>
+                {#if s.matched && s.total}
+                  <span class="readchip" class:is-done={(s.read || 0) >= s.total} class:is-none={!s.read}
+                    title="{fmt(s.read || 0)} of {fmt(s.total)} issues read">{fmt(s.read || 0)}/{fmt(s.total)} read</span>
+                {/if}
                 {#if s.pub_status && s.pub_status !== 'unknown'}
                   <span class="pubchip pubchip--{s.pub_status}"
                     title={s.pub_status === 'ongoing' ? 'Continuing — still publishing' : 'Finished — no longer publishing'}>{s.pub_status === 'ongoing' ? 'cont.' : 'fin.'}</span>
@@ -503,7 +512,7 @@
     {:else}
       <div class="libx-list">
         <div class="libx-list__head">
-          <span></span><span>Title</span><span>Progress</span>
+          <span></span><span>Title</span><span>Progress</span><span>Read</span>
           <span class="libx-col--wide">Latest</span><span class="libx-col--wide libx-col--right">Size</span>
           <span class="libx-col--wide">Status</span><span class="libx-col--wide">Dates</span><span></span><span></span>
         </div>
@@ -541,6 +550,12 @@
             <div class="libx-row__progress">
               <span class="libx-row__nums">{s.matched ? `${s.owned}/${s.total}` : (s.files ? `${fmt(s.files)} files` : '—')}</span>
               {#if s.matched}<span class="libx-row__track"><span class="libx-row__fill" class:is-done={isDone(s)} style="width:{pct(s)}%"></span></span>{/if}
+            </div>
+            <div class="libx-row__read" title={s.matched ? `${fmt(s.read || 0)} of ${fmt(s.total)} issues read` : ''}>
+              {#if s.matched && s.total}
+                <span class="libx-row__nums" class:is-done={(s.read || 0) >= s.total}>{fmt(s.read || 0)}/{fmt(s.total)} · {readPct(s)}%</span>
+                <span class="libx-row__track"><span class="libx-row__fill libx-row__fill--read" class:is-done={(s.read || 0) >= s.total} style="width:{readPct(s)}%"></span></span>
+              {:else}<span class="libx-row__nums">—</span>{/if}
             </div>
             <span class="libx-row__dim libx-col--wide" title="Newest known issue's cover date">{s.matched ? (s.latest || '—') : '—'}</span>
             <span class="libx-row__dim libx-col--wide libx-col--right">{s.size ? humanBytes(s.size) : '—'}</span>
@@ -651,7 +666,7 @@
      three had no column of their own and landed in implicit ones). Cap the
      title, give every trailing cell a real column, and park the slack in a
      filler column just before the star. */
-  .libx-list__head, .libx-row { display: grid; grid-template-columns: 46px minmax(170px, 34ch) 132px 86px 78px 74px 148px 1fr 34px; align-items: center; gap: 12px; padding: 9px 14px; }
+  .libx-list__head, .libx-row { display: grid; grid-template-columns: 46px minmax(170px, 30ch) 118px 118px 86px 78px 74px 148px 1fr 34px; align-items: center; gap: 12px; padding: 9px 14px; }
   .libx-list__head { border-bottom: 1px solid var(--line); font: 600 10.5px var(--font-body); text-transform: uppercase; letter-spacing: .06em; color: var(--faint); background: rgba(255,255,255,.02); }
   .libx-col--right { text-align: right; }
   .libx-row { border-bottom: 1px solid #2a2536; cursor: pointer; }
@@ -697,6 +712,19 @@
     box-shadow: 0 1px 4px rgba(0,0,0,.5);
   }
   .libx-card__wsym.wsym--paused { font-size: 11px; }
+  /* fork: read progress */
+  .libx-row__read { min-width: 0; }
+  .libx-row__nums.is-done { color: var(--green); }
+  .libx-row__fill--read { background: #60a5fa; }
+  .libx-row__fill--read.is-done { background: var(--green); }
+  .readchip {
+    font: 700 9.5px var(--font-mono); letter-spacing: .03em;
+    padding: 2px 7px; border-radius: 20px; flex-shrink: 0;
+    border: 1px solid rgba(96,165,250,.3); background: rgba(96,165,250,.14); color: #60a5fa;
+  }
+  .readchip.is-done { border-color: rgba(95,211,138,.45); background: rgba(95,211,138,.14); color: var(--green); }
+  .readchip.is-none { border-color: var(--line); background: transparent; color: var(--faint); }
+
   .pubchip {
     font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
     padding: 2px 7px; border-radius: 20px; flex-shrink: 0; justify-self: start;
@@ -768,7 +796,7 @@
 
   @media (max-width: 760px) {
     .libx-grid { grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 14px; }
-    .libx-list__head, .libx-row { grid-template-columns: 46px 1fr auto 1fr 34px; }
+    .libx-list__head, .libx-row { grid-template-columns: 46px 1fr auto auto 1fr 34px; }
     .libx-col--wide { display: none; }
   }
 </style>

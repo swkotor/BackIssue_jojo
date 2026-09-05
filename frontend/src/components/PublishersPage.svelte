@@ -25,6 +25,9 @@
   // Volume tier view mode — a device preference, matching the Library page.
   let vview = $state(localStorage.getItem('publisherVolView') || 'grid');
   function setVview(v) { vview = v; localStorage.setItem('publisherVolView', v); }
+  // fork: read progress, same definition as the Library — finished issues over
+  // the full ComicVine issue count.
+  const rpct = (x) => (x.total ? Math.round(((x.read || 0) / x.total) * 100) : 0);
 
   // One effect per tier: the URL is the state, so each level refetches only
   // when its own key changes.
@@ -164,7 +167,8 @@
               {/if}
             </div>
             <div class="pcard__name">{p.name}</div>
-            <div class="pcard__meta">{fmt(p.franchises)} {p.franchises === 1 ? 'series' : 'series'} · {fmt(p.series)} volumes</div>
+            <div class="pcard__meta">{fmt(p.franchises)} series · {fmt(p.series)} volumes</div>
+            {#if p.total}<div class="pcard__meta pcard__meta--read">{fmt(p.read || 0)}/{fmt(p.total)} read · {rpct(p)}%</div>{/if}
           </button>
         {/each}
       </div>
@@ -189,6 +193,12 @@
             </div>
             <div class="fcard__name">{f.name}</div>
             <div class="fcard__meta">{fmt(f.owned)}/{fmt(f.total)} issues</div>
+            {#if f.total}
+              <div class="fcard__read">
+                <span class="fcard__readbar"><span class="fcard__readfill" class:is-done={(f.read || 0) >= f.total} style="width:{rpct(f)}%"></span></span>
+                <span class="fcard__readnum" class:is-done={(f.read || 0) >= f.total}>{fmt(f.read || 0)}/{fmt(f.total)} · {rpct(f)}%</span>
+              </div>
+            {/if}
           </button>
         {/each}
       </div>
@@ -215,6 +225,7 @@
                 <span class="vcard__art"><Cover coverUrl={v.cover} title={v.title} /></span>
                 <span class="vcard__title">{v.title}</span>
                 <span class="vcard__meta">{v.year || '—'} · {fmt(v.owned)}/{fmt(v.total)}</span>
+                {#if v.total}<span class="vcard__meta vcard__meta--read" class:is-done={(v.read || 0) >= v.total}>{fmt(v.read || 0)}/{fmt(v.total)} read · {rpct(v)}%</span>{/if}
               </button>
             </div>
           {/each}
@@ -230,7 +241,7 @@
                 <Cover coverUrl={v.cover} title={v.title} />
                 <span class="vrow__main">
                   <span class="vrow__title">{v.title}{#if v.year}<span class="vrow__year"> ({v.year})</span>{/if}</span>
-                  <span class="vrow__meta">{fmt(v.owned)}/{fmt(v.total)} issues</span>
+                  <span class="vrow__meta">{fmt(v.owned)}/{fmt(v.total)} issues{#if v.total} · <span class="vrow__read" class:is-done={(v.read || 0) >= v.total}>{fmt(v.read || 0)}/{fmt(v.total)} read ({rpct(v)}%)</span>{/if}</span>
                 </span>
               </button>
             </div>
@@ -348,6 +359,20 @@
   .vrow__title { font: 600 13.5px var(--font-body); color: var(--text); }
   .vrow__year { color: var(--faint); font-weight: 400; }
   .vrow__meta { font: 11px var(--font-mono); color: var(--faint); }
+
+  /* fork: read progress. Blue while in progress, green once finished — the
+     same language the Library and series pages use. */
+  .pcard__meta--read { color: #60a5fa; }
+  .fcard__read { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
+  .fcard__readbar { flex: 1; height: 4px; border-radius: 4px; background: var(--ink); overflow: hidden; }
+  .fcard__readfill { display: block; height: 100%; background: #60a5fa; }
+  .fcard__readfill.is-done { background: var(--green); }
+  .fcard__readnum { font: 10px var(--font-mono); color: #60a5fa; white-space: nowrap; }
+  .fcard__readnum.is-done { color: var(--green); }
+  .vcard__meta--read { color: #60a5fa; }
+  .vcard__meta--read.is-done { color: var(--green); }
+  .vrow__read { color: #60a5fa; }
+  .vrow__read.is-done { color: var(--green); }
 
   .pubx__view { display: flex; background: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 2px; flex: none; }
   .pubx__viewbtn { width: 30px; height: 28px; display: grid; place-items: center; border: none; border-radius: 6px; cursor: pointer; background: transparent; color: var(--faint); }

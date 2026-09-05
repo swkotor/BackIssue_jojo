@@ -21,6 +21,8 @@
 // Step 2's "only if the target already exists" guard is what keeps this honest:
 // it never invents a franchise, it only merges into one the library already has.
 
+import { readCountsForSeries } from './db.js';
+
 export function initFranchiseTables(db) {
   db.exec(`
     -- Per-series manual grouping override. Absent row = follow the derivation.
@@ -190,8 +192,8 @@ export function groupByFranchise(rows, overrides = new Map()) {
 const MEMBER_SQL = `(s.followed = 1
     OR EXISTS (SELECT 1 FROM library_files lf WHERE lf.series_id = s.id AND lf.valid = 1))`;
 
-function libraryRows(db, { publisher = null, includeRestricted = true } = {}) {
-  return db.prepare(`
+function libraryRows(db, { publisher = null, includeRestricted = true, userId = null } = {}) {
+  const rows = db.prepare(`
     SELECT s.id, s.title, s.year, s.cover_url, s.watch_state, s.cv_id,
            COALESCE(NULLIF(cv.publisher,''), 'Unknown') publisher,
            cv.image_url cv_cover, cv.start_year,
@@ -203,6 +205,11 @@ function libraryRows(db, { publisher = null, includeRestricted = true } = {}) {
        ${includeRestricted ? '' : 'AND s.restricted = 0'}
        ${publisher ? `AND COALESCE(NULLIF(cv.publisher,''), 'Unknown') = @publisher` : ''}
      ORDER BY s.title`).all(publisher ? { publisher } : {});
+  // fork: finished-issue counts, so the Publishers browser can show progress
+  // the same way the Library does. Plugin-owned table, hence the guard inside.
+  const readBy = readCountsForSeries(db, rows.map((r) => r.id), userId);
+  for (const r of rows) r.read = readBy.get(r.id) || 0;
+  return rows;
 }
 
 const overrideMap = (db) => new Map(
@@ -210,13 +217,13 @@ const overrideMap = (db) => new Map(
 
 /** Publisher cards: one per publisher we own something from, newest cover as a
  *  fallback when ComicVine has no logo for it. */
-export function listPublishers(db, { includeRestricted = true } = {}) {
-  const rows = libraryRows(db, { includeRestricted });
+export function listPublishers(db, { includeRestricted = true, userId = null } = {}) {
+  const rows = libraryRows(db, { includeRestricted, userId });
   const by = new Map();
   for (const r of rows) {
-    if (!by.has(r.publisher)) by.set(r.publisher, { name: r.publisher, series: 0, owned: 0, covers: [] });
+    if (!by.has(r.publisher)) by.set(r.publisher, { name: r.publisher, series: 0, owned: 0, read: 0, total: 0, covers: [] });
     const p = by.get(r.publisher);
-    p.series++; p.owned += r.owned;
+    p.series++; p.owned += r.owned; p.read += r.read || 0; p.total += r.total;
     if (p.covers.length < 3 && (r.cover_url || r.cv_cover)) p.covers.push(r.cover_url || r.cv_cover);
   }
   const logos = new Map(db.prepare('SELECT name, cv_id, image_url, site_detail_url FROM cv_publishers').all()
@@ -234,8 +241,8 @@ export function listPublishers(db, { includeRestricted = true } = {}) {
 }
 
 /** Franchise cards for one publisher. */
-export function listFranchises(db, publisher, { includeRestricted = true } = {}) {
-  const rows = libraryRows(db, { publisher, includeRestricted });
+export function listFranchises(db, publisher, { includeRestricted = true, userId = null } = {}) {
+  const rows = libraryRows(db, { publisher, includeRestricted, userId });
   const byId = new Map(rows.map((r) => [r.id, r]));
   const groups = groupByFranchise(rows, overrideMap(db));
   const meta = new Map(db.prepare('SELECT franchise, display_name, image_url, cv_character_id FROM franchise_meta WHERE publisher = ?')
@@ -258,6 +265,7 @@ export function listFranchises(db, publisher, { includeRestricted = true } = {})
       volumes: vols.length,
       owned: vols.reduce((n, v) => n + v.owned, 0),
       total: vols.reduce((n, v) => n + v.total, 0),
+      read: vols.reduce((n, v) => n + (v.read || 0), 0),
       years: [Math.min(...vols.map((v) => v.year || v.start_year || 9999)), Math.max(...vols.map((v) => v.year || v.start_year || 0))],
     });
   }
@@ -265,8 +273,8 @@ export function listFranchises(db, publisher, { includeRestricted = true } = {})
 }
 
 /** Every volume in one franchise, newest first. */
-export function franchiseVolumes(db, publisher, key, { includeRestricted = true } = {}) {
-  const rows = libraryRows(db, { publisher, includeRestricted });
+export function franchiseVolumes(db, publisher, key, { includeRestricted = true, userId = null } = {}) {
+  const rows = libraryRows(db, { publisher, includeRestricted, userId });
   const byId = new Map(rows.map((r) => [r.id, r]));
   const groups = groupByFranchise(rows, overrideMap(db));
   const ids = groups.get(key) || [];
@@ -279,7 +287,7 @@ export function franchiseVolumes(db, publisher, key, { includeRestricted = true 
       .map((v) => ({
         id: v.id, title: v.title, year: v.year || v.start_year || null,
         cover: v.cover_url || v.cv_cover || null,
-        owned: v.owned, total: v.total, watch_state: v.watch_state, cv_id: v.cv_id,
+        owned: v.owned, total: v.total, read: v.read || 0, watch_state: v.watch_state, cv_id: v.cv_id,
       }))
       .sort((a, b) => (b.year || 0) - (a.year || 0) || a.title.localeCompare(b.title)),
   };

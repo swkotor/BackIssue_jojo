@@ -285,7 +285,14 @@
     }
     const total = issues.length;
     const owned = c.saved + c.untagged;
-    return { ...c, total, owned, pct: total ? Math.round((owned / total) * 100) : 0,
+    // fork: read progress. Counted off the issue rows (each carries readState)
+    // rather than a separate call, so it always agrees with the list below.
+    const read = issues.filter((i) => i.readState === 'read').length;
+    const reading = issues.filter((i) => i.readState === 'reading').length;
+    return { ...c, total, owned, read, reading,
+      readPct: total ? Math.round((read / total) * 100) : 0,
+      readW: total ? (read / total) * 100 : 0,
+      pct: total ? Math.round((owned / total) * 100) : 0,
       ownedW: total ? (owned / total) * 100 : 0, dlW: total ? (c.downloading / total) * 100 : 0 };
   });
   // Live per-filter counts for the issue filter tabs.
@@ -638,6 +645,16 @@
                 <div class="sx-comp__seg sx-comp__seg--owned" style="width:{hero.ownedW}%"></div>
                 <div class="sx-comp__seg sx-comp__seg--dl" style="width:{hero.dlW}%"></div>
               </div>
+              <!-- fork: read progress gets its own line + bar. Owning an issue
+                   and having read it are different questions, so they don't
+                   share a bar. -->
+              <div class="sx-comp__top sx-comp__top--read">
+                <span class="sx-comp__owned">{fmt(hero.read)} of {fmt(hero.total)} read{#if hero.reading} · {fmt(hero.reading)} in progress{/if}</span>
+                <span class="sx-comp__pct sx-comp__pct--read" class:is-done={hero.read >= hero.total && hero.total > 0}>{hero.readPct}%</span>
+              </div>
+              <div class="sx-comp__bar sx-comp__bar--read">
+                <div class="sx-comp__seg sx-comp__seg--read" style="width:{hero.readW}%"></div>
+              </div>
               <div class="sx-comp__legend">
                 {#if hero.saved}<span class="sx-comp__leg sx-comp__leg--saved">{fmt(hero.saved)} saved</span>{/if}
                 {#if hero.downloading}<span class="sx-comp__leg sx-comp__leg--dl">{fmt(hero.downloading)} downloading</span>{/if}
@@ -847,6 +864,7 @@
                 {@const state = issueState(i)}
                 {@const cover = issueCoverUrl(i)}
                 <div class="icard"
+                  class:is-read={i.readState === 'read'}
                   class:is-corrupt={i.corrupt} class:is-checked={detailSelected.has(i.cv_issue_id)}
                   title={i.corrupt && corruptReason(i) ? 'Corrupt: ' + corruptReason(i) : (i.title || '')}>
                   <div class="icard__art" onclick={() => openIssueInfo(i.cv_issue_id, i.number)} role="button" tabindex="0"
@@ -858,6 +876,8 @@
                       onclick={(e) => { e.stopPropagation(); toggleIssue(i, range.start + vi, e.shiftKey); }} />
                     <span class="icard__state icard__state--{state}" title={state}></span>
                     {#if i.wanted && !i.owned}<span class="icard__wanted" title="Wanted">★</span>{/if}
+                    {#if i.readState}<span class="icard__read icard__read--{i.readState}"
+                      title={i.readState === 'read' ? 'Read' : 'Started — not finished'}>{#if i.readState === 'read'}<Icon name="check" size={12} />{:else}◐{/if}</span>{/if}
                     <div class="icard__actions" onclick={(e) => e.stopPropagation()}>
                       {#each issueActions as a (a.id + ':' + issueActionsTick.n)}
                         {#if !a.when || a.when(i)}
@@ -898,7 +918,7 @@
               {@const state = issueState(i)}
               {@const bf = bestFile(i)}
               <div class="issue"
-                class:is-owned={i.owned} class:is-corrupt={i.corrupt} class:is-wanted={!i.owned && i.wanted}
+                class:is-owned={i.owned} class:is-corrupt={i.corrupt} class:is-wanted={!i.owned && i.wanted} class:is-read={i.readState === 'read'}
                 title={i.corrupt && corruptReason(i) ? 'Corrupt: ' + corruptReason(i) : undefined}
                 onclick={(e) => toggleIssue(i, range.start + vi, e.shiftKey)} role="button" tabindex="0"
                 onkeydown={(e) => { if (e.key === 'Enter') toggleIssue(i, range.start + vi, e.shiftKey); }}>
@@ -907,6 +927,11 @@
                   onclick={(e) => e.stopPropagation()}
                   onchange={() => toggleIssue(i, range.start + vi)} />
                 <span class="issue__num">{i.number || '—'}</span>
+                <span class="issue__read issue__read--{i.readState || 'unread'}"
+                  title={i.readState === 'read' ? 'Read' : i.readState === 'reading' ? 'Started — not finished' : 'Unread'}
+                  aria-label={i.readState === 'read' ? 'Read' : i.readState === 'reading' ? 'Reading' : 'Unread'}>
+                  {#if i.readState === 'read'}<Icon name="check" size={12} />{:else if i.readState === 'reading'}◐{:else}○{/if}
+                </span>
                 <button class="issue__title" title="Issue details" onclick={(e) => { e.stopPropagation(); openIssueInfo(i.cv_issue_id, i.number); }}>{i.title}</button>
                 <span class="issue__col issue__col--date" title="Cover date">{i.cover_date || ''}</span>
                 <span class="issue__col issue__col--pages" title="Pages">{bf?.page_count ? fmt(bf.page_count) + 'p' : ''}</span>
@@ -1006,6 +1031,36 @@
   .wstate-chip--paused .wstate-chip__sym { font-size: 11px; letter-spacing: -1px; }
   .wstate-chip--watched { background: rgba(52,211,153,.16); color: #34d399; }
   .wstate-chip--paused { background: rgba(251,191,36,.16); color: #fbbf24; }
+
+  .sx-comp__top--read { margin-top: 8px; }
+  .sx-comp__bar--read { margin-top: 4px; }
+  .sx-comp__seg--read { background: #60a5fa; }
+  .sx-comp__pct--read { color: #60a5fa; }
+
+  /* fork: READ STATE. Unread is the thing worth spotting in a long run, so
+     read issues recede (dimmed cover, muted tick) rather than shouting. The
+     marker sits immediately after the issue number, before the title, so it
+     reads as part of the identity of the row rather than a trailing action. */
+  .issue__read {
+    flex-shrink: 0; width: 20px; height: 20px; border-radius: 50%;
+    display: inline-grid; place-items: center;
+    font-size: 11px; line-height: 1;
+  }
+  .issue__read--read { background: rgba(52,211,153,.18); color: #34d399; }
+  .issue__read--reading { background: rgba(96,165,250,.18); color: #60a5fa; }
+  .issue__read--unread { color: #4a4458; }
+  .issue.is-read .issue__title { color: var(--muted); }
+
+  .icard.is-read .icard__art img { opacity: .45; }
+  .icard.is-read:hover .icard__art img { opacity: .8; }
+  .icard__read {
+    position: absolute; top: 4px; left: 4px; z-index: 2;
+    width: 19px; height: 19px; border-radius: 50%;
+    display: grid; place-items: center; font-size: 11px; line-height: 1;
+    background: rgba(0,0,0,.72); backdrop-filter: blur(2px);
+  }
+  .icard__read--read { color: #34d399; }
+  .icard__read--reading { color: #60a5fa; }
 
   /* fork: per-issue wanted toggle */
   .issue__want {

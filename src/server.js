@@ -664,7 +664,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   });
 
   // ---- fork: Publishers browser (publisher → franchise → volume) ----
-  const pubOpts = (req) => ({ includeRestricted: canRestricted(req) });
+  const pubOpts = (req) => ({ includeRestricted: canRestricted(req), userId: req.user.id });
   app.get('/api/publishers', (req, res) => {
     res.json({ publishers: franchise.listPublishers(db, pubOpts(req)) });
   });
