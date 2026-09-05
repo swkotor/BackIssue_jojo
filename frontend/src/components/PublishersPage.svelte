@@ -22,6 +22,9 @@
   let artBusy = $state(false);
   let artNote = $state('');
   let picked = $state(new Set());   // series ids selected for a merge/split
+  // Volume tier view mode — a device preference, matching the Library page.
+  let vview = $state(localStorage.getItem('publisherVolView') || 'grid');
+  function setVview(v) { vview = v; localStorage.setItem('publisherVolView', v); }
 
   // One effect per tier: the URL is the state, so each level refetches only
   // when its own key changes.
@@ -120,6 +123,14 @@
       {/if}
     {/if}
     <span class="pubx__spacer"></span>
+    {#if pub && fr}
+      <div class="pubx__view" role="group" aria-label="View">
+        <button class="pubx__viewbtn" class:is-active={vview === 'grid'} title="Poster grid" aria-label="Poster grid"
+          onclick={() => setVview('grid')}><Icon name="grid" size={15} /></button>
+        <button class="pubx__viewbtn" class:is-active={vview === 'list'} title="List" aria-label="List"
+          onclick={() => setVview('list')}><Icon name="list" size={15} /></button>
+      </div>
+    {/if}
     {#if !pub && can('library.manage')}
       <button class="pubx__act" disabled={artBusy} title="Look up publisher logos and franchise character art on ComicVine"
         onclick={fetchArt}><Icon name="refresh" size={14} /> {artBusy ? 'Starting…' : 'Fetch artwork'}</button>
@@ -193,22 +204,39 @@
           <button class="pubx__link" onclick={() => (picked = new Set())}>Clear</button>
         </div>
       {/if}
-      <div class="pubx__vols">
-        {#each detail.volumes as v (v.id)}
-          <div class="vrow ws-{v.watch_state || 'watched'}">
-            {#if isTrusted()}
-              <input type="checkbox" class="vrow__cb" checked={picked.has(v.id)} onclick={(e) => toggle(v.id, e)} />
-            {/if}
-            <button class="vrow__open" onclick={() => navigate('/volume/' + v.id)}>
-              <Cover coverUrl={v.cover} title={v.title} />
-              <span class="vrow__main">
-                <span class="vrow__title">{v.title}{#if v.year}<span class="vrow__year"> ({v.year})</span>{/if}</span>
-                <span class="vrow__meta">{fmt(v.owned)}/{fmt(v.total)} issues</span>
-              </span>
-            </button>
-          </div>
-        {/each}
-      </div>
+      {#if vview === 'grid'}
+        <div class="pubx__vgrid">
+          {#each detail.volumes as v (v.id)}
+            <div class="vcard ws-{v.watch_state || 'watched'}" class:is-picked={picked.has(v.id)}>
+              {#if isTrusted()}
+                <input type="checkbox" class="vcard__cb" checked={picked.has(v.id)} onclick={(e) => toggle(v.id, e)} />
+              {/if}
+              <button class="vcard__open" onclick={() => navigate('/volume/' + v.id)}>
+                <span class="vcard__art"><Cover coverUrl={v.cover} title={v.title} /></span>
+                <span class="vcard__title">{v.title}</span>
+                <span class="vcard__meta">{v.year || '—'} · {fmt(v.owned)}/{fmt(v.total)}</span>
+              </button>
+            </div>
+          {/each}
+        </div>
+      {:else}
+        <div class="pubx__vols">
+          {#each detail.volumes as v (v.id)}
+            <div class="vrow ws-{v.watch_state || 'watched'}">
+              {#if isTrusted()}
+                <input type="checkbox" class="vrow__cb" checked={picked.has(v.id)} onclick={(e) => toggle(v.id, e)} />
+              {/if}
+              <button class="vrow__open" onclick={() => navigate('/volume/' + v.id)}>
+                <Cover coverUrl={v.cover} title={v.title} />
+                <span class="vrow__main">
+                  <span class="vrow__title">{v.title}{#if v.year}<span class="vrow__year"> ({v.year})</span>{/if}</span>
+                  <span class="vrow__meta">{fmt(v.owned)}/{fmt(v.total)} issues</span>
+                </span>
+              </button>
+            </div>
+          {/each}
+        </div>
+      {/if}
     {/if}
   </div>
 </section>
@@ -249,12 +277,23 @@
   /* Publisher card: a wide letterbox, because logos are wordmarks, not posters. */
   .pcard, .fcard { background: none; border: none; padding: 0; cursor: pointer; text-align: left; }
   .pcard__art {
-    display: grid; place-items: center; aspect-ratio: 16 / 9;
-    background: var(--panel-2); border: 1px solid var(--line); border-radius: 12px;
-    overflow: hidden; padding: 14px;
+    display: grid; place-items: center; aspect-ratio: 3 / 2;
+    border: 1px solid var(--line); border-radius: 12px;
+    overflow: hidden; padding: 16px;
+    /* ComicVine ships most publisher logos as JPEGs with a baked-in WHITE
+       background, and the rest as dark-on-transparent PNGs. Both only read
+       correctly on a light plate, so the tile is white rather than following
+       the dark UI — a logo wall, not a poster grid. */
+    background: #fff;
   }
   .pcard:hover .pcard__art { border-color: var(--accent); }
-  .pcard__art img { max-width: 100%; max-height: 100%; object-fit: contain; }
+  /* Explicit width+height, not max-*: as a grid item with an aspect-ratio
+     parent, `max-height: 100%` resolves against the item's own content box and
+     stops constraining, so a square logo overflowed a 16/9 tile and got
+     clipped. Sizing the box and letting object-fit do the letterboxing is the
+     only reliable way round it. */
+  .pcard__art img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .pcard__art:has(.pcard__mark) { background: var(--panel-2); }
   .pcard__mark { font: 700 26px var(--font-body); color: var(--faint); letter-spacing: .04em; }
   .pcard__name { margin-top: 9px; font: 600 13.5px var(--font-body); color: var(--text); }
   .pcard__meta { margin-top: 2px; font: 11.5px var(--font-mono); color: var(--faint); }
@@ -266,7 +305,7 @@
     display: grid; place-items: center;
   }
   .fcard:hover .fcard__art { border-color: var(--accent); }
-  .fcard__art img { width: 100%; height: 100%; object-fit: cover; object-position: top center; }
+  .fcard__art img { width: 100%; height: 100%; object-fit: cover; object-position: top center; display: block; }
   /* A borrowed cover is art for a DIFFERENT thing, so it reads dimmer than
      real character art — the card shouldn't claim it's the franchise's own. */
   .fcard__art img.is-cover { opacity: .82; }
@@ -309,4 +348,27 @@
   .vrow__title { font: 600 13.5px var(--font-body); color: var(--text); }
   .vrow__year { color: var(--faint); font-weight: 400; }
   .vrow__meta { font: 11px var(--font-mono); color: var(--faint); }
+
+  .pubx__view { display: flex; background: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 2px; flex: none; }
+  .pubx__viewbtn { width: 30px; height: 28px; display: grid; place-items: center; border: none; border-radius: 6px; cursor: pointer; background: transparent; color: var(--faint); }
+  .pubx__viewbtn.is-active { background: var(--panel-2); color: var(--text); }
+
+  .pubx__vgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 18px; }
+  .vcard { position: relative; }
+  .vcard__cb { position: absolute; top: 7px; left: 7px; z-index: 3; width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
+  .vcard__open { display: block; width: 100%; background: none; border: none; padding: 0; cursor: pointer; text-align: left; }
+  .vcard__art {
+    display: block; position: relative; aspect-ratio: 2 / 3; border-radius: 10px; overflow: hidden;
+    border: 2px solid transparent; background: var(--panel-2);
+  }
+  .vcard.ws-watched .vcard__art { border-color: #34d399; }
+  .vcard.ws-paused .vcard__art { border-color: #fbbf24; }
+  .vcard.ws-unwatched .vcard__art { border-color: #f87171; }
+  .vcard.is-picked .vcard__art { border-color: var(--accent); }
+  .vcard__art :global(.cover) { width: 100%; height: 100%; }
+  .vcard__title {
+    display: block; margin-top: 8px; font: 600 12.5px var(--font-body); color: var(--text);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .vcard__meta { display: block; margin-top: 2px; font: 11px var(--font-mono); color: var(--faint); }
 </style>
