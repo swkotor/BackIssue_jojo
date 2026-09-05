@@ -355,23 +355,28 @@
 
   /* Publisher card: a wide letterbox, because logos are wordmarks, not posters. */
   .pcard, .fcard { background: none; border: none; padding: 0; cursor: pointer; text-align: left; }
+  /* Logo plate. ComicVine ships most publisher logos as JPEGs with a baked-in
+     WHITE background and the rest as dark-on-transparent PNGs, so the tile is
+     white rather than following the dark UI — a logo wall, not a poster grid.
+     box-sizing matters here: the padding has to come OUT of the 3:2 box, not
+     get added to it. */
   .pcard__art {
-    display: grid; place-items: center; aspect-ratio: 3 / 2;
+    display: flex; align-items: center; justify-content: center;
+    aspect-ratio: 3 / 2; box-sizing: border-box; padding: 16px;
     border: 1px solid var(--line); border-radius: 12px;
-    overflow: hidden; padding: 16px;
-    /* ComicVine ships most publisher logos as JPEGs with a baked-in WHITE
-       background, and the rest as dark-on-transparent PNGs. Both only read
-       correctly on a light plate, so the tile is white rather than following
-       the dark UI — a logo wall, not a poster grid. */
-    background: #fff;
+    overflow: hidden; background: #fff;
   }
   .pcard:hover .pcard__art { border-color: var(--accent); }
-  /* Explicit width+height, not max-*: as a grid item with an aspect-ratio
-     parent, `max-height: 100%` resolves against the item's own content box and
-     stops constraining, so a square logo overflowed a 16/9 tile and got
-     clipped. Sizing the box and letting object-fit do the letterboxing is the
-     only reliable way round it. */
-  .pcard__art img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  /* Intrinsic sizing capped by max-*, NOT width/height: 100%. Percentage
+     heights on a centred flex/grid item have no definite basis here, so the
+     image fell back to its intrinsic height (Fantagraphics' logo is 960px
+     tall), overflowed the tile and got clipped by overflow:hidden. Letting the
+     image keep its own size and merely capping it is the one form that holds
+     for both tall and wide logos. */
+  .pcard__art img {
+    max-width: 100%; max-height: 100%; width: auto; height: auto;
+    object-fit: contain; display: block;
+  }
   .pcard__art:has(.pcard__mark) { background: var(--panel-2); }
   .pcard__mark { font: 700 26px var(--font-body); color: var(--faint); letter-spacing: .04em; }
   .pcard__name { margin-top: 9px; font: 600 13.5px var(--font-body); color: var(--text); }
