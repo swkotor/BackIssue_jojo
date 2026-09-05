@@ -372,6 +372,23 @@
   }
 
   // Bulk version for the issues currently ticked on this page.
+  // fork: flip an issue's read flag via the reader plugin's manual override
+  // (POST /api/reader/issue/:id/mark). Optimistic, with the same store-shape
+  // care toggleWanted needed: issues live at detail.det.issues.
+  const readTracking = $derived(detail.det?.readTracking !== false);
+  async function toggleRead(i) {
+    const next = i.readState === 'read' ? null : 'read';
+    const prev = i.readState;
+    i.readState = next;
+    if (detail.det?.issues) detail.det.issues = [...detail.det.issues];
+    const r = await apiPost(`/api/reader/issue/${i.cv_issue_id}/mark`, { read: next === 'read' });
+    if (r?.error) {
+      i.readState = prev;
+      if (detail.det?.issues) detail.det.issues = [...detail.det.issues];
+      notify(r.error, 'error');
+    }
+  }
+
   async function markSelectedWanted(wanted) {
     const ids = [...detailSelected];
     if (!ids.length) return;
@@ -876,8 +893,8 @@
                       onclick={(e) => { e.stopPropagation(); toggleIssue(i, range.start + vi, e.shiftKey); }} />
                     <span class="icard__state icard__state--{state}" title={state}></span>
                     {#if i.wanted && !i.owned}<span class="icard__wanted" title="Wanted">★</span>{/if}
-                    {#if i.readState}<span class="icard__read icard__read--{i.readState}"
-                      title={i.readState === 'read' ? 'Read' : 'Started — not finished'}>{#if i.readState === 'read'}<Icon name="check" size={12} />{:else}◐{/if}</span>{/if}
+                    {#if readTracking}<span class="icard__read icard__read--{i.readState || 'unread'}"
+                      title={i.readState === 'read' ? 'Read' : i.readState === 'reading' ? 'Started — not finished' : 'Unread'}>{#if i.readState === 'read'}<Icon name="check" size={11} /> READ{:else if i.readState === 'reading'}◐{:else}UNREAD{/if}</span>{/if}
                     <div class="icard__actions" onclick={(e) => e.stopPropagation()}>
                       {#each issueActions as a (a.id + ':' + issueActionsTick.n)}
                         {#if !a.when || a.when(i)}
@@ -927,11 +944,17 @@
                   onclick={(e) => e.stopPropagation()}
                   onchange={() => toggleIssue(i, range.start + vi)} />
                 <span class="issue__num">{i.number || '—'}</span>
-                <span class="issue__read issue__read--{i.readState || 'unread'}"
-                  title={i.readState === 'read' ? 'Read' : i.readState === 'reading' ? 'Started — not finished' : 'Unread'}
-                  aria-label={i.readState === 'read' ? 'Read' : i.readState === 'reading' ? 'Reading' : 'Unread'}>
-                  {#if i.readState === 'read'}<Icon name="check" size={12} />{:else if i.readState === 'reading'}◐{:else}○{/if}
-                </span>
+                {#if readTracking}
+                  <button class="issue__read issue__read--{i.readState || 'unread'}"
+                    title={i.readState === 'read' ? 'Read — click to mark unread'
+                      : i.readState === 'reading' ? 'Started, not finished — click to mark read'
+                      : 'Unread — click to mark read'}
+                    onclick={(e) => { e.stopPropagation(); toggleRead(i); }}>
+                    {#if i.readState === 'read'}<Icon name="check" size={12} /> READ
+                    {:else if i.readState === 'reading'}◐ READING
+                    {:else}UNREAD{/if}
+                  </button>
+                {/if}
                 <button class="issue__title" title="Issue details" onclick={(e) => { e.stopPropagation(); openIssueInfo(i.cv_issue_id, i.number); }}>{i.title}</button>
                 <span class="issue__col issue__col--date" title="Cover date">{i.cover_date || ''}</span>
                 <span class="issue__col issue__col--pages" title="Pages">{bf?.page_count ? fmt(bf.page_count) + 'p' : ''}</span>
@@ -1041,26 +1064,34 @@
      read issues recede (dimmed cover, muted tick) rather than shouting. The
      marker sits immediately after the issue number, before the title, so it
      reads as part of the identity of the row rather than a trailing action. */
+  /* A labelled pill, not a glyph: in a 160-issue run the question "have I read
+     this" has to be answerable at a glance, and a small circle wasn't. Clicking
+     it toggles read/unread through the reader plugin. */
   .issue__read {
-    flex-shrink: 0; width: 20px; height: 20px; border-radius: 50%;
-    display: inline-grid; place-items: center;
-    font-size: 11px; line-height: 1;
+    flex-shrink: 0; width: 76px; height: 22px; border-radius: 6px;
+    display: inline-flex; align-items: center; justify-content: center; gap: 4px;
+    font: 700 9.5px var(--font-body); letter-spacing: .07em;
+    border: 1.5px solid transparent; cursor: pointer; padding: 0;
   }
-  .issue__read--read { background: rgba(52,211,153,.18); color: #34d399; }
-  .issue__read--reading { background: rgba(96,165,250,.18); color: #60a5fa; }
-  .issue__read--unread { color: #4a4458; }
+  .issue__read--read { background: #34d399; border-color: #34d399; color: #06301f; }
+  .issue__read--reading { background: rgba(96,165,250,.18); border-color: #60a5fa; color: #60a5fa; }
+  .issue__read--unread { background: transparent; border-color: #4a4458; color: #6f6880; }
+  .issue__read--unread:hover { border-color: #34d399; color: #34d399; }
+  .issue__read--read:hover { filter: brightness(1.08); }
   .issue.is-read .issue__title { color: var(--muted); }
 
   .icard.is-read .icard__art img { opacity: .45; }
   .icard.is-read:hover .icard__art img { opacity: .8; }
   .icard__read {
     position: absolute; top: 4px; left: 4px; z-index: 2;
-    width: 19px; height: 19px; border-radius: 50%;
-    display: grid; place-items: center; font-size: 11px; line-height: 1;
-    background: rgba(0,0,0,.72); backdrop-filter: blur(2px);
+    height: 18px; padding: 0 6px; border-radius: 5px;
+    display: inline-flex; align-items: center; gap: 3px;
+    font: 700 9px var(--font-body); letter-spacing: .06em; line-height: 1;
+    background: rgba(0,0,0,.78); backdrop-filter: blur(2px);
   }
-  .icard__read--read { color: #34d399; }
+  .icard__read--read { color: #34d399; background: #34d399; color: #06301f; }
   .icard__read--reading { color: #60a5fa; }
+  .icard__read--unread { color: #b9b3c7; }
 
   /* fork: per-issue wanted toggle */
   .issue__want {
