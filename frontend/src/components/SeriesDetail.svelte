@@ -1,5 +1,5 @@
 <script>
-  import { goBack, navigate } from '../lib/router.svelte.js';
+  import { goBack, navigate, route } from '../lib/router.svelte.js';
   import { detail, detailSelected, flags, ops, loadCollection, reloadDetail, clearDetail, issueState, downloadCvIssues, redownloadCvIssues, redownloadIssues, watchDetailSweep } from '../lib/store.svelte.js';
   import { plugins, issueActions, seriesActions, issueActionsTick, issueCoverUrl, seriesViews, renderSeriesView } from '../lib/plugins.svelte.js';
   import { isTrusted, can } from '../lib/auth.svelte.js';
@@ -389,6 +389,18 @@
     }
   }
 
+  // fork: where the Back button goes. A `from` param (set by the Publishers
+  // browser) names an exact in-app view to return to; without one we fall back
+  // to history, labelled "Library" as before. `from` is only honoured when it
+  // is a site-relative path — never a protocol or //host — so a crafted link
+  // can't turn this button into an off-site redirect.
+  const backFrom = $derived.by(() => {
+    const raw = new URLSearchParams(route.search).get('from') || '';
+    if (!raw.startsWith('/') || raw.startsWith('//')) return null;
+    const label = new URLSearchParams(route.search).get('fromLabel') || '';
+    return { url: raw, label: label || 'Back' };
+  });
+
   async function markSelectedWanted(wanted) {
     const ids = [...detailSelected];
     if (!ids.length) return;
@@ -613,7 +625,9 @@
     </div>
   {:else}
     <div id="detail-body">
-      <button id="detail-back" class="btn btn--ghost detail-back" onclick={goBack}><Icon name="arrow-left" /> Library</button>
+      <button id="detail-back" class="btn btn--ghost detail-back"
+        title={backFrom ? `Back to ${backFrom.label}` : 'Back to the library'}
+        onclick={() => (backFrom ? navigate(backFrom.url) : goBack())}><Icon name="arrow-left" /> {backFrom ? backFrom.label : 'Library'}</button>
       <header class="series-header">
         <Cover coverUrl={s.cover_url} title={s.title} />
         <div class="series-meta">

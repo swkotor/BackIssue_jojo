@@ -15,6 +15,16 @@
   const pub = $derived(new URLSearchParams(route.search).get('pub') || '');
   const fr = $derived(new URLSearchParams(route.search).get('fr') || '');
 
+  // Opening a volume carries the exact view to come back to. History alone
+  // isn't enough: a reload (or a shared link) on the volume page leaves
+  // nothing behind to go back TO, and the series page would otherwise only
+  // offer "Library", dumping you out of the publisher you were browsing.
+  const backTo = $derived('/publishers?' + new URLSearchParams(
+    fr ? { pub, fr } : { pub }).toString());
+  const backLabel = $derived(fr ? (detail?.name || fr) : pub);
+  const openVolume = (id) => navigate(
+    `/volume/${id}?from=${encodeURIComponent(backTo)}&fromLabel=${encodeURIComponent(backLabel)}`);
+
   let publishers = $state([]);
   let franchises = $state([]);
   let detail = $state(null);
@@ -289,7 +299,7 @@
               {#if isTrusted()}
                 <input type="checkbox" class="vcard__cb" checked={picked.has(v.id)} onclick={(e) => toggle(v.id, e)} />
               {/if}
-              <button class="vcard__open" onclick={() => navigate('/volume/' + v.id)}>
+              <button class="vcard__open" onclick={() => openVolume(v.id)}>
                 <span class="vcard__art"><Cover coverUrl={v.cover} title={v.title} /></span>
                 <span class="vcard__title">{v.title}</span>
                 <span class="vcard__meta">{v.year || '—'} · {fmt(v.owned)}/{fmt(v.total)}</span>
@@ -305,7 +315,7 @@
               {#if isTrusted()}
                 <input type="checkbox" class="vrow__cb" checked={picked.has(v.id)} onclick={(e) => toggle(v.id, e)} />
               {/if}
-              <button class="vrow__open" onclick={() => navigate('/volume/' + v.id)}>
+              <button class="vrow__open" onclick={() => openVolume(v.id)}>
                 <Cover coverUrl={v.cover} title={v.title} />
                 <span class="vrow__main">
                   <span class="vrow__title">{v.title}{#if v.year}<span class="vrow__year"> ({v.year})</span>{/if}</span>
