@@ -642,6 +642,8 @@ body.userspage .users-page { display: flex; flex-direction: column; height: 100%
 /* ---------- Reading lists page ---------- */
 .lists-page { display: none; }
 body.listspage .home { display: none; }
+body.publisherspage .home { display: none; }
+body.publisherspage .publishers-page { display: flex; flex-direction: column; height: 100%; }
 body.listspage .lists-page { display: flex; flex-direction: column; height: 100%; }
 .lists-scroll { overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 10px; max-width: 860px; width: 100%; margin: 0 auto; }
 .listcard {

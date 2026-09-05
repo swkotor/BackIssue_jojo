@@ -26,6 +26,13 @@ export const SETTING_FIELDS = {
   tagPlacement:        { type: 'enum', values: ['embed', 'sidecar'] },
   comictaggerPath:     { type: 'string' }, // legacy (ComicTagger removed); tolerated so old settings.json loads
   comicvineKeys:       { type: 'string' },
+  // fork: a SECOND ComicVine key, used only by the Publishers browser for
+  // publisher logos and franchise character art. Kept separate from
+  // comicvineKeys/metadataSource on purpose — those govern volume and issue
+  // metadata, which stays on whichever source is configured. The hosted
+  // metadata service mirrors only /volume and /issue, so artwork has to come
+  // straight from ComicVine or not at all.
+  publisherCvKey:      { type: 'string' },
   cvBaseUrl:           { type: 'string', allowEmpty: true },
   // Where metadata comes from: the hosted BackIssue metadata service (zero
   // setup, cached + enriched) or ComicVine directly with the user's own key.

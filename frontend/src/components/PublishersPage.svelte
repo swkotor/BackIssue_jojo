@@ -102,7 +102,8 @@
   }
 </script>
 
-<section class="page pubx" class:is-active={active}>
+{#if active}
+<section class="page pubx publishers-page">
   <div class="pubx__bar">
     <button class="pubx__crumb" class:is-cur={!pub} onclick={() => setQuery({ pub: null, fr: null })}>
       <Icon name="layers" size={15} /> Publishers
@@ -211,6 +212,7 @@
     {/if}
   </div>
 </section>
+{/if}
 
 <style>
   .pubx { display: flex; flex-direction: column; height: 100%; min-height: 0; }

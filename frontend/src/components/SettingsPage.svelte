@@ -909,6 +909,11 @@
           <div class="client-test"><button id="cv-test" class="btn btn--ghost" type="button" onclick={testCv}>Test key</button>
             {#if tests.cv}<span id="cv-test-result" class="client-status {tests.cv.cls}">{#if tests.cv.icon}<Icon name={tests.cv.icon} /> {/if}{tests.cv.text}</span>{/if}</div>
         </div>
+        <!-- fork: artwork-only ComicVine key. Shown for BOTH sources, because
+             the hosted service doesn't mirror /publishers or /characters — the
+             Publishers browser needs ComicVine directly regardless. -->
+        <label class="field"><span>Publisher artwork key</span><input id="set-publisherCvKey" class="mono" type="text" spellcheck="false" autocomplete="off" placeholder="ComicVine API key for publisher logos…" /></label>
+        <p class="modal__note">Used only by the <b>Publishers</b> browser, for publisher logos and franchise character art. Your volume and issue metadata keeps using the source selected above — this key is never used for it. Free at comicvine.gamespot.com.</p>
         <!-- Service URL (self-hosted metadata instance) is an advanced escape
              hatch: kept mounted so a saved value persists, but not shown. It
              remains settable via the API / a previously saved value. -->

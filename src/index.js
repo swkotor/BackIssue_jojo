@@ -685,8 +685,11 @@ async function refreshPublisherArt({ paceMs = 400, force = false } = {}) {
   // adding a key for artwork doesn't move regular metadata off the hosted
   // service (and its Metron enrichment). Without a key there is simply no
   // artwork: the UI already falls back to lettermarks and volume covers.
-  if (!cvKey(currentSettings().comicvineKeys)) {
-    return { started: false, reason: 'needs a ComicVine API key (Settings → Metadata) — publisher logos and character art are not available through the hosted metadata service' };
+  // Prefer the dedicated artwork key; fall back to the main one when the user
+  // is already on the direct-ComicVine source and hasn't set a separate one.
+  const artKey = cvKey(currentSettings().publisherCvKey) || cvKey(currentSettings().comicvineKeys);
+  if (!artKey) {
+    return { started: false, reason: 'needs a ComicVine API key — set one under Settings → Metadata → “Publisher artwork key”. Publisher logos and character art are not available through the hosted metadata service.' };
   }
   const { publishers, franchises } = artBacklog(db, { maxAgeDays: force ? 0 : 30 });
   if (!publishers.length && !franchises.length) return { started: false, reason: 'nothing to fetch' };
@@ -694,7 +697,7 @@ async function refreshPublisherArt({ paceMs = 400, force = false } = {}) {
   const job = startJob('publisher-art', `Publisher artwork · ${publishers.length} publishers, ${franchises.length} franchises`);
   (async () => {
     let client;
-    try { client = makeCvClient({ ...currentSettings(), metadataSource: 'comicvine' }); }
+    try { client = makeCvClient({ ...currentSettings(), metadataSource: 'comicvine' }, { key: artKey }); }
     catch (e) { job.fail(String(e?.message || e)); publisherArtRunning = false; return; }
     const total = publishers.length + franchises.length;
     let done = 0, hits = 0;
@@ -720,19 +723,31 @@ async function refreshPublisherArt({ paceMs = 400, force = false } = {}) {
       await new Promise((r) => setTimeout(r, paceMs));
     }
 
+    // A franchise name is usually a character ("Batman", "Thor") but often a
+    // TEAM instead ("X-Men", "Avengers", "Fantastic Four"), which ComicVine
+    // keeps in a separate resource — so try both before giving up and letting
+    // the card fall back to a volume cover.
+    const artFor = async (resource, key, publisher) => {
+      const r = await client.list(resource, {
+        filter: `name:${key}`, fieldList: 'id,name,image,publisher', limit: 10,
+      });
+      const cands = (r.results || []).filter((c) => String(c.name || '').toLowerCase() === key.toLowerCase());
+      // Same-publisher first — "Batman" is DC's, not a same-named indie character.
+      const pick = cands.find((c) => String(c.publisher?.name || '').toLowerCase() === publisher.toLowerCase())
+        || cands[0] || null;
+      const img = pick?.image?.medium_url || pick?.image?.screen_url || pick?.image?.original_url || null;
+      return img ? { img, id: pick.id } : null;
+    };
+
     for (const { publisher, key } of franchises) {
       try {
-        const r = await client.list('characters', {
-          filter: `name:${key}`, fieldList: 'id,name,image,publisher', limit: 10,
-        });
-        const cands = (r.results || []).filter((c) => String(c.name || '').toLowerCase() === key.toLowerCase());
-        // Same-publisher character first — "Batman" is DC's, not a same-named
-        // indie character's.
-        const pick = cands.find((c) => String(c.publisher?.name || '').toLowerCase() === publisher.toLowerCase())
-          || cands[0] || null;
-        const img = pick?.image?.medium_url || pick?.image?.screen_url || pick?.image?.original_url || null;
-        setFranchiseArt(db, publisher, key, { imageUrl: img, characterId: pick?.id || null });
-        if (img) hits++;
+        let hit = await artFor('characters', key, publisher);
+        if (!hit) {
+          await new Promise((r) => setTimeout(r, paceMs));
+          hit = await artFor('teams', key, publisher);
+        }
+        setFranchiseArt(db, publisher, key, { imageUrl: hit?.img || null, characterId: hit?.id || null });
+        if (hit) hits++;
       } catch (e) {
         try { setFranchiseArt(db, publisher, key, {}); } catch { /* ignore */ }
         logWarn(`Franchise art lookup failed for ${publisher}/${key}: ${e?.message || e}`, 'collection');
