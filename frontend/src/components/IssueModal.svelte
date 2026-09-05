@@ -27,6 +27,7 @@
   import { issueActions, issueActionsTick } from '../lib/plugins.svelte.js';
   import { sanitizeHtml, safeUrl } from '../lib/util.js';
   import { openSourceSearch } from './SourceSearchModal.svelte';
+  import { confirmDialog } from './DialogModal.svelte';
   import { apiPost } from '../lib/api.js';
   import { notify } from '../lib/toasts.svelte.js';
   import { trapFocus } from '../lib/dom.js';
@@ -44,6 +45,28 @@
     if (info.owned || info.corrupt) await redownloadCvIssues([m.cvIssueId]);
     else await downloadCvIssues([m.cvIssueId]);
   }
+  // fork: bin a bad rip. Deletes the file(s) on disk without re-queueing, so
+  // the issue simply reads as missing again — automation can re-fetch it later
+  // if the series still wants it. Destructive and irreversible, hence the
+  // confirm; gated on library.manage rather than downloads.grab.
+  let deleting = $state(false);
+  async function deleteDownload() {
+    const ok = await confirmDialog({
+      title: 'Delete the downloaded file?',
+      message: `This permanently deletes the file for #${m.number ?? '?'} from disk. The issue goes back to “missing”, so it can be downloaded again.`,
+      confirmLabel: 'Delete file',
+      danger: true,
+    });
+    if (!ok) return;
+    deleting = true;
+    const r = await apiPost(`/api/collection/${detail.series.id}/delete-files`, { cvIssueIds: [m.cvIssueId] });
+    deleting = false;
+    if (r?.error) return notify(r.error, 'error');
+    notify(r.deleted ? `Deleted ${r.deleted} file(s) — the issue is missing again.` : 'No file was on disk for that issue.', 'ok');
+    closeModal('issue');
+    reloadDetail();
+  }
+
   function searchSources() {
     closeModal('issue');
     openSourceSearch(m.cvIssueId, m.number);
@@ -172,6 +195,11 @@
                 {#if info.corrupt}<Icon name="refresh" /> Replace corrupt file{:else if info.owned}<Icon name="refresh" /> Re-download{:else}<Icon name="download" /> Download{/if}</button>
               {#if flags.anySource}
                 <button class="btn btn--ghost ii-usenet" onclick={searchSources}><Icon name="search" /> Search sources</button>
+              {/if}
+              {#if info.owned && can('library.manage')}
+                <button class="btn btn--ghost ii-del" disabled={deleting}
+                  title="Delete the downloaded file from disk — for a bad rip you want gone"
+                  onclick={deleteDownload}><Icon name="trash" /> {deleting ? 'Deleting…' : 'Delete file'}</button>
               {/if}
             </div>
           {/if}

@@ -275,6 +275,9 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     // collection stays library.view and downloads still route via DOWNLOAD_RULES.
     [/^\/api\/collection\/\d+\/(delete|scan|refile|refresh|tag|cleanup|metadata|monitor|path|restricted|aliases|cv|type|library)$/, 'library.manage'],
     [/^\/api\/collection\/(bulk|add-cv)$/, 'library.manage'],
+    // fork: deleting downloaded files is library management, not a download
+    // action — a downloads.grab role can fetch things, not erase them.
+    [/^\/api\/collection\/\d+\/delete-files$/, 'library.manage'],
     [/^\/api\/cv\/match$/, 'library.manage'],
     [/^\/api\/issue\/\d+\/metadata$/, 'library.manage'],
     [/^\/api\/releases\/check$/, 'library.manage'],
@@ -1105,6 +1108,39 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     queueIssues(db, ids);
     startDownloads(ids);
     res.json({ queued: ids.length });
+  });
+
+  // fork: DELETE the downloaded file(s) for one or more issues, without
+  // re-queueing — the "this is a bad rip, get it off my disk" action. Same
+  // cleanup as /redownload (file, sidecar, library_files row, and the issues
+  // row's done-status + file_path), minus the queueing. The issue stays wanted
+  // if the series says so, so normal automation can fetch it again later.
+  app.post('/api/collection/:id/delete-files', async (req, res) => {
+    const seriesId = Number(req.params.id);
+    const cvIssueIds = Array.isArray(req.body?.cvIssueIds) ? req.body.cvIssueIds.map(Number).filter(Boolean) : [];
+    if (!cvIssueIds.length) return res.status(400).json({ error: 'cvIssueIds required' });
+    let removed = 0;
+    const ids = [];
+    try {
+      for (const cvid of cvIssueIds) {
+        for (const f of db.prepare('SELECT path FROM library_files WHERE cv_issue_id=?').all(cvid)) {
+          try { await fsp.unlink(f.path); removed++; } catch { /* already gone */ }
+          const side = sidecarPath(f.path);
+          if (side !== f.path) await fsp.unlink(side).catch(() => {});
+        }
+        db.prepare('DELETE FROM library_files WHERE cv_issue_id=?').run(cvid);
+        const ci = getCvIssue(db, cvid);
+        if (ci) ids.push(ensureCvIssueRow(db, { seriesId, cvIssueId: cvid, number: ci.issue_number, title: ci.name }));
+      }
+      // Clear the 'done' latch so the issue reads as missing again (and drop a
+      // downloader-written file that never got a library_files row).
+      for (const path of clearIssuesForRedownload(db, ids)) {
+        try { await fsp.unlink(path); removed++; } catch { /* already gone */ }
+        const side = sidecarPath(path);
+        if (side !== path) await fsp.unlink(side).catch(() => {});
+      }
+      res.json({ deleted: removed, issues: cvIssueIds.length });
+    } catch (e) { res.status(500).json({ error: String(e?.message || e) }); }
   });
 
   // Alternative search names for a volume (indexers that name it differently).

@@ -1877,3 +1877,10 @@ textarea.dialog-input { resize: vertical; font-family: var(--font-mono); }
 .qx__emptychip { width: 56px; height: 56px; margin: 0 auto 16px; border-radius: 15px; background: var(--panel-2); display: grid; place-items: center; color: var(--faint); }
 .qx__empty b { display: block; font-size: 16px; font-weight: 600; margin-bottom: 6px; }
 .qx__empty p { font-size: 13px; color: var(--faint); margin: 0 auto; max-width: 360px; line-height: 1.6; }
+
+
+/* fork: "Delete file" in the issue modal — a destructive action, styled as one
+   so it can't be mistaken for the neighbouring download buttons. */
+.ii-del { color: var(--red); border-color: rgba(255,90,82,.35); }
+.ii-del:hover:not(:disabled) { background: rgba(255,90,82,.12); border-color: var(--red); color: var(--red); }
+.ii-del:disabled { opacity: .6; cursor: default; }
