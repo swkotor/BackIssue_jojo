@@ -1,0 +1,310 @@
+<script>
+  // fork: browse the library the way a shelf is arranged — publisher, then the
+  // franchise, then that franchise's volumes. Three tiers driven off ?pub= and
+  // ?fr= so every level is linkable and Back works.
+  import { apiGet, apiPost } from '../lib/api.js';
+  import { route, setQuery, navigate } from '../lib/router.svelte.js';
+  import { notify } from '../lib/toasts.svelte.js';
+  import { can, isTrusted } from '../lib/auth.svelte.js';
+  import { fmt, initials } from '../lib/util.js';
+  import Icon from '../lib/Icon.svelte';
+  import Cover from './Cover.svelte';
+
+  let { active = false } = $props();
+
+  const pub = $derived(new URLSearchParams(route.search).get('pub') || '');
+  const fr = $derived(new URLSearchParams(route.search).get('fr') || '');
+
+  let publishers = $state([]);
+  let franchises = $state([]);
+  let detail = $state(null);
+  let loading = $state(false);
+  let artBusy = $state(false);
+  let artNote = $state('');
+  let picked = $state(new Set());   // series ids selected for a merge/split
+
+  // One effect per tier: the URL is the state, so each level refetches only
+  // when its own key changes.
+  $effect(() => {
+    if (!active) return;
+    void pub; void fr;
+    load();
+  });
+
+  async function load() {
+    loading = true;
+    picked = new Set();
+    try {
+      if (!pub) {
+        publishers = (await apiGet('/api/publishers')).publishers || [];
+        franchises = []; detail = null;
+      } else if (!fr) {
+        franchises = (await apiGet('/api/publishers/' + encodeURIComponent(pub))).franchises || [];
+        detail = null;
+      } else {
+        detail = await apiGet(`/api/publishers/${encodeURIComponent(pub)}/${encodeURIComponent(fr)}`);
+      }
+    } catch (e) {
+      notify(String(e?.message || e), 'error');
+    }
+    loading = false;
+  }
+
+  async function fetchArt() {
+    artBusy = true;
+    const r = await apiPost('/api/publishers/art', {});
+    artBusy = false;
+    if (r?.error) return notify(r.error, 'error');
+    if (!r.started) {
+      if (r.reason === 'nothing to fetch') return notify('Artwork is already up to date.', 'ok');
+      // No key = no logos, which is a config gap rather than a failure — say so
+      // once, plainly, instead of leaving the button looking broken.
+      artNote = r.reason;
+      return notify(r.reason, 'error');
+    }
+    artNote = '';
+    notify(`Fetching artwork for ${fmt(r.publishers)} publisher(s) and ${fmt(r.franchises)} franchise(s) — check Jobs for progress.`, 'ok');
+  }
+
+  function toggle(id, e) {
+    e?.stopPropagation();
+    const next = new Set(picked);
+    next.has(id) ? next.delete(id) : next.add(id);
+    picked = next;
+  }
+
+  async function moveTo(target) {
+    if (!picked.size) return;
+    const r = await apiPost('/api/publishers/franchise', { seriesIds: [...picked], franchise: target });
+    if (r?.error) return notify(r.error, 'error');
+    notify(target ? `Moved ${fmt(r.updated)} volume(s) into “${target}”.` : `Reset ${fmt(r.updated)} volume(s) to automatic grouping.`, 'ok');
+    load();
+  }
+
+  async function mergeInto() {
+    const target = prompt('Move the selected volumes into which franchise?', detail?.name || fr || '');
+    if (target === null) return;
+    moveTo(target.trim() || null);
+  }
+
+  async function splitOut() {
+    const target = prompt('Name the new franchise for the selected volumes:', '');
+    if (!target?.trim()) return;
+    moveTo(target.trim());
+  }
+
+  async function renameGroup() {
+    const name = prompt('Display name for this franchise:', detail?.name || fr);
+    if (name === null) return;
+    const r = await apiPost(`/api/publishers/${encodeURIComponent(pub)}/${encodeURIComponent(fr)}/rename`, { name: name.trim() || null });
+    if (r?.error) return notify(r.error, 'error');
+    load();
+  }
+</script>
+
+<section class="page pubx" class:is-active={active}>
+  <div class="pubx__bar">
+    <button class="pubx__crumb" class:is-cur={!pub} onclick={() => setQuery({ pub: null, fr: null })}>
+      <Icon name="layers" size={15} /> Publishers
+    </button>
+    {#if pub}
+      <span class="pubx__sep">/</span>
+      <button class="pubx__crumb" class:is-cur={!fr} onclick={() => setQuery({ fr: null })}>{pub}</button>
+    {/if}
+    {#if pub && fr}
+      <span class="pubx__sep">/</span>
+      <button class="pubx__crumb is-cur">{detail?.name || fr}</button>
+      {#if isTrusted()}
+        <button class="pubx__mini" title="Rename this franchise" onclick={renameGroup}><Icon name="edit" size={13} /></button>
+      {/if}
+    {/if}
+    <span class="pubx__spacer"></span>
+    {#if !pub && can('library.manage')}
+      <button class="pubx__act" disabled={artBusy} title="Look up publisher logos and franchise character art on ComicVine"
+        onclick={fetchArt}><Icon name="refresh" size={14} /> {artBusy ? 'Starting…' : 'Fetch artwork'}</button>
+    {/if}
+  </div>
+
+  <div class="pubx__scroll">
+    {#if artNote}
+      <div class="pubx__warn">
+        <Icon name="alert-triangle" size={15} />
+        <span>{artNote}</span>
+        <button class="pubx__link" onclick={() => (artNote = '')}>Dismiss</button>
+      </div>
+    {/if}
+    {#if loading}
+      <div class="pubx__note">Loading…</div>
+
+    <!-- tier 1: publishers -->
+    {:else if !pub}
+      {#if !publishers.length}
+        <div class="pubx__note">Nothing in the library yet.</div>
+      {/if}
+      <div class="pubx__grid">
+        {#each publishers as p (p.name)}
+          <button class="pcard" onclick={() => setQuery({ pub: p.name, fr: null })}>
+            <div class="pcard__art">
+              {#if p.logo}
+                <img src={p.logo} alt="" loading="lazy" referrerpolicy="no-referrer" />
+              {:else}
+                <span class="pcard__mark">{initials(p.name)}</span>
+              {/if}
+            </div>
+            <div class="pcard__name">{p.name}</div>
+            <div class="pcard__meta">{fmt(p.franchises)} {p.franchises === 1 ? 'series' : 'series'} · {fmt(p.series)} volumes</div>
+          </button>
+        {/each}
+      </div>
+
+    <!-- tier 2: franchises within a publisher -->
+    {:else if !fr}
+      {#if !franchises.length}
+        <div class="pubx__note">Nothing from {pub}.</div>
+      {/if}
+      <div class="pubx__grid pubx__grid--fr">
+        {#each franchises as f (f.key)}
+          <button class="fcard" onclick={() => setQuery({ fr: f.key })}>
+            <div class="fcard__art">
+              {#if f.image}
+                <img src={f.image} alt="" loading="lazy" referrerpolicy="no-referrer" />
+              {:else if f.cover}
+                <img class="is-cover" src={f.cover} alt="" loading="lazy" referrerpolicy="no-referrer" />
+              {:else}
+                <span class="pcard__mark">{initials(f.name)}</span>
+              {/if}
+              {#if f.volumes > 1}<span class="fcard__count">{fmt(f.volumes)}</span>{/if}
+            </div>
+            <div class="fcard__name">{f.name}</div>
+            <div class="fcard__meta">{fmt(f.owned)}/{fmt(f.total)} issues</div>
+          </button>
+        {/each}
+      </div>
+
+    <!-- tier 3: the volumes -->
+    {:else if detail}
+      {#if picked.size && isTrusted()}
+        <div class="pubx__bulk">
+          <span class="pubx__bulk-n">{fmt(picked.size)} selected</span>
+          <button class="pubx__link" onclick={mergeInto}><Icon name="layers" size={14} /> Move to franchise…</button>
+          <button class="pubx__link" onclick={splitOut}><Icon name="plus" size={14} /> Split into new…</button>
+          <button class="pubx__link" onclick={() => moveTo(null)}><Icon name="refresh" size={14} /> Reset to automatic</button>
+          <button class="pubx__link" onclick={() => (picked = new Set())}>Clear</button>
+        </div>
+      {/if}
+      <div class="pubx__vols">
+        {#each detail.volumes as v (v.id)}
+          <div class="vrow ws-{v.watch_state || 'watched'}">
+            {#if isTrusted()}
+              <input type="checkbox" class="vrow__cb" checked={picked.has(v.id)} onclick={(e) => toggle(v.id, e)} />
+            {/if}
+            <button class="vrow__open" onclick={() => navigate('/volume/' + v.id)}>
+              <Cover coverUrl={v.cover} title={v.title} />
+              <span class="vrow__main">
+                <span class="vrow__title">{v.title}{#if v.year}<span class="vrow__year"> ({v.year})</span>{/if}</span>
+                <span class="vrow__meta">{fmt(v.owned)}/{fmt(v.total)} issues</span>
+              </span>
+            </button>
+          </div>
+        {/each}
+      </div>
+    {/if}
+  </div>
+</section>
+
+<style>
+  .pubx { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+  .pubx__bar { display: flex; align-items: center; gap: 8px; padding: 11px 18px; border-bottom: 1px solid var(--line); flex: none; }
+  .pubx__crumb {
+    background: none; border: none; cursor: pointer; padding: 4px 2px;
+    display: inline-flex; align-items: center; gap: 7px;
+    color: var(--muted); font: 600 13px var(--font-body);
+  }
+  .pubx__crumb:hover { color: var(--text); }
+  .pubx__crumb.is-cur { color: var(--text); }
+  .pubx__sep { color: var(--faint); }
+  .pubx__spacer { flex: 1; }
+  .pubx__mini { background: none; border: none; color: var(--faint); cursor: pointer; padding: 2px; }
+  .pubx__mini:hover { color: var(--text); }
+  .pubx__act {
+    height: 32px; padding: 0 13px; border: 1px solid var(--line); background: transparent;
+    color: var(--muted); border-radius: 8px; font: 600 12.5px var(--font-body); cursor: pointer;
+    display: inline-flex; align-items: center; gap: 7px;
+  }
+  .pubx__act:disabled { opacity: .6; cursor: default; }
+  .pubx__scroll { flex: 1; overflow-y: auto; padding: 18px; }
+  .pubx__note { color: var(--faint); font-size: 13px; padding: 20px 2px; }
+  .pubx__warn {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 16px;
+    padding: 10px 14px; border-radius: 10px; font-size: 12.5px; line-height: 1.45;
+    border: 1px solid rgba(255,194,75,.32); background: rgba(255,194,75,.08); color: #fbbf24;
+  }
+  .pubx__warn span { flex: 1; }
+
+  .pubx__grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 18px; }
+  .pubx__grid--fr { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
+
+  /* Publisher card: a wide letterbox, because logos are wordmarks, not posters. */
+  .pcard, .fcard { background: none; border: none; padding: 0; cursor: pointer; text-align: left; }
+  .pcard__art {
+    display: grid; place-items: center; aspect-ratio: 16 / 9;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 12px;
+    overflow: hidden; padding: 14px;
+  }
+  .pcard:hover .pcard__art { border-color: var(--accent); }
+  .pcard__art img { max-width: 100%; max-height: 100%; object-fit: contain; }
+  .pcard__mark { font: 700 26px var(--font-body); color: var(--faint); letter-spacing: .04em; }
+  .pcard__name { margin-top: 9px; font: 600 13.5px var(--font-body); color: var(--text); }
+  .pcard__meta { margin-top: 2px; font: 11.5px var(--font-mono); color: var(--faint); }
+
+  /* Franchise card: portrait, because character art and covers both are. */
+  .fcard__art {
+    position: relative; aspect-ratio: 2 / 3; border-radius: 12px; overflow: hidden;
+    background: var(--panel-2); border: 1px solid var(--line);
+    display: grid; place-items: center;
+  }
+  .fcard:hover .fcard__art { border-color: var(--accent); }
+  .fcard__art img { width: 100%; height: 100%; object-fit: cover; object-position: top center; }
+  /* A borrowed cover is art for a DIFFERENT thing, so it reads dimmer than
+     real character art — the card shouldn't claim it's the franchise's own. */
+  .fcard__art img.is-cover { opacity: .82; }
+  .fcard__count {
+    position: absolute; right: 6px; bottom: 6px;
+    background: rgba(0,0,0,.72); color: #fff; border-radius: 20px;
+    font: 700 11px var(--font-mono); padding: 2px 8px;
+  }
+  .fcard__name { margin-top: 8px; font: 600 13px var(--font-body); color: var(--text); }
+  .fcard__meta { margin-top: 2px; font: 11px var(--font-mono); color: var(--faint); }
+
+  .pubx__bulk {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 10px 14px; margin-bottom: 14px;
+    border: 1px solid rgba(255,45,111,.25); background: rgba(255,45,111,.06); border-radius: 10px;
+  }
+  .pubx__bulk-n { font: 600 12.5px var(--font-body); color: var(--text); }
+  .pubx__link {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: none; border: none; color: #c4bdd4; font: 600 12.5px var(--font-body); cursor: pointer;
+  }
+  .pubx__link:hover { color: var(--text); }
+
+  .pubx__vols { display: flex; flex-direction: column; gap: 4px; }
+  .vrow {
+    display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+    border: 1px solid transparent; border-radius: 10px;
+  }
+  .vrow:hover { background: var(--panel); }
+  .vrow.ws-watched { box-shadow: inset 3px 0 0 #34d399; }
+  .vrow.ws-paused { box-shadow: inset 3px 0 0 #fbbf24; }
+  .vrow.ws-unwatched { box-shadow: inset 3px 0 0 #f87171; }
+  .vrow__cb { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; flex: none; }
+  .vrow__open {
+    flex: 1; min-width: 0; display: flex; align-items: center; gap: 12px;
+    background: none; border: none; padding: 0; cursor: pointer; text-align: left;
+  }
+  .vrow :global(.cover) { width: 38px; height: 52px; flex: none; }
+  .vrow__main { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+  .vrow__title { font: 600 13.5px var(--font-body); color: var(--text); }
+  .vrow__year { color: var(--faint); font-weight: 400; }
+  .vrow__meta { font: 11px var(--font-mono); color: var(--faint); }
+</style>

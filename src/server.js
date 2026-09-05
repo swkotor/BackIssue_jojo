@@ -22,6 +22,7 @@ import { fetchCatalog, installPlugin, uninstallPlugin } from './plugincatalog.js
 import { logWarn } from './logstore.js';
 import * as users from './users.js';
 import * as lists from './lists.js';
+import * as franchise from './franchise.js';
 import * as cbl from './cbl.js';
 import * as notifications from './notifications.js';
 import { createEventHub } from './events.js';
@@ -41,7 +42,7 @@ if (process.env.BUILD_CHANNEL && process.env.BUILD_CHANNEL !== 'release') {
   APP_VERSION += `-${process.env.BUILD_CHANNEL}${sha ? '.' + sha : ''}`;
 }
 
-export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvSearch, cvVolumeInfo, cvIssueInfo, arcSearch, arcIssues, cblResolve, cleanupSeriesFiles, runImportScan, runImport, importState, runTool, toolsState, runLibraryRefile, refileState, stats, listSources, queueProgress, packProgress, cancelGrab, testCvKeys, usenetSearch, usenetGrab, torrentSearch, torrentGrabPack, searchSources, manualGrabResult, grabSourcePack, searchPacks, grabPack, setAliases, pluginRoutes = [], pluginClientAssets = [], matchImportCandidate, confirmImportCandidate, skipImportCandidate, cvSetManual, addFromCv, scanSeriesFolder, deleteComic, refreshVolume, refreshAllVolumes, tagSeriesFiles, checkReleases, listJobs, clearJobs, listLogs, clearLogs, listSchedules, setScheduleCron, runScheduleNow, getSettings, saveSettings, requestRestart, state }) {
+export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvSearch, cvVolumeInfo, cvIssueInfo, arcSearch, arcIssues, cblResolve, cleanupSeriesFiles, runImportScan, runImport, importState, runTool, toolsState, runLibraryRefile, refileState, stats, listSources, queueProgress, packProgress, cancelGrab, testCvKeys, usenetSearch, usenetGrab, torrentSearch, torrentGrabPack, searchSources, manualGrabResult, grabSourcePack, searchPacks, grabPack, setAliases, pluginRoutes = [], pluginClientAssets = [], matchImportCandidate, confirmImportCandidate, skipImportCandidate, cvSetManual, addFromCv, scanSeriesFolder, deleteComic, refreshVolume, refreshAllVolumes, refreshPublisherArt, tagSeriesFiles, checkReleases, listJobs, clearJobs, listLogs, clearLogs, listSchedules, setScheduleCron, runScheduleNow, getSettings, saveSettings, requestRestart, state }) {
   const startDownloads = (arg) => {
     if (!state.queue.running) {
       state.queue.running = true;
@@ -97,6 +98,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   // session cookie or HTTP Basic credentials verified against the users table.
   users.initUserTables(db);
   lists.initListTables(db);
+  franchise.initFranchiseTables(db);
   notifications.initNotificationTables(db);
   // Plugins (and core call sites) raise notifications through this — the
   // module owns persistence + webhook dispatch.
@@ -262,6 +264,8 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     // Reading lists + notifications are personal (each user manages their own;
     // ownership is enforced in the handlers) — any signed-in user, incl. writes.
     [/^\/api\/lists/, 'library.view'],
+    // fork: the Publishers browser is a read view of the library
+    [/^\/api\/publishers/, 'library.view'],
     [/^\/api\/notifications/, 'library.view'],
     // Personal follows likewise: each user curates their own pull list.
     [/^\/api\/collection\/\d+\/follow$/, 'library.view'],
@@ -657,6 +661,50 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   app.post('/api/notifications/read', (req, res) => {
     const { ids, all } = req.body || {};
     res.json({ unread: notifications.markRead(db, req.user.id, { ids, all: !!all, categories: notifCategories(req), includeRestricted: canRestricted(req) }) });
+  });
+
+  // ---- fork: Publishers browser (publisher → franchise → volume) ----
+  const pubOpts = (req) => ({ includeRestricted: canRestricted(req) });
+  app.get('/api/publishers', (req, res) => {
+    res.json({ publishers: franchise.listPublishers(db, pubOpts(req)) });
+  });
+  app.get('/api/publishers/:name', (req, res) => {
+    const name = String(req.params.name);
+    const franchises = franchise.listFranchises(db, name, pubOpts(req));
+    if (!franchises.length) return res.status(404).json({ error: 'no series from that publisher' });
+    res.json({ publisher: name, franchises });
+  });
+  app.get('/api/publishers/:name/:franchise', (req, res) => {
+    const r = franchise.franchiseVolumes(db, String(req.params.name), String(req.params.franchise), pubOpts(req));
+    if (!r.volumes.length) return res.status(404).json({ error: 'no volumes in that group' });
+    res.json({ publisher: String(req.params.name), ...r });
+  });
+  // Move volumes between groups (merge/split). franchise:null restores the
+  // derived grouping for those volumes.
+  app.post('/api/publishers/franchise', (req, res) => {
+    if (!users.roleGrants(db, req.user.role, 'library.manage', permCatalog)) {
+      return res.status(403).json({ error: "your role doesn't include the permission: Manage the library" });
+    }
+    const b = req.body || {};
+    const ids = Array.isArray(b.seriesIds) ? b.seriesIds : (b.seriesId != null ? [b.seriesId] : []);
+    if (!ids.length) return res.status(400).json({ error: 'no series ids' });
+    try { res.json({ updated: franchise.setFranchise(db, ids, b.franchise ?? null) }); }
+    catch (e) { res.status(500).json({ error: String(e?.message || e) }); }
+  });
+  app.post('/api/publishers/:name/:franchise/rename', (req, res) => {
+    if (!users.roleGrants(db, req.user.role, 'library.manage', permCatalog)) {
+      return res.status(403).json({ error: "your role doesn't include the permission: Manage the library" });
+    }
+    const name = (req.body || {}).name;
+    try { franchise.renameFranchise(db, String(req.params.name), String(req.params.franchise), name); res.json({ ok: true }); }
+    catch (e) { res.status(500).json({ error: String(e?.message || e) }); }
+  });
+  app.post('/api/publishers/art', (req, res) => {
+    if (!users.roleGrants(db, req.user.role, 'library.manage', permCatalog)) {
+      return res.status(403).json({ error: "your role doesn't include the permission: Manage the library" });
+    }
+    try { res.json(refreshPublisherArt({ force: !!(req.body || {}).force })); }
+    catch (e) { res.status(500).json({ error: String(e?.message || e) }); }
   });
 
   // ---- reading lists (personal, per-user) ----

@@ -18,6 +18,7 @@ import { extractYear } from './matcher.js';
 import { poolWithResource } from './pool.js';
 import { makeCvClient, cvKey } from './cv.js';
 import { resolveBooks } from './cbl.js';
+import { initFranchiseTables, artBacklog, savePublisherLogo, setFranchiseArt } from './franchise.js';
 import { tagFileFromCv, ensureCvIssueDetail, fetchAllIssueMetadata } from './metatagger.js';
 import { fetchWeeklyReleases, matchReleases } from './releases.js';
 import { startJob, listJobs, clearFinishedJobs, attachJobsDb } from './jobs.js';
@@ -667,6 +668,86 @@ function setScheduleCron(key, { cron, enabled } = {}) {
 // Volume-level only: the per-issue detail sweep is far too many requests to run
 // across a whole library, and carries nothing we need here.
 let refreshAllRunning = false;
+// fork: art for the Publishers browser. Publisher logos come from ComicVine's
+// /publishers resource; a franchise card borrows the art of the CHARACTER whose
+// name matches the group ("Batman", "X-Men"), which is what makes the grid read
+// like a shelf rather than a list of covers. Both are stored as URLs and
+// hot-linked, matching how the app already serves issue covers — nothing is
+// downloaded to disk. Anything without a hit falls back to a volume cover, and
+// a miss is recorded so the backlog doesn't retry it on every pass.
+let publisherArtRunning = false;
+async function refreshPublisherArt({ paceMs = 400, force = false } = {}) {
+  if (publisherArtRunning) return { started: false, reason: 'already running' };
+  // Publisher logos and character art live on ComicVine's /publishers and
+  // /characters resources, which the hosted metadata proxy does NOT mirror (it
+  // serves volumes and issues only). So this job always talks to ComicVine
+  // directly, using a key from settings — independent of metadataSource, so
+  // adding a key for artwork doesn't move regular metadata off the hosted
+  // service (and its Metron enrichment). Without a key there is simply no
+  // artwork: the UI already falls back to lettermarks and volume covers.
+  if (!cvKey(currentSettings().comicvineKeys)) {
+    return { started: false, reason: 'needs a ComicVine API key (Settings → Metadata) — publisher logos and character art are not available through the hosted metadata service' };
+  }
+  const { publishers, franchises } = artBacklog(db, { maxAgeDays: force ? 0 : 30 });
+  if (!publishers.length && !franchises.length) return { started: false, reason: 'nothing to fetch' };
+  publisherArtRunning = true;
+  const job = startJob('publisher-art', `Publisher artwork · ${publishers.length} publishers, ${franchises.length} franchises`);
+  (async () => {
+    let client;
+    try { client = makeCvClient({ ...currentSettings(), metadataSource: 'comicvine' }); }
+    catch (e) { job.fail(String(e?.message || e)); publisherArtRunning = false; return; }
+    const total = publishers.length + franchises.length;
+    let done = 0, hits = 0;
+    const bump = () => job.progress({ done: ++done, total });
+
+    for (const name of publishers) {
+      try {
+        const r = await client.list('publishers', {
+          filter: `name:${name}`, fieldList: 'id,name,image,site_detail_url', limit: 10,
+        });
+        // CV's name filter is a contains match, so prefer an exact hit.
+        const exact = (r.results || []).find((p) => String(p.name || '').toLowerCase() === name.toLowerCase());
+        const pick = exact || (r.results || [])[0] || null;
+        const img = pick?.image?.medium_url || pick?.image?.screen_url || pick?.image?.original_url || null;
+        savePublisherLogo(db, name, { cvId: pick?.id || null, imageUrl: img, siteUrl: pick?.site_detail_url || null });
+        if (img) hits++;
+      } catch (e) {
+        // A miss is still recorded (null image) so we don't re-ask every pass.
+        try { savePublisherLogo(db, name, {}); } catch { /* ignore */ }
+        logWarn(`Publisher art lookup failed for ${name}: ${e?.message || e}`, 'collection');
+      }
+      bump();
+      await new Promise((r) => setTimeout(r, paceMs));
+    }
+
+    for (const { publisher, key } of franchises) {
+      try {
+        const r = await client.list('characters', {
+          filter: `name:${key}`, fieldList: 'id,name,image,publisher', limit: 10,
+        });
+        const cands = (r.results || []).filter((c) => String(c.name || '').toLowerCase() === key.toLowerCase());
+        // Same-publisher character first — "Batman" is DC's, not a same-named
+        // indie character's.
+        const pick = cands.find((c) => String(c.publisher?.name || '').toLowerCase() === publisher.toLowerCase())
+          || cands[0] || null;
+        const img = pick?.image?.medium_url || pick?.image?.screen_url || pick?.image?.original_url || null;
+        setFranchiseArt(db, publisher, key, { imageUrl: img, characterId: pick?.id || null });
+        if (img) hits++;
+      } catch (e) {
+        try { setFranchiseArt(db, publisher, key, {}); } catch { /* ignore */ }
+        logWarn(`Franchise art lookup failed for ${publisher}/${key}: ${e?.message || e}`, 'collection');
+      }
+      bump();
+      await new Promise((r) => setTimeout(r, paceMs));
+    }
+
+    logInfo(`Publisher artwork: ${hits}/${total} resolved`, 'collection');
+    job.finish({ resolved: hits, total });
+    publisherArtRunning = false;
+  })().catch((e) => { job.fail(String(e?.message || e)); publisherArtRunning = false; });
+  return { started: true, publishers: publishers.length, franchises: franchises.length };
+}
+
 async function refreshAllVolumes({ paceMs = 900 } = {}) {
   if (refreshAllRunning) return { started: false, reason: 'already running' };
   refreshAllRunning = true;
@@ -1287,6 +1368,7 @@ const app = createApp({
   deleteComic,
   refreshVolume,
   refreshAllVolumes,
+  refreshPublisherArt,
   tagSeriesFiles,
   checkReleases,
   listJobs,

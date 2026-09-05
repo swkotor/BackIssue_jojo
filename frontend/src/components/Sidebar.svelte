@@ -71,6 +71,8 @@
       <span class="sidenav__icon"><Icon name="layers" /></span> Collections</button>
     <button id="lists-btn" class="sidenav__item" class:is-active={isActive('/lists')} onclick={() => go('/lists')}>
       <span class="sidenav__icon"><Icon name="list" /></span> Lists</button>
+    <button id="publishers-btn" class="sidenav__item" class:is-active={isActive('/publishers')} onclick={() => go('/publishers')}>
+      <span class="sidenav__icon"><Icon name="grid" /></span> Publishers</button>
     {#if isTrusted()}
       <button id="import-btn" class="sidenav__item" class:is-active={isActive('/import')} onclick={() => go('/import')}>
         <span class="sidenav__icon"><Icon name="import" /></span> Import</button>
