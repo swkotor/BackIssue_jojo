@@ -33,6 +33,7 @@ export const SETTING_FIELDS = {
   // metadata service mirrors only /volume and /issue, so artwork has to come
   // straight from ComicVine or not at all.
   publisherCvKey:      { type: 'string' },
+  debugUserAgent:      { type: 'string' }, // fork: log every request from a client whose UA contains this
   cvBaseUrl:           { type: 'string', allowEmpty: true },
   // Where metadata comes from: the hosted BackIssue metadata service (zero
   // setup, cached + enriched) or ComicVine directly with the user's own key.

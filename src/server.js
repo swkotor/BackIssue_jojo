@@ -19,7 +19,7 @@ import { testTorznabIndexer } from './torznab.js';
 import { testTorrentClient } from './torrentclients.js';
 import { pluginsDir, pluginCatalog, setPluginEnabled, markPluginPending, pendingPluginChanges, installedOnDisk, registeredRoutes, registeredPermissions, registeredAuthProviders, registeredCredentialProviders, pluginLibraryTypes, registeredLibraryScanners, registeredCollectionFilters } from './plugins.js';
 import { fetchCatalog, installPlugin, uninstallPlugin } from './plugincatalog.js';
-import { logWarn } from './logstore.js';
+import { logWarn, logInfo } from './logstore.js';
 import * as users from './users.js';
 import * as lists from './lists.js';
 import * as franchise from './franchise.js';
@@ -381,7 +381,17 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     try {
     // The SPA shell, its assets, and auth endpoints are public — everything
     // under /api and /plugins requires an authenticated user.
-    if (!req.path.startsWith('/api') && !req.path.startsWith('/plugins')) return next();
+    // fork: debug tap — when settings.debugUserAgent is set, every request
+    // from a matching client (e.g. "Panels") is logged with its outcome, so a
+    // reader app's exact call sequence can be read off the Logs page.
+    if (config.debugUserAgent && String(req.headers['user-agent'] || '').includes(config.debugUserAgent)) {
+      const t0 = Date.now();
+      res.on('finish', () => logInfo(`${req.method} ${req.originalUrl} → ${res.statusCode} ${res.get('Content-Type') || ''} auth=${req.headers.authorization ? req.headers.authorization.split(' ')[0] : 'none'} ${Date.now() - t0}ms`, 'debug-ua'));
+    }
+    // fork: /opds is the Komga-shaped catalog mirror (plugin-opds), which has to
+    // sit at the site root because Komga clients key on host/opds/v1.2/… — it is
+    // guarded exactly like /api.
+    if (!req.path.startsWith('/api') && !req.path.startsWith('/plugins') && !req.path.startsWith('/opds')) return next();
     if (/^\/api\/auth\/(login|register|me|providers)$/.test(req.path)) return next();
     if (basicCsrfBlocked(req)) return res.status(403).json({ error: 'cross-origin request refused' });
     // Resolve the route's required access BEFORE authenticating: a route
@@ -406,6 +416,15 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
       return res.status(401).json({ error: 'authentication required' });
     }
     req.user = user;
+    // fork: a Komga-style client (Panels) authenticates the /opds catalog with
+    // HTTP Basic, then calls the Komga progress API (/api/v1/books/…) with NO
+    // Authorization header — it relies on the session cookie Komga's Spring
+    // stack sets on the catalog responses. Do the same: the first Basic
+    // request to /opds gets a session cookie; the client sends it back on
+    // everything after, so only that first request creates a session.
+    if (req.path.startsWith('/opds') && req.headers.authorization && !readCookie(req, COOKIE) && user.id) {
+      setSessionCookie(req, res, users.createSession(db, user.id));
+    }
     if (need !== 'authed' && !users.roleGrants(db, user.role, need, permCatalog)) {
       const label = permCatalog.get(need)?.label || need;
       return res.status(403).json({ error: `your role doesn't include the permission: ${label}` });
