@@ -16,11 +16,11 @@ import { initRssTables, unseenItems, markSeen, buildWantedIndex, matchFeedItems 
 import { findComicFiles, groupSeries, importMetaForFolder } from './scanner.js';
 import { extractYear } from './matcher.js';
 import { poolWithResource } from './pool.js';
-import { makeCvClient, cvKey } from './cv.js';
+import { makeCvClient, cvKey, rankSearchResults } from './cv.js';
 import { resolveBooks } from './cbl.js';
 import { initFranchiseTables, artBacklog, savePublisherLogo, setFranchiseArt } from './franchise.js';
 import { tagFileFromCv, ensureCvIssueDetail, fetchAllIssueMetadata } from './metatagger.js';
-import { fetchWeeklyReleases, matchReleases } from './releases.js';
+import { fetchWeeklyReleases, matchReleases, shiftWeek, currentWeek } from './releases.js';
 import { startJob, listJobs, clearFinishedJobs, attachJobsDb } from './jobs.js';
 import { createScheduler } from './scheduler.js';
 import { createDownloadMonitor } from './downloadmonitor.js';
@@ -30,7 +30,7 @@ import { installConsoleCapture, attachLogDb, listLogs, clearLogs, logInfo, logWa
 import { runCvMatch as runCvMatchLib, cacheAndLink, addSeriesFromCv, refreshCvVolume, refreshAllIssueDetails, rankCandidates, rematchMismatched, mergeDuplicateSeries } from './cvmatch.js';
 import { getSeriesById, seriesCollectionDetail, untrackSeries, getCvIssue, upsertSeries, setSeriesPath,
   ensureCvIssueRow, recordGrab, getGrab, setGrabStatus, setIssueStatus, setSeriesAliases, setSeriesType, listLibraries, libraryFolders, createLibrary, assignSeriesLibrary, seriesSearchNames,
-  clearImportCandidates, upsertImportCandidate, listImportCandidates, getImportCandidate, setImportCandidateMatch, setImportCandidateStatus, readyImportCandidates, listWantedIssues, queueIssues, getCvSeries } from './db.js';
+  clearImportCandidates, upsertImportCandidate, listImportCandidates, getImportCandidate, setImportCandidateMatch, setImportCandidateStatus, readyImportCandidates, listWantedIssues, queueIssues, getCvSeries, fulfilPicks } from './db.js';
 import { parseIndexers, searchNewznab } from './newznab.js';
 import { makeNzbClient } from './nzbclients.js';
 import { parseIndexers as parseTorznab, searchTorznab } from './torznab.js';
@@ -158,6 +158,7 @@ const TOOLS = {
   'relink-cv': { label: 'Re-link to ComicVine', desc: 'Re-map owned files to ComicVine issues for every matched comic (fixes owned/missing counts).', run: (op) => relinkAllCv(db, op) },
   'merge-duplicate-series': { label: 'Merge duplicate series', desc: "Fold together series rows that point at the same ComicVine volume (a copy added straight from ComicVine while the folder's own row was matched elsewhere). The folder-backed row is kept; the other's files, wanted issues and follows move over. Any duplicate copies that surface are then cleared with Remove duplicate files.", run: (op) => mergeDuplicateSeries(db, op) },
   'rematch-mismatched': { label: 'Re-check mismatched volumes', desc: "Find series whose files go beyond their ComicVine volume's last issue — the sign a same-name mini or one-shot was matched instead of the real run — and re-match them. A clear winner is applied and its files re-linked; anything unclear is left for Fix match on the series page.", needsCv: true, run: (op) => rematchMismatched(db, cvClient(), op) },
+  'refresh-series': { label: 'Refresh series metadata', desc: 'Re-pull every matched series\u2019 volume details and issue list from the metadata service — picks up publication status (Ongoing / Ended), enrichment for series cached before it was on, and issues published since. One request a second, so a big library takes a while; if the service rate-limits, it stops cleanly and you run it again.', needsCv: true, run: (op) => refreshAllVolumes(op) },
   'fetch-metadata': { label: 'Download issue metadata', desc: 'Fetch ComicVine detail (descriptions, credits, dates, covers) for every issue in your collection that is missing it. Already-cached issues are skipped; if ComicVine rate-limits, it stops cleanly — just run it again to finish.', needsCv: true, run: (op) => fetchAllIssueMetadata(db, cvClient(), op) },
   'rename-files': { label: 'Rename files to pattern', desc: 'Rename every CV-linked file to your file pattern (same folder — no moves) so imported scene-named files match downloaded ones. Collisions are skipped.', run: (op) => renameAllFiles(db, op) },
   'backup-db': { label: 'Back up database', desc: 'Snapshot the catalog database into backups/ next to it (keeps the newest 5). Safe while the app is in use. Restore: stop the app and copy a snapshot over catalog.db.', run: (op) => backupDatabase(db, config.dbPath, op) },
@@ -228,7 +229,15 @@ async function runCvMatchSweep() {
 }
 
 async function cvSearch(q, opts = {}) {
-  return cvClient().search(q, opts);
+  const results = await cvClient().search(q, opts);
+  // The user's own publishers rank alongside the familiar ones — someone with
+  // a shelf of Panini Verlag wants those on top, not buried.
+  let favoured = [];
+  try {
+    favoured = db.prepare(`SELECT publisher FROM series WHERE (followed = 1 OR monitor IN ('all', 'new')) AND publisher IS NOT NULL AND publisher <> ''
+      GROUP BY publisher ORDER BY COUNT(*) DESC LIMIT 12`).all().map((r) => r.publisher);
+  } catch { /* ranking still works on the defaults */ }
+  return rankSearchResults(results, q, { favoured });
 }
 
 // Look up one ComicVine volume by id (for pasting a CV URL/id into the match
@@ -285,8 +294,8 @@ async function cvIssueInfo(cvIssueId) {
 }
 
 // Add a comic to the collection from a ComicVine volume.
-async function addFromCv(comicvineId) {
-  const r = await addSeriesFromCv(db, cvClient(), comicvineId);
+async function addFromCv(comicvineId, opts = {}) {
+  const r = await addSeriesFromCv(db, cvClient(), comicvineId, opts);
   logInfo(`Added from ComicVine: ${r.title || 'volume ' + comicvineId} (${r.outcome})`, 'collection');
   return r;
 }
@@ -303,7 +312,7 @@ async function scanSeriesFolder(seriesId) {
   indexFolderForSeries({
     db, dir, seriesId, cvId: series.cv_id,
     onProgress: (p) => { state.scanFolder = { running: true, seriesId, dir, done: p.done, total: p.total }; job.progress({ done: p.done, total: p.total }); },
-  }).then((r) => { state.scanFolder = { running: false, seriesId, dir, error: r?.error || undefined, pruned: r?.pruned }; if (r?.error) { job.fail(new Error(r.error)); } else { logInfo(`Scanned folder for ${series.title || dir}: ${r?.total || 0} file(s)${r?.pruned ? ', ' + r.pruned + ' pruned' : ''}`, 'library'); job.finish({ files: r?.total, pruned: r?.pruned }); } })
+  }).then((r) => { state.scanFolder = { running: false, seriesId, dir, error: r?.error || undefined, pruned: r?.pruned }; settlePicks(seriesId); if (r?.error) { job.fail(new Error(r.error)); } else { logInfo(`Scanned folder for ${series.title || dir}: ${r?.total || 0} file(s)${r?.pruned ? ', ' + r.pruned + ' pruned' : ''}`, 'library'); job.finish({ files: r?.total, pruned: r?.pruned }); } })
     .catch((e) => { state.scanFolder = { running: false, seriesId, dir, error: String(e?.message || e) }; job.fail(e); });
   return { started: true, dir };
 }
@@ -578,7 +587,6 @@ async function cleanupSeriesFiles(seriesId) {
 
 // Check this week's new releases and cross-reference them against tracked
 // comics by ComicVine id; new issues get cached (shown as missing).
-let lastNotifiedReleaseWeek = null; // dedupe the weekly release-day notification
 async function checkReleases({ week, year } = {}) {
   if (state.releases.running) return { busy: true };
   state.releases = { running: true };
@@ -589,13 +597,39 @@ async function checkReleases({ week, year } = {}) {
       const r = matchReleases(db, releases);
       state.releases = { running: false, week: wk, year: yr, checkedAt: new Date().toISOString(), ...r };
       logInfo(`This week's releases: ${r.total} total, ${r.hits} in your collection, ${r.added} new`, 'releases');
+      // What ships next for each tracked series: this week's tracked entries
+      // plus a look at next week (not cached — a future issue must not become
+      // "wanted" before it exists on ComicVine). Only when checking the
+      // current week; browsing history leaves the lookahead alone.
+      const cur = currentWeek();
+      if (!week || (wk === cur.week && yr === cur.year)) {
+        const pick = (list, w, y) => (list || []).filter((x) => x.tracked && x.seriesId)
+          .map((x) => ({ seriesId: x.seriesId, number: x.number, shipdate: x.shipdate, issueId: x.issueId, owned: x.owned, collected: x.collected, week: w, year: y }));
+        let upcoming = pick(r.releases, wk, yr);
+        try {
+          const nw = shiftWeek(wk, yr, 1);
+          const next = await fetchWeeklyReleases(nw);
+          upcoming = upcoming.concat(pick(matchReleases(db, next.releases, { cache: false }).releases, next.week, next.year));
+        } catch (e) { logWarn(`Next week's releases unavailable: ${e?.message || e}`, 'releases'); }
+        state.releasesUpcoming = upcoming;
+      }
       // Release-day heads-up for followed series — once per week (the check
-      // runs twice daily; dedupe on the week key so it doesn't repeat).
-      const wkKey = `${yr}-${wk}`;
-      if (r.hits > 0 && lastNotifiedReleaseWeek !== wkKey) {
-        lastNotifiedReleaseWeek = wkKey;
+      // runs twice daily; dedupe on the week key so it doesn't repeat). Names
+      // the first few single issues; collections are left out of the count.
+      // Deduped against the notification already stored for this week, so a
+      // restart (deploys, updates) doesn't post it again — the in-memory key
+      // this used to rely on reset every boot.
+      const weekUrl = `/releases?week=${wk}&year=${yr}`;
+      const told = db.prepare("SELECT 1 FROM notifications WHERE type = 'release.week' AND url = ? LIMIT 1").get(weekUrl);
+      if (r.hits > 0 && !told) {
+        const singles = (r.releases || []).filter((x) => x.tracked && !x.collected);
+        const named = singles.slice(0, 3).map((x) => `${x.series} #${x.number ?? '?'}`);
+        const more = singles.length - named.length;
+        const n = singles.length || r.hits;
         notifyRaw(db, { type: 'release.week', category: 'release', level: 'info',
-          title: 'New releases this week', body: `${r.hits} issue(s) from series you follow ship this week.`, url: '/releases' });
+          title: 'New releases this week',
+          body: `${n} issue${n === 1 ? '' : 's'} from series you follow ship${n === 1 ? 's' : ''} this week${named.length ? ': ' + named.join(', ') + (more > 0 ? ` and ${more} more` : '') : ''}.`,
+          url: weekUrl });
       }
       job.finish({ releases: r.total, inCollection: r.hits, newIssues: r.added });
     } catch (e) { state.releases = { running: false, error: String(e?.message || e), checkedAt: new Date().toISOString() }; job.fail(e); }
@@ -889,14 +923,55 @@ async function usenetGrab({ seriesId, cvIssueId, number, name, nzbUrl, releaseTi
   }
 }
 
-// Scheduled backfill: queue the next batch of wanted (missing) issues of
-// FOLLOWED series for download. Skips anything already moving or previously
-// failed (use Retry Failed for those), so every run makes forward progress
-// without hammering the indexers.
+// A picked issue that has landed on disk: tell whoever asked for it (a
+// targeted notification — only they see it), then the pick retires. Runs
+// after anything that can put a file on disk; the nightly backfill sweeps
+// the whole library as a catch-all.
+function settlePicks(seriesId = null) {
+  let done;
+  try { done = fulfilPicks(db, seriesId); } catch (e) { logWarn(`could not settle picks: ${e?.message || e}`, 'download'); return; }
+  for (const p of done) {
+    if (p.by_user == null) continue;
+    notifyRaw(db, {
+      type: 'pick.arrived', category: 'import', level: 'success',
+      title: 'An issue you asked for is here',
+      body: `${p.series_title || 'Series'} #${p.issue_number ?? '?'}${p.name ? ' — ' + p.name : ''}`,
+      url: `/volume/${p.series_id}`, userId: p.by_user, seriesId: p.series_id,
+    });
+  }
+}
+
+// Every matched series' volume metadata + issue list, re-pulled one request
+// at a time — picks up publication status (Ongoing/Ended) and enrichment for
+// series cached before it was on, and any issues published since. Stops
+// cleanly on a rate limit; rerun to finish.
+async function refreshAllVolumes(op) {
+  const client = cvClient();
+  const ids = db.prepare('SELECT id FROM series WHERE cv_id IS NOT NULL ORDER BY id').all().map((r) => r.id);
+  let done = 0, updated = 0, failed = 0, stopped = 0;
+  for (const id of ids) {
+    try { const r = await refreshCvVolume(db, client, id); if (r?.ok) updated++; else failed++; }
+    catch (e) {
+      failed++;
+      if (/429|rate.?limit|too many/i.test(String(e?.message || e))) { logWarn('Refresh series metadata: rate limited — stopping; run it again later to finish', 'tools'); stopped = ids.length - done - 1; break; }
+    }
+    op({ done: ++done, total: ids.length });
+    await new Promise((r) => setTimeout(r, 900)); // stay polite to the metadata service
+  }
+  settlePicks();
+  return { checked: done, updated, failed, remaining: stopped };
+}
+
+// Scheduled backfill: queue the next batch of wanted issues (each series'
+// monitoring policy plus its per-issue picks — the wanted_issues view) for
+// download. Skips anything already moving or previously failed (use Retry
+// Failed for those), so every run makes forward progress without hammering
+// the indexers.
 async function runWantedSearch() {
   const job = startJob('wanted-search', 'Search wanted issues');
+  settlePicks(); // anything that arrived by other means (scans, packs) retires its pick
   const batch = Math.max(1, Number(config.wantedSearchBatch) || 25);
-  const { items, total } = listWantedIssues(db, { followedOnly: true, hideUnreleased: true, limit: 500 });
+  const { items, total } = listWantedIssues(db, { hideUnreleased: true, limit: 500 });
   const ids = [];
   for (const it of items) {
     if (ids.length >= batch) break;
@@ -912,8 +987,8 @@ async function runWantedSearch() {
   return { queued: ids.length, wanted: total };
 }
 
-// Scheduled new-releases lane: queue missing issues of FOLLOWED series that hit
-// the shelves in the last recentSearchDays. Unlike the backfill above, FAILED
+// Scheduled new-releases lane: queue wanted issues that hit the shelves in
+// the last recentSearchDays. Unlike the backfill above, FAILED
 // items are retried on every run while they're inside the window — a comic
 // released yesterday often isn't on the indexers yet, and availability changes
 // daily in week one. Once an issue ages out of the window it stops being
@@ -921,12 +996,12 @@ async function runWantedSearch() {
 async function runRecentSearch() {
   const job = startJob('recent-search', 'Search new releases');
   const days = Math.max(1, Number(config.recentSearchDays) || 14);
-  const { items, total } = listWantedIssues(db, { followedOnly: true, releasedWithinDays: days, limit: 200 });
+  const { items, total } = listWantedIssues(db, { releasedWithinDays: days, limit: 200 });
   const fresh = [], failed = [];
   for (const it of items) {
     // 'pending' is PARKED (a cancelled or interrupted queue entry), not
     // in-flight — inside the new-releases window it gets picked back up:
-    // followed means "keep this complete". Only genuinely moving statuses
+    // wanted means "keep after it". Only genuinely moving statuses
     // (queued/downloading/grabbed/saving/done) are left alone.
     const bucket = it.queue_status === 'failed' ? failed
       : (!it.queue_status || it.queue_status === 'pending') ? fresh
@@ -947,7 +1022,7 @@ async function runRecentSearch() {
 }
 
 // RSS watch: poll the indexers' latest-uploads feed (empty-query search) and
-// grab anything matching a missing issue of a followed series. Each item is
+// grab anything matching a wanted issue. Each item is
 // considered once (rss_seen); a match is PINNED to the issue so the queue
 // downloads exactly that release — no re-search. See src/rsswatch.js.
 async function runRssWatch() {
@@ -1156,6 +1231,7 @@ function grabSourcePack({ source, seriesId, result } = {}) {
       setGrabStatus(db, grabId, 'imported', { importedAt: new Date().toISOString() });
       logInfo(`${source} pack imported: ${summary.imported} new · ${summary.skipped} already owned · ${summary.unmatched} unmatched · ${summary.failed} failed — ${result.title}`, source);
       notifyRaw(db, { type: 'pack.done', category: 'import', level: summary.failed ? 'warn' : 'success', title: 'Pack imported', body: `${result.title} — ${summary.imported} new issue(s)`, seriesId: sid ?? null });
+      settlePicks(sid ?? null);
     } catch (e) {
       setGrabStatus(db, grabId, 'failed', { error: String(e?.message || e) });
       job.fail(e);
@@ -1310,7 +1386,7 @@ async function runDownloads() {
       }
       if (p.event === 'tag-result') recordProgressTagLog(p);
       if (p.event === 'failed') logError(`Download failed: ${p.issue?.title || 'issue ' + p.issue?.id} — ${p.error}`, 'download');
-      else if (p.event === 'done') logInfo(`Downloaded: ${p.issue?.title || 'issue ' + p.issue?.id}${p.source ? ' (' + p.source + ')' : ''}`, 'download');
+      else if (p.event === 'done') { logInfo(`Downloaded: ${p.issue?.title || 'issue ' + p.issue?.id}${p.source ? ' (' + p.source + ')' : ''}`, 'download'); settlePicks(p.issue?.series_id ?? null); }
       else if (p.event === 'grabbed') logInfo(`Grabbed via ${p.source || 'usenet'}: ${p.issue?.title || 'issue ' + p.issue?.id}`, 'download');
     },
   });
@@ -1453,7 +1529,7 @@ const downloadMonitor = createDownloadMonitor({
   db,
   onProgress: (p) => {
     if (p.event === 'tag-result') recordProgressTagLog(p);
-    if (p.event === 'done') { logInfo(`Imported from ${p.source || 'download'}: ${p.issue?.title || 'issue ' + p.issue?.id}`, p.source || 'usenet'); notifyRaw(db, { type: 'import.done', category: 'import', level: 'success', title: 'Downloaded', body: `${p.issue?.title || 'issue'}${p.source ? ' · ' + p.source : ''}`, seriesId: p.issue?.series_id ?? null }); }
+    if (p.event === 'done') { logInfo(`Imported from ${p.source || 'download'}: ${p.issue?.title || 'issue ' + p.issue?.id}`, p.source || 'usenet'); notifyRaw(db, { type: 'import.done', category: 'import', level: 'success', title: 'Downloaded', body: `${p.issue?.title || 'issue'}${p.source ? ' · ' + p.source : ''}`, seriesId: p.issue?.series_id ?? null }); settlePicks(p.issue?.series_id ?? null); }
     if (p.event === 'failed') { logError(`${p.source || 'download'} import failed: ${p.issue?.title || 'issue ' + p.issue?.id} — ${p.error}`, p.source || 'usenet'); notifyRaw(db, { type: 'import.failed', category: 'failure', level: 'error', title: 'Download failed', body: `${p.issue?.title || 'issue'} — ${p.error}`, seriesId: p.issue?.series_id ?? null }); }
     if (p.event === 'pack-start') logInfo(`Post-processing pack — ${p.title}…`, p.source || 'torrent');
     if (p.event === 'pack-import') {

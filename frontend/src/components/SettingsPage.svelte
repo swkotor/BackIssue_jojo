@@ -9,6 +9,7 @@
   import { confirmDialog } from './DialogModal.svelte';
   import { notify } from '../lib/toasts.svelte.js';
   import Icon from '../lib/Icon.svelte';
+  import { hscroll } from '../lib/hscroll.js';
 
   let { active = false } = $props();
 
@@ -69,7 +70,7 @@
       const r = await apiGet('/api/libraries');
       libs = (r.libraries || []).map(withFolders);
       if (Array.isArray(r.types) && r.types.length) LIB_TYPES = r.types.map((t) => [t.id, t.label]);
-    } catch { /* offline */ }
+    } catch { notify('Could not load your libraries — the list below may be out of date.', 'error'); }
   }
   $effect(() => { if (active) loadLibs(); });
   async function addLib() {
@@ -186,6 +187,13 @@
     const mount = document.getElementById(mountId);
     if (!mount) return [];
     const out = [];
+    // The rail note is the description's first sentence — whole words, never a
+    // hard cut mid-word (a 48-character slice used to end in "hubs via t").
+    const firstSentence = (text) => {
+      const t = String(text || '').replace(/\s+/g, ' ').trim();
+      const one = (t.match(/^[^.!?]*[.!?]/)?.[0] || t).trim();
+      return one.length > 90 ? one.slice(0, 89).replace(/\s+\S*$/, '') + '…' : one;
+    };
     [...mount.querySelectorAll(':scope > .src-block')].forEach((block, i) => {
       const key = 'plugin:' + (block.id || i);
       block.dataset.setxKey = key;
@@ -193,7 +201,7 @@
       out.push({
         key,
         label: block.querySelector('.src-toggle b')?.textContent?.trim() || 'Plugin',
-        note: block.querySelector('.src-toggle .modal__note')?.textContent?.trim().slice(0, 48) || 'Plugin settings',
+        note: firstSentence(block.querySelector('.src-toggle .modal__note')?.textContent) || 'Plugin settings',
         on: !!sw?.checked,
       });
       if (sw && !sw.dataset.setxWired) { sw.dataset.setxWired = '1'; sw.addEventListener('change', () => syncSourceUI()); }
@@ -512,7 +520,7 @@
   </div>
 
   <!-- Tab rail -->
-  <nav class="setx-tabs" aria-label="Settings pages">
+  <nav class="setx-tabs" aria-label="Settings pages" use:hscroll>
     {#each TABS.filter((t) => t.id !== 'plugins' || pluginPanels.length) as t (t.id)}
       <button type="button" class="setx-tab" class:is-active={activeTab === t.id} onclick={() => pickTab(t.id)}>
         <Icon name={t.icon} size={14} /> {t.label}
@@ -659,7 +667,17 @@
           <span class="switch"><input id="set-autoDownloadOnAdd" type="checkbox" /><span class="switch__track"></span></span>
           <span>Download on add</span>
         </label>
-        <p class="modal__note">Adding a series (Library, Discover, Releases, reading lists) immediately queues every issue for download. Off = series add empty and you press "Download missing" yourself.</p>
+        <p class="modal__note">Adding a series (Library, Discover, Releases, reading lists) immediately queues what its monitoring policy wants. Off = series add empty and you press "Download missing" yourself.</p>
+        <label class="field">
+          <span>Monitor added series</span>
+          <select id="set-defaultMonitor"><option value="all">All issues</option><option value="new">New issues only</option><option value="none">Off</option></select>
+        </label>
+        <p class="modal__note">The monitoring policy a series gets when it enters the library — added by hand, from Discover, Releases, reading lists, requests, or an import. <b>All issues</b> keeps the run complete; <b>New issues only</b> wants issues from the newest one onward and leaves the back catalogue alone; <b>Off</b> fetches nothing until you monitor it or pick issues yourself. Any series can be changed later from its ⋯ menu.</p>
+        <label class="field field--check">
+          <span class="switch"><input id="set-addDownloadOnlyRequested" type="checkbox" /><span class="switch__track"></span></span>
+          <span>Only the issues that were asked for</span>
+        </label>
+        <p class="modal__note">When a series is added because of specific issues — an entry on a reading list, a release, a CBL import — it arrives with monitoring off and just those issues wanted, so only they are downloaded (now and if a grab fails later). Adding from the Library or Discover still gets the policy above. Needs "Download on add".</p>
         <label class="field">
           <span>Download format</span>
           <select id="set-format"><option value="cbz">CBZ (with metadata)</option><option value="pdf">PDF</option></select>

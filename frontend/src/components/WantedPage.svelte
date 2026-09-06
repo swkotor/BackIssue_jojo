@@ -1,53 +1,68 @@
 <script>
   import { untrack } from 'svelte';
+  import { SvelteSet } from 'svelte/reactivity';
   import { goBack, navigate, route, setQuery } from '../lib/router.svelte.js';
   import { apiGet, apiPost } from '../lib/api.js';
   import { subscribe } from '../lib/events.svelte.js';
   import { notify } from '../lib/toasts.svelte.js';
-  import { fmt, initials } from '../lib/util.js';
+  import { fmt } from '../lib/util.js';
   import { rail } from '../lib/store.svelte.js';
   import Badge from './Badge.svelte';
   import Cover from './Cover.svelte';
   import { confirmDialog } from './DialogModal.svelte';
   import { can } from '../lib/auth.svelte.js';
   import Icon from '../lib/Icon.svelte';
+  import { hscroll } from '../lib/hscroll.js';
 
   let { active = false } = $props();
 
   let followed = $state(false);
   let hideUnreleased = $state(false);
+  let scope = $state('wanted'); // 'wanted' (what automation fetches) | 'gaps' (every missing issue)
+  let sort = $state('series');
   let q = $state('');
   let items = $state([]);
   let total = $state(0);
   let loaded = $state(false);
   let collapsed = $state({}); // series_id → true when the user collapses it
+  const gaps = $derived(scope === 'gaps');
+
+  const SORTS = [
+    { key: 'series', label: 'Series A–Z' },
+    { key: 'newest', label: 'Newest release' },
+    { key: 'oldest', label: 'Oldest release' },
+    { key: 'most', label: 'Most wanted first' },
+    { key: 'fewest', label: 'Fewest wanted first' },
+  ];
 
   async function renderWanted({ append = false } = {}) {
     const offset = append ? items.length : 0;
-    const qs = `limit=200&offset=${offset}` + (followed ? '&followed=1' : '') + (hideUnreleased ? '&hideUnreleased=1' : '') + (q ? `&q=${encodeURIComponent(q)}` : '') + (sort && sort !== 'series' ? `&sort=${sort}` : '');
+    const qs = `limit=200&offset=${offset}&scope=${scope}&sort=${sort}` + (followed ? '&followed=1' : '') + (hideUnreleased ? '&hideUnreleased=1' : '') + (q ? `&q=${encodeURIComponent(q)}` : '');
     let w;
     try { w = await apiGet('/api/wanted?' + qs); } catch { return; }
     items = append ? items.concat(w.items) : w.items;
     total = w.total;
     loaded = true;
+    if (!append) { selected.clear(); lastToggled = null; }
   }
 
-  // Filters live in the URL (?wf=followed&hide=1&find=…) so views are
-  // shareable and Back/Forward restore them. The URL is the source of truth:
-  // handlers only patch the query; this effect syncs state + refetches.
+  // Filters live in the URL (?wf=followed&hide=1&scope=gaps&sort=…&find=…) so
+  // views are shareable and Back/Forward restore them. The URL is the source
+  // of truth: handlers only patch the query; this effect syncs state + refetches.
   $effect(() => {
     if (!active) { items = []; loaded = false; return; }
     const p = new URLSearchParams(route.search);
     untrack(() => {
       followed = p.get('wf') === 'followed';
       hideUnreleased = p.get('hide') === '1';
-      sort = p.get('sort') || 'series';
+      scope = p.get('scope') === 'gaps' ? 'gaps' : 'wanted';
+      sort = SORTS.some((s) => s.key === p.get('sort')) ? p.get('sort') : 'series';
       if (q !== (p.get('find') || '')) q = p.get('find') || '';
       renderWanted();
     });
     // refresh in place (status counts move when downloads land) unless the
-    // user has paged deeper
-    return subscribe('status', () => { if (items.length <= 200) renderWanted(); }, 4000);
+    // user has paged deeper or is mid-selection
+    return subscribe('status', () => { if (items.length <= 200 && !selected.size) renderWanted(); }, 4000);
   });
 
   let searchTimer;
@@ -62,81 +77,13 @@
     if (!n) return notify('Nothing to download.', 'info');
     if (!(await confirmDialog({
       title: `Queue ${n} issue(s) for download?`,
-      message: 'Everything matching the current filters is queued.' + (total > 500 ? ' Capped at 500 per pass — run it again for the rest.' : ''),
+      message: 'Everything matching the current filters is queued.' + (gaps ? ' Gaps that were not wanted become wanted.' : '') + (total > 500 ? ' Capped at 500 per pass — run it again for the rest.' : ''),
       confirmLabel: 'Queue downloads',
     }))) return;
-    const r = await apiPost('/api/wanted/download-all', { followed, hideUnreleased, q });
+    const r = await apiPost('/api/wanted/download-all', { followed, hideUnreleased, q, scope });
     if (r?.error) return notify(r.error, 'error');
     notify(`Queued ${fmt(r.queued || 0)} issue(s).`, 'ok');
     renderWanted();
-  }
-
-  // fork: server-side ordering for the whole list (not just the loaded page)
-  let sort = $state('series');
-
-  // fork: multi-select + explicit wanted flags
-  let selected = $state(new Set());
-  let bulkBusy = $state(false);
-  const selCount = $derived(selected.size);
-
-  let lastPickedIssue = $state(null);
-
-  // Toggle one issue, or shift-click to select every issue between the last
-  // one clicked and this one (in displayed order).
-  function toggleSel(id, e) {
-    const next = new Set(selected);
-    const order = groups.flatMap((g) => g.issues.map((i) => i.cv_issue_id));
-    if (e?.shiftKey && lastPickedIssue != null) {
-      const a = order.indexOf(lastPickedIssue);
-      const b = order.indexOf(id);
-      if (a !== -1 && b !== -1) {
-        const [from, to] = a < b ? [a, b] : [b, a];
-        const on = !next.has(id);
-        for (let i = from; i <= to; i++) { if (on) next.add(order[i]); else next.delete(order[i]); }
-        selected = next; lastPickedIssue = id;
-        return;
-      }
-    }
-    if (next.has(id)) next.delete(id); else next.add(id);
-    selected = next; lastPickedIssue = id;
-  }
-  function selectGroup(g, on) {
-    const next = new Set(selected);
-    for (const it of g.issues) { if (on) next.add(it.cv_issue_id); else next.delete(it.cv_issue_id); }
-    selected = next;
-  }
-  function clearSel() { selected = new Set(); }
-
-  async function markWanted(wanted) {
-    if (!selected.size) return;
-    bulkBusy = true;
-    try {
-      await apiPost('/api/issues/wanted', { cvIssueIds: [...selected], wanted });
-      clearSel();
-      await renderWanted();
-    } finally { bulkBusy = false; }
-  }
-
-  // fork: drop a single issue from the wanted list (and the download queue).
-  async function unwantIssue(it) {
-    const r = await apiPost('/api/issues/wanted', { cvIssueIds: [it.cv_issue_id], wanted: false });
-    if (r?.error) return;
-    await renderWanted();
-  }
-
-  // fork: stop wanting a whole series — sets it Unwatched, which clears every
-  // want for it and takes its issues out of the queue.
-  async function unwantSeries(g) {
-    if (!confirm(`Stop wanting every issue of "${g.title || 'this series'}"?\n\nThe series is set to Unwatched: nothing in it will be wanted or downloaded.`)) return;
-    const r = await apiPost('/api/series/watch-state', { ids: [g.id], state: 'unwatched' });
-    if (r?.error) return;
-    await renderWanted();
-  }
-
-  async function downloadSelected() {
-    const ids = new Set(selected);
-    clearSel();
-    for (const it of items) if (ids.has(it.cv_issue_id)) await download(it);
   }
 
   const IN_FLIGHT = ['queued', 'downloading', 'grabbed', 'tagging'];
@@ -144,35 +91,120 @@
     it._busy = true;
     await apiPost(`/api/collection/${it.series_id}/download`, { cvIssueIds: [it.cv_issue_id] });
     it.queue_status = 'queued';
+    it.wanted = 1; it.why = it.why || 'pick';
     it._busy = false;
   }
 
-  // Group the flat, pre-sorted item list into per-series cards, enriching each
-  // with owned/total from the rail store when the series is loaded there (the
-  // completion bar is progressive enhancement — the missing count is primary).
-  // Groups follow the order the server returned rows in, so the chosen sort
-  // survives grouping (a client-side re-sort would undo it).
+  /* ---- Wants: pick / skip, singly or for a selection ---- */
+  // Group a set of rows by series and post one request per series. Rows are
+  // patched in place: in the wanted view a skipped issue disappears, in the
+  // gaps view it stays and flips its flag.
+  async function setWants(rows, want) {
+    const bySeries = new Map();
+    for (const it of rows) {
+      if (!bySeries.has(it.series_id)) bySeries.set(it.series_id, []);
+      bySeries.get(it.series_id).push(it);
+    }
+    let changed = 0;
+    for (const [sid, list] of bySeries) {
+      let r;
+      try { r = await apiPost(`/api/collection/${sid}/wanted`, { cvIssueIds: list.map((x) => x.cv_issue_id), want }); }
+      catch { notify('Could not update — is the app reachable?', 'error'); return; }
+      if (r?.error) { notify(r.error, 'error'); return; }
+      changed += r.changed || 0;
+      const by = new Map((r.issues || []).map((x) => [x.cv_issue_id, x]));
+      for (const it of list) {
+        const u = by.get(it.cv_issue_id);
+        if (!u) continue;
+        it.wanted = u.wanted ? 1 : 0; it.why = u.why; it.reason = u.reason; it.pick = u.pick;
+        if (!u.wanted && ['queued', 'failed'].includes(it.queue_status)) it.queue_status = 'pending';
+      }
+    }
+    if (!gaps && !want) {
+      const drop = new Set(rows.map((x) => x.cv_issue_id));
+      items = items.filter((x) => !drop.has(x.cv_issue_id));
+      total = Math.max(0, total - drop.size);
+    }
+    for (const it of rows) selected.delete(it.cv_issue_id);
+    if (rows.length > 1) notify(want ? `Wanting ${fmt(rows.length)} issues.` : `${fmt(rows.length)} issues no longer wanted.`, 'ok');
+    void changed;
+  }
+
+  // fork: one click to stop wanting a whole series from here — sets it
+  // Unwatched (policy off, picks dropped, queue rows parked) and drops its card.
+  async function unwantSeries(g) {
+    let r;
+    try { r = await apiPost('/api/series/watch-state', { ids: [g.id], state: 'unwatched' }); }
+    catch { return notify('Could not update — is the app reachable?', 'error'); }
+    if (r?.error) return notify(r.error, 'error');
+    const drop = new Set(g.issues.map((x) => x.cv_issue_id));
+    for (const id of drop) selected.delete(id);
+    if (!gaps) { items = items.filter((x) => x.series_id !== g.id); total = Math.max(0, total - drop.size); }
+    else for (const it of g.issues) { it.wanted = 0; it.why = null; it.pick = null; }
+    notify(`${g.title || 'Series'} is no longer watched.`, 'ok');
+  }
+
+  /* ---- Selection (checkbox per row, shift-click for ranges) ---- */
+  const selected = new SvelteSet();
+  let lastToggled = $state(null); // index into `items`
+  function toggleRow(it, index, shiftKey) {
+    const willCheck = !selected.has(it.cv_issue_id);
+    if (shiftKey && lastToggled != null && index !== lastToggled) {
+      const [a, b] = [Math.min(lastToggled, index), Math.max(lastToggled, index)];
+      for (let k = a; k <= b; k++) { const x = items[k]; if (!x) continue; if (willCheck) selected.add(x.cv_issue_id); else selected.delete(x.cv_issue_id); }
+    } else if (willCheck) selected.add(it.cv_issue_id);
+    else selected.delete(it.cv_issue_id);
+    lastToggled = index;
+  }
+  function toggleSeries(g) {
+    const all = g.issues.every((it) => selected.has(it.cv_issue_id));
+    for (const it of g.issues) { if (all) selected.delete(it.cv_issue_id); else selected.add(it.cv_issue_id); }
+  }
+  const selectedRows = $derived(items.filter((it) => selected.has(it.cv_issue_id)));
+  // Flat position of each row, for shift-click ranges (never written onto the rows themselves).
+  const indexById = $derived(new Map(items.map((it, i) => [it.cv_issue_id, i])));
+  async function downloadSelected() {
+    const rows = selectedRows.filter((it) => !IN_FLIGHT.includes(it.queue_status));
+    if (!rows.length) return notify('Everything selected is already on its way.', 'info');
+    const bySeries = new Map();
+    for (const it of rows) { if (!bySeries.has(it.series_id)) bySeries.set(it.series_id, []); bySeries.get(it.series_id).push(it.cv_issue_id); }
+    for (const [sid, ids] of bySeries) await apiPost(`/api/collection/${sid}/download`, { cvIssueIds: ids });
+    for (const it of rows) { it.queue_status = 'queued'; it.wanted = 1; }
+    selected.clear();
+    notify(`Queued ${fmt(rows.length)} issue(s).`, 'ok');
+  }
+
+  // Group the flat, pre-sorted item list into per-series cards (in order of
+  // first appearance, so a date sort surfaces the series with the newest
+  // issue first), enriching each with owned/total from the rail store when
+  // the series is loaded there (the completion bar is progressive enhancement).
   const groups = $derived.by(() => {
     const out = []; const byId = new Map();
-    for (const it of items) {
+    items.forEach((it) => {
       let g = byId.get(it.series_id);
-      if (!g) { g = { id: it.series_id, title: it.series_title, cover: it.series_cover, followed: it.followed, seriesMissing: it.series_missing, issues: [] }; byId.set(it.series_id, g); out.push(g); }
+      if (!g) { g = { id: it.series_id, title: it.series_title, cover: it.series_cover, followed: it.followed, monitor: it.monitor, monitor_from: it.monitor_from, issues: [] }; byId.set(it.series_id, g); out.push(g); }
       g.issues.push(it);
-    }
+    });
     for (const g of out) {
       const r = rail.rows?.find((x) => x.id === g.id);
-      if (r && r.total) { g.owned = r.owned; g.total = r.total; g.pct = Math.round((r.owned / r.total) * 100); g.missing = r.missing; g.hasBar = true; }
-      else { g.missing = g.issues.length; g.hasBar = false; }
+      if (r && r.total) { g.owned = r.owned; g.total = r.total; g.pct = Math.round((r.owned / r.total) * 100); g.hasBar = true; }
+      else g.hasBar = false;
+      g.count = g.issues.length;
     }
     return out;
   });
+
+  const monitorLabel = (g) => g.monitor === 'new' ? `new from #${g.monitor_from ?? '?'}` : g.monitor === 'none' ? 'not monitored' : 'monitored';
+  const whyTitle = (it) => it.why === 'pick'
+    ? `Picked by hand${it.reason && it.reason !== 'manual' ? ` (${it.reason})` : ''}`
+    : it.wanted ? 'Wanted because the series is monitored' : 'Not wanted — a gap the policy leaves alone';
 
   const stats = $derived.by(() => {
     let inFlight = 0, failed = 0;
     for (const it of items) { if (IN_FLIGHT.includes(it.queue_status)) inFlight++; else if (it.queue_status === 'failed') failed++; }
     const series = new Set(items.map((i) => i.series_id)).size;
     return [
-      { label: 'Missing', value: fmt(total), tone: 'var(--amber)' },
+      { label: gaps ? 'Missing' : 'Wanted', value: fmt(total), tone: 'var(--amber)' },
       { label: 'In flight', value: fmt(inFlight), tone: 'var(--cyan)' },
       { label: 'Failed', value: fmt(failed), tone: failed ? 'var(--red)' : 'var(--green)' },
       { label: 'Series', value: fmt(series), tone: 'var(--muted)' },
@@ -187,7 +219,7 @@
     <div class="wx__head">
       <button id="wanted-back" class="wx__iconbtn" aria-label="Back" onclick={goBack}><Icon name="arrow-left" size={16} /></button>
       <h2 class="wx__title">Wanted</h2>
-      <span id="wanted-summary" class="wx__summary">{fmt(total)} missing issue{total === 1 ? '' : 's'}</span>
+      <span id="wanted-summary" class="wx__summary">{fmt(total)} {gaps ? 'missing' : 'wanted'} issue{total === 1 ? '' : 's'}</span>
       <div class="wx__right">
         <div class="wx__find">
           <Icon name="search" size={15} />
@@ -199,7 +231,7 @@
       </div>
     </div>
 
-    <div class="wx__stats">
+    <div class="wx__stats" use:hscroll>
       {#each stats as st (st.label)}
         <div class="wx__stat">
           <div class="wx__stat-lbl"><span class="wx__stat-dot" style="background:{st.tone};"></span>{st.label}</div>
@@ -208,21 +240,33 @@
       {/each}
     </div>
 
-    <div class="wx__chips">
-      <select class="wx__sort" title="Sort the wanted list" value={sort}
-        onchange={(e) => setQuery({ sort: e.currentTarget.value === 'series' ? null : e.currentTarget.value })}>
-        <option value="series">A–Z by series</option>
-        <option value="missing">Most missing</option>
-        <option value="missing-asc">Fewest missing</option>
-        <option value="newest">Newest released</option>
-        <option value="oldest">Oldest released</option>
-      </select>
-      <button class="wx__chip" class:is-active={!followed} onclick={() => setQuery({ wf: null })}>All series</button>
-      <button class="wx__chip" class:is-active={followed} onclick={() => setQuery({ wf: 'followed' })} title="Series you follow (the ☆ on a series page)">Following</button>
+    <div class="wx__chips" use:hscroll>
+      <button class="wx__chip" class:is-active={!gaps} title="What download automation goes after — each series' monitoring policy plus your picks" onclick={() => setQuery({ scope: null })}>Wanted</button>
+      <button class="wx__chip" class:is-active={gaps} title="Every missing issue of every series in the library, wanted or not" onclick={() => setQuery({ scope: 'gaps' })}>All gaps</button>
+      <span class="wx__chips-sep"></span>
+      <button class="wx__chip" class:is-active={followed} onclick={() => setQuery({ wf: followed ? null : 'followed' })} title="Series you follow (the ☆ on a series page)"><Icon name="star" size={13} /> Following</button>
       <button id="wanted-unreleased" class="wx__chip wx__chip--hide" class:is-active={hideUnreleased}
         title="Hides issues whose known cover date is in the future (most cached issues have no date — this only hides what we know)"
         onclick={() => setQuery({ hide: hideUnreleased ? null : '1' })}><Icon name="eye-off" size={14} /> Hide unreleased</button>
+      <label class="wx__sort" title="Sort order">
+        <Icon name="arrow-up-down" size={13} />
+        <select value={sort} onchange={(e) => setQuery({ sort: e.currentTarget.value === 'series' ? null : e.currentTarget.value })}>
+          {#each SORTS as o (o.key)}<option value={o.key}>{o.label}</option>{/each}
+        </select>
+      </label>
     </div>
+
+    {#if selected.size}
+      <div class="wx__bulk" id="wanted-bulkbar">
+        <span class="wx__bulk-count">{fmt(selected.size)} selected</span>
+        {#if can('downloads.grab')}
+          <button class="wx__bulk-btn" onclick={() => setWants(selectedRows, true)} title="Want the selected issues — automation searches for them"><Icon name="target" size={14} /> Want</button>
+          <button class="wx__bulk-btn" onclick={() => setWants(selectedRows, false)} title="Stop wanting the selected issues"><Icon name="ban" size={14} /> Don't want</button>
+          <button class="wx__bulk-btn wx__bulk-btn--primary" onclick={downloadSelected}><Icon name="download" size={14} /> Download selected</button>
+        {/if}
+        <button class="wx__bulk-btn wx__bulk-btn--ghost" onclick={() => selected.clear()}>Clear</button>
+      </div>
+    {/if}
   </div>
 
   <div class="wx__scroll">
@@ -233,39 +277,31 @@
           {#if emptyLibrary}
             <div class="wx__empty-title">Nothing tracked yet</div>
             <p class="wx__empty-body">Add a series from the <a href="/" onclick={(e) => { e.preventDefault(); navigate('/'); }}>Library</a> and its missing issues show up here.</p>
-          {:else}
+          {:else if gaps}
             <div class="wx__empty-title">{q ? 'No series match your filter' : 'Nothing missing'}</div>
-            <p class="wx__empty-body">{q ? 'Try a different search, or clear the filters.' : 'Every issue of every tracked series is in your library. New releases show up here automatically.'}</p>
+            <p class="wx__empty-body">{q ? 'Try a different search, or clear the filters.' : 'Every issue of every series in your library is on disk.'}</p>
+          {:else}
+            <div class="wx__empty-title">{q ? 'No series match your filter' : 'Nothing wanted'}</div>
+            <p class="wx__empty-body">{q ? 'Try a different search, or clear the filters.' : 'Every issue your monitoring policies ask for is in your library. Switch to All gaps to see what else is missing, and pick anything you want by hand.'}</p>
           {/if}
-        </div>
-      {/if}
-
-      {#if selCount}
-        <div class="wx__bulk">
-          <span class="wx__bulk-count">{selCount} selected</span>
-          <button class="wx__bulk-btn is-want" disabled={bulkBusy} onclick={() => markWanted(true)}>Mark wanted</button>
-          <button class="wx__bulk-btn" disabled={bulkBusy} onclick={() => markWanted(false)}>Not wanted</button>
-          {#if can('downloads.grab')}
-            <button class="wx__bulk-btn" disabled={bulkBusy} onclick={downloadSelected}>Download selected</button>
-          {/if}
-          <button class="wx__bulk-btn is-plain" onclick={clearSel}>Clear</button>
         </div>
       {/if}
 
       {#each groups as g (g.id)}
         {@const open = !collapsed[g.id]}
+        {@const allSel = g.issues.every((it) => selected.has(it.cv_issue_id))}
         <div class="wx__card">
           <div class="wx__series" role="button" tabindex="0"
             onclick={() => { collapsed = { ...collapsed, [g.id]: open }; }}
             onkeydown={(e) => { if (e.key === 'Enter') collapsed = { ...collapsed, [g.id]: open }; }}>
-            <input type="checkbox" class="wx__check" title="Select every issue shown for this series"
-              checked={g.issues.every((i) => selected.has(i.cv_issue_id))}
-              onclick={(e) => { e.stopPropagation(); selectGroup(g, e.currentTarget.checked); }} />
+            <input class="wx__check wx__check--series" type="checkbox" checked={allSel} title="Select every issue of this series"
+              onclick={(e) => e.stopPropagation()} onchange={() => toggleSeries(g)} />
             <div class="wx__cover"><Cover coverUrl={g.cover} title={g.title || '?'} /></div>
             <div class="wx__series-main">
               <div class="wx__series-title">
                 <a href={'/volume/' + g.id} onclick={(e) => { e.stopPropagation(); e.preventDefault(); navigate('/volume/' + g.id); }}>{g.title || '?'}</a>
                 {#if g.followed}<span class="wx__star" title="Following"><Icon name="star" fill size={13} /></span>{/if}
+                <span class="wx__mon wx__mon--{g.monitor || 'all'}" title="Monitoring policy — change it on the series page">{monitorLabel(g)}</span>
               </div>
               {#if g.hasBar}
                 <div class="wx__prog">
@@ -274,22 +310,23 @@
                 </div>
               {/if}
             </div>
-            <span class="wx__misspill">{fmt(g.seriesMissing ?? g.missing)} missing</span>
-            <button class="wx__unwant wx__unwant--series" title="Unwant this series — sets it Unwatched and clears its queue"
-              onclick={(e) => { e.stopPropagation(); unwantSeries(g); }}>▬ Unwant series</button>
+            <span class="wx__misspill">{fmt(g.count)} {gaps ? 'missing' : 'wanted'}</span>
+            {#if g.monitor !== 'none' || g.issues.some((i) => i.wanted)}
+              <button class="wx__unwant wx__unwant--series" title="Unwant this series — stops monitoring, drops its picks and clears its queue rows"
+                onclick={(e) => { e.stopPropagation(); unwantSeries(g); }}>▬ Unwant series</button>
+            {/if}
             <span class="wx__chev" class:is-open={open}><Icon name="chevron-right" size={16} /></span>
           </div>
           {#if open}
             <div class="wx__issues">
               {#each g.issues as it (it.cv_issue_id)}
-                <div class="wx__row" class:is-picked={selected.has(it.cv_issue_id)}>
-                  <input type="checkbox" class="wx__check" checked={selected.has(it.cv_issue_id)}
-                    onclick={(e) => toggleSel(it.cv_issue_id, e)} />
+                <div class="wx__row" class:is-unwanted={gaps && !it.wanted} class:is-selected={selected.has(it.cv_issue_id)}>
+                  <input class="wx__check" type="checkbox" checked={selected.has(it.cv_issue_id)}
+                    onclick={(e) => toggleRow(it, indexById.get(it.cv_issue_id), e.shiftKey)} />
                   <span class="wx__num">#{it.issue_number ?? '?'}</span>
                   <span class="wx__name">{it.issue_name || '—'}</span>
-                  {#if it.wanted}<span class="wx__wantpill" title="Wanted — will be searched for">wanted</span>{/if}
-                  <button class="wx__unwant" title="Unwant this issue — removes it from the wanted list and the queue"
-                    onclick={() => unwantIssue(it)}>▬ Unwant</button>
+                  {#if it.why === 'pick'}<span class="wx__why" title={whyTitle(it)}>picked</span>
+                  {:else if gaps && !it.wanted}<span class="wx__why wx__why--off" title={whyTitle(it)}>not wanted</span>{/if}
                   {#if it.queue_status && IN_FLIGHT.includes(it.queue_status)}
                     <Badge status={it.queue_status} />
                   {:else if it._busy}
@@ -298,6 +335,13 @@
                     <button class="wx__retry" onclick={() => download(it)}><Icon name="refresh" size={13} /> Retry</button>
                   {:else if can('downloads.grab')}
                     <button class="wx__dl" onclick={() => download(it)}><Icon name="download" size={13} /> Download</button>
+                  {/if}
+                  {#if can('downloads.grab')}
+                    {#if it.wanted}
+                      <button class="wx__want" title={it.why === 'pick' ? 'Stop wanting this issue' : 'Skip this issue — the policy leaves it alone from now on'} aria-label="Don't want" onclick={() => setWants([it], false)}><Icon name="ban" size={13} /></button>
+                    {:else}
+                      <button class="wx__want wx__want--on" title="Want just this issue" aria-label="Want" onclick={() => setWants([it], true)}><Icon name="target" size={13} /></button>
+                    {/if}
                   {/if}
                 </div>
               {/each}
@@ -312,47 +356,6 @@
 </main>
 
 <style>
-  /* fork: multi-select */
-  .wx__check { width: 15px; height: 15px; accent-color: var(--accent, #7c5cff); cursor: pointer; flex-shrink: 0; }
-  .wx__bulk {
-    position: sticky; top: 0; z-index: 3;
-    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-    padding: 10px 12px; margin-bottom: 10px;
-    border: 1px solid var(--line, #2a2e3b); border-radius: 10px;
-    background: var(--panel, #1a1d27);
-  }
-  .wx__bulk-count { font-weight: 600; font-size: 13px; margin-right: 4px; }
-  .wx__bulk-btn {
-    border: 1px solid var(--line, #2a2e3b); background: transparent; color: inherit;
-    border-radius: 8px; padding: 6px 12px; font-size: 12.5px; font-weight: 600; cursor: pointer;
-  }
-  .wx__bulk-btn:hover:not(:disabled) { border-color: var(--accent, #7c5cff); }
-  .wx__bulk-btn:disabled { opacity: .5; cursor: wait; }
-  .wx__bulk-btn.is-want { background: var(--accent, #7c5cff); border-color: transparent; color: #fff; }
-  .wx__bulk-btn.is-plain { opacity: .7; }
-  .wx__row.is-picked { background: color-mix(in srgb, var(--accent, #7c5cff) 12%, transparent); }
-  .wx__sort {
-    height: 30px; padding: 0 10px; border-radius: 8px; cursor: pointer;
-    background: var(--ink, #0f1117); border: 1px solid var(--line, #2a2e3b);
-    color: inherit; font-size: 12.5px;
-  }
-  .wx__sort:focus { outline: none; border-color: var(--accent, #7c5cff); }
-
-  .wx__unwant {
-    display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0;
-    height: 26px; padding: 0 10px; border-radius: 8px; cursor: pointer;
-    border: 1.5px solid rgba(248,113,113,.35); background: transparent; color: #f87171;
-    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
-  }
-  .wx__unwant:hover { background: #f87171; border-color: #f87171; color: #3d0d0d; }
-  .wx__unwant--series { margin-left: 8px; }
-
-  .wx__wantpill {
-    font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
-    padding: 2px 7px; border-radius: 20px; flex-shrink: 0;
-    background: color-mix(in srgb, var(--accent, #7c5cff) 18%, transparent); color: var(--accent, #7c5cff);
-  }
-
   /* Layout (display:flex, column, height:100%) comes from the route reveal
      rule `body.wanted .wanted-page` — the page must NOT set its own display
      here or it overrides the `.scan-page { display:none }` hide and shows on
@@ -378,47 +381,83 @@
   .wx__stat-dot { width: 7px; height: 7px; border-radius: 50%; }
   .wx__stat-val { font: 700 21px var(--font-body); margin-top: 6px; }
 
-  .wx__chips { display: flex; gap: 8px; margin-top: 14px; padding-bottom: 14px; border-bottom: 1px solid var(--line); overflow-x: auto; scrollbar-width: none; }
+  .wx__chips { display: flex; align-items: center; gap: 8px; margin-top: 14px; padding-bottom: 14px; border-bottom: 1px solid var(--line); overflow-x: auto; scrollbar-width: none; }
   .wx__chips::-webkit-scrollbar { display: none; }
   .wx__chip { display: inline-flex; align-items: center; gap: 7px; height: 34px; padding: 0 14px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: var(--muted); font: 600 12.5px var(--font-body); cursor: pointer; white-space: nowrap; flex: none; }
   .wx__chip.is-active { background: var(--accent); border-color: var(--accent); color: #fff; }
   .wx__chip--hide.is-active { background: rgba(255,194,75,.12); border-color: var(--amber); color: var(--amber); }
+  .wx__chips-sep { width: 1px; height: 22px; background: var(--line); flex: none; margin: 0 2px; }
+  .wx__sort { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; color: var(--faint); flex: none; }
+  .wx__sort select { height: 34px; padding: 0 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--ink); color: var(--muted); font: 600 12.5px var(--font-body); cursor: pointer; }
+
+  .wx__bulk { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 0 12px; border-bottom: 1px solid var(--line); background: rgba(255,45,111,.05); margin: 0 -22px; padding-left: 22px; padding-right: 22px; }
+  .wx__bulk-count { font: 600 12.5px var(--font-body); color: var(--text); margin-right: 4px; }
+  .wx__bulk-btn { height: 32px; padding: 0 13px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: var(--muted); font: 600 12.5px var(--font-body); cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+  .wx__bulk-btn:hover { color: var(--text); border-color: var(--accent); }
+  .wx__bulk-btn--primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .wx__bulk-btn--ghost { margin-left: auto; border-color: transparent; }
 
   .wx__scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 14px 22px 60px; }
   .wx__inner { max-width: 900px; margin: 0 auto; }
 
   .wx__card { border: 1px solid var(--line); border-radius: 13px; background: rgba(255,255,255,.012); margin-bottom: 14px; overflow: hidden; }
   .wx__series { display: flex; align-items: center; gap: 13px; padding: 13px 15px; cursor: pointer; }
+  .wx__check { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; flex: none; margin: 0; }
   .wx__cover :global(.cover) { width: 40px; height: 54px; border-radius: 6px; }
   .wx__series-main { flex: 1; min-width: 0; }
-  .wx__series-title { display: flex; align-items: center; gap: 8px; }
+  .wx__series-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
   .wx__series-title a { font-size: 14.5px; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .wx__series-title a:hover { color: var(--accent); }
   .wx__star { color: var(--amber); display: flex; flex: none; }
+  .wx__mon { font: 10.5px var(--font-mono); padding: 2px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--faint); white-space: nowrap; flex: none; }
+  .wx__mon--all { color: var(--green); border-color: rgba(84,214,132,.35); }
+  .wx__mon--new { color: var(--cyan); border-color: rgba(88,205,255,.35); }
   .wx__prog { display: flex; align-items: center; gap: 10px; margin-top: 7px; }
   .wx__track { display: block; flex: 1; max-width: 220px; height: 5px; border-radius: 3px; background: var(--panel-2); overflow: hidden; }
   .wx__fill { display: block; height: 100%; background: var(--accent); }
   .wx__fill.is-done { background: var(--green); }
   .wx__prog-num { font: 11px var(--font-mono); color: var(--faint); white-space: nowrap; }
+  /* fork: series-level unwant */
+  .wx__unwant {
+    display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0;
+    height: 26px; padding: 0 10px; border-radius: 8px; cursor: pointer;
+    border: 1.5px solid rgba(248,113,113,.35); background: transparent; color: #f87171;
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+  }
+  .wx__unwant:hover { background: #f87171; border-color: #f87171; color: #3d0d0d; }
+  .wx__unwant--series { margin-left: 8px; }
   .wx__misspill { font: 11px var(--font-mono); color: var(--amber); background: rgba(255,194,75,.1); border: 1px solid rgba(255,194,75,.3); border-radius: 999px; padding: 3px 10px; flex: none; }
   .wx__chev { color: #6f6885; display: flex; flex: none; transition: transform .15s; }
   .wx__chev.is-open { transform: rotate(90deg); }
 
   .wx__issues { border-top: 1px solid #2a2536; }
-  .wx__row { display: flex; align-items: center; gap: 12px; padding: 9px 15px 9px 60px; border-bottom: 1px solid #221e2c; }
+  .wx__row { display: flex; align-items: center; gap: 12px; padding: 9px 15px 9px 44px; border-bottom: 1px solid #221e2c; }
   .wx__row:last-child { border-bottom: none; }
   .wx__row:hover { background: rgba(255,255,255,.025); }
+  .wx__row.is-selected { background: rgba(255,45,111,.07); }
+  .wx__row.is-unwanted .wx__num, .wx__row.is-unwanted .wx__name { opacity: .55; }
   .wx__num { font: 600 13px var(--font-body); flex: none; }
   .wx__name { flex: 1; min-width: 0; font-size: 12.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wx__why { font: 10.5px var(--font-mono); color: var(--accent); border: 1px solid rgba(255,45,111,.35); border-radius: 999px; padding: 2px 7px; flex: none; }
+  .wx__why--off { color: var(--faint); border-color: var(--line); }
   .wx__badge-muted { font: 600 11.5px var(--font-body); color: var(--faint); flex: none; }
   .wx__dl, .wx__retry { height: 29px; padding: 0 13px; border-radius: 7px; font: 600 12px var(--font-body); cursor: pointer; display: inline-flex; align-items: center; gap: 5px; flex: none; }
   .wx__dl { border: none; background: var(--accent); color: #fff; opacity: .35; transition: opacity .12s; }
   .wx__row:hover .wx__dl { opacity: 1; }
   .wx__retry { border: 1px solid rgba(255,90,82,.4); background: rgba(255,90,82,.1); color: var(--red); }
+  .wx__want { width: 29px; height: 29px; display: grid; place-items: center; border-radius: 7px; border: 1px solid transparent; background: transparent; color: var(--faint); cursor: pointer; flex: none; opacity: .35; transition: opacity .12s, color .12s; }
+  .wx__row:hover .wx__want { opacity: 1; }
+  @media (hover: none), (pointer: coarse) {
+    /* Touch: the skip button is always visible and big enough to hit; checkboxes too. */
+    .wx__want { opacity: 1; width: 38px; height: 38px; }
+    .wx__check { width: 20px; height: 20px; }
+  }
+  .wx__want:hover { color: var(--text); border-color: var(--line); }
+  .wx__want--on { opacity: 1; color: var(--accent); }
 
   .wx__empty { padding: 70px 20px; text-align: center; }
   .wx__empty-art { width: 54px; height: 54px; margin: 0 auto 14px; border-radius: 14px; background: var(--panel-2); display: grid; place-items: center; color: var(--green); }
   .wx__empty-title { font-size: 15px; font-weight: 600; margin-bottom: 6px; }
-  .wx__empty-body { font-size: 13px; color: var(--faint); margin: 0 auto; max-width: 360px; line-height: 1.55; }
+  .wx__empty-body { font-size: 13px; color: var(--faint); margin: 0 auto; max-width: 400px; line-height: 1.55; }
   .wx__more { display: block; margin: 6px auto 0; height: 38px; padding: 0 20px; border: 1px solid var(--line); background: transparent; color: var(--muted); border-radius: 9px; font: 600 13px var(--font-body); cursor: pointer; }
 </style>

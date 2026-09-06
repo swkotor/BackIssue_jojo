@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeCvClient, normVolume, cvKey } from '../src/cv.js';
+import { makeCvClient, normVolume, cvKey, rankSearchResults } from '../src/cv.js';
 
 test('cvKey takes the first key from legacy multi-key values', () => {
   assert.equal(cvKey('a\nb , c'), 'a'); // old multi-key settings.json still loads
@@ -8,6 +8,7 @@ test('cvKey takes the first key from legacy multi-key values', () => {
   assert.equal(cvKey(''), '');
 });
 import { scoreCvCandidate, rankCandidates, matchSeriesToCv, runCvMatch, linkFilesToCv, addSeriesFromCv, autoLinkCvSeries, refreshCvVolume, migrateAdoptedSeriesToCv } from '../src/cvmatch.js';
+import config from '../src/config.js';
 import {
   openDb, upsertSeries, upsertIssue, upsertLibraryFile, linkLibraryFile,
   upsertCvSeries, getCvSeries, upsertCvIssue, listCvIssues, setSeriesCv,
@@ -643,4 +644,63 @@ test('scoreCvCandidate penalises a volume with fewer issues than the files on di
   const a = scoreCvCandidate({ title: 'Radiant Black', year: '2021' }, { name: 'Radiant Black', start_year: '2021', count_of_issues: 48 });
   const b = scoreCvCandidate({ title: 'Radiant Black', year: '2021' }, { name: 'Radiant Black', start_year: '2021', count_of_issues: 8 });
   assert.equal(a.score, b.score);
+});
+
+test('addSeriesFromCv: the "Monitor added series" setting decides a new series\' policy; re-adds only lift an unmonitored one', async () => {
+  const db = openDb(':memory:');
+  const client = volumeClient({ id: 40, name: 'Late Start', start_year: '2020', publisher: 'P', count_of_issues: 3, image_url: 'i',
+    issues: [{ id: 401, number: '1', name: 'a' }, { id: 402, number: '2', name: 'b' }, { id: 403, number: '3', name: 'c' }] });
+  const saved = config.defaultMonitor;
+  try {
+    config.defaultMonitor = 'new';
+    let r = await addSeriesFromCv(db, client, 40);
+    let s = getSeriesById(db, r.seriesId);
+    assert.equal(s.monitor, 'new');
+    assert.equal(s.monitor_from, '3', 'watermark = the newest known issue');
+    assert.equal(s.followed, 1);
+    // A "for these issues" add of an existing series leaves the policy alone.
+    r = await addSeriesFromCv(db, client, 40, { monitor: 'none' });
+    assert.equal(r.outcome, 'existing');
+    assert.equal(getSeriesById(db, r.seriesId).monitor, 'new');
+    // An unmonitored existing series is lifted to the default on a plain re-add.
+    db.prepare("UPDATE series SET monitor='none', followed=0 WHERE id=?").run(r.seriesId);
+    config.defaultMonitor = 'all';
+    await addSeriesFromCv(db, client, 40);
+    assert.equal(getSeriesById(db, r.seriesId).monitor, 'all');
+    // 'none' as the default: the series is added but nothing is wanted.
+    config.defaultMonitor = 'none';
+    const client2 = volumeClient({ id: 41, name: 'Quiet', start_year: '2021', publisher: 'P', count_of_issues: 1, image_url: 'i', issues: [{ id: 411, number: '1', name: 'a' }] });
+    r = await addSeriesFromCv(db, client2, 41);
+    s = getSeriesById(db, r.seriesId);
+    assert.equal(s.monitor, 'none');
+    assert.equal(s.followed, 0);
+    // Garbage in the setting falls back to 'all'.
+    config.defaultMonitor = 'paused';
+    const client3 = volumeClient({ id: 42, name: 'Fallback', start_year: '2022', publisher: 'P', count_of_issues: 1, image_url: 'i', issues: [{ id: 421, number: '1', name: 'a' }] });
+    r = await addSeriesFromCv(db, client3, 42);
+    assert.equal(getSeriesById(db, r.seriesId).monitor, 'all');
+  } finally { config.defaultMonitor = saved; }
+});
+
+test('rankSearchResults: the current run from a familiar publisher outranks translated reprints and odd matches', () => {
+  const raw = [
+    { id: 1, name: 'Batman', start_year: '1940', publisher: 'DC Comics', count_of_issues: 716 },
+    { id: 2, name: 'Batman', start_year: '1975', publisher: 'Murray Comics', count_of_issues: 7 },
+    { id: 3, name: 'Batman', start_year: '1992', publisher: 'Glenat Italia', count_of_issues: 48 },
+    { id: 4, name: 'Batman', start_year: '2007', publisher: 'Panini Verlag', count_of_issues: 65 },
+    { id: 5, name: 'Batman', start_year: '2016', publisher: 'DC Comics', count_of_issues: 160 },
+    { id: 6, name: 'Batman', start_year: '2025', publisher: 'DC Comics', count_of_issues: 12 },
+    { id: 7, name: 'Batman and Robin', start_year: '2023', publisher: 'DC Comics', count_of_issues: 30 },
+    { id: 8, name: 'The Batman Adventures', start_year: '1992', publisher: 'DC Comics', count_of_issues: 36 },
+  ];
+  const ids = rankSearchResults(raw, 'Batman').map((v) => v.id);
+  assert.deepEqual(ids.slice(0, 3), [5, 6, 1], 'current DC runs first, then the classic run');
+  assert.ok(ids.indexOf(4) > ids.indexOf(7) || ids.indexOf(4) > ids.indexOf(1), 'a translated reprint never beats the familiar publisher');
+  assert.ok(ids.indexOf(2) === ids.length - 1 || ids.indexOf(2) >= 5, 'a seven-issue foreign reprint sits near the bottom');
+  // The user's own publishers count as familiar.
+  const mine = rankSearchResults(raw, 'Batman', { favoured: ['Panini Verlag'] }).map((v) => v.id);
+  assert.ok(mine.indexOf(4) < mine.indexOf(3), 'a favoured publisher moves up');
+  // Non-arrays pass through; ties keep the service's order.
+  assert.equal(rankSearchResults(null, 'x'), null);
+  assert.deepEqual(rankSearchResults([{ id: 1, name: 'A' }, { id: 2, name: 'A' }], 'A').map((v) => v.id), [1, 2]);
 });

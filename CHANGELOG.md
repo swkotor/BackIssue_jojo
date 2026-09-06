@@ -8,6 +8,146 @@ by the maintainers when changes merge, so concurrent PRs don't conflict here.
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-09-05
+
+### Fixed
+
+- **The Add button is always on screen.** The library toolbar scrolled
+  sideways with a hidden scrollbar, and Add sat at its far end — off-screen at
+  every desktop width, 1920 included. The filter chips now scroll on their
+  own, with the clipped edge fading out (and a mouse wheel scrolls them), while
+  sort, view, Select, Match and Add stay put. On phones the actions get their
+  own row.
+- **Every sideways strip says when there is more.** Wanted stats and chips,
+  plugin categories, settings tabs, queue bands and release filters fade at
+  the edge that has more content instead of cutting a word in half.
+- **Adding a series finds the run you mean.** Search results are ranked:
+  closest name first, then the familiar publishers and the ones already in
+  your library, newer and longer runs ahead of older and shorter ones.
+  "Batman" now leads with the current DC runs instead of translated reprints.
+- **The weekly release notice no longer repeats after a restart.** It is
+  deduped against the notification already stored for that week.
+- **A missing series says so.** A deleted or mistyped series link shows
+  "This series isn't in your library" with a way back, instead of a header of
+  placeholders and "is the app running?". Unknown URLs get a proper
+  not-found page, and a page your account can't open explains that rather
+  than silently showing Home.
+- **The browser tab names the page** ("Wanted · BackIssue", the series
+  title on a series page), so history and tabs make sense.
+- Phones: release rows keep their download button on screen; settings source
+  cards wrap their descriptions; the Wanted skip button and checkboxes are
+  finger-sized; the home page no longer tells you to use a sidebar you
+  can't see.
+- Dates on the Releases page read as local short dates ("ships Sep 9") and
+  the last check as "checked 5m ago". Stats names the built-in metadata
+  service instead of claiming a ComicVine key.
+- The sign-in error is a sentence. A failed library load in Settings is
+  reported instead of swallowed. Viewers no longer trigger forbidden
+  admin-only requests at start-up.
+
+### Changed
+
+- **No more web fonts.** The app linked Google Fonts that its own Content
+  Security Policy blocked, so every install rendered the fallback fonts
+  anyway and logged an error on each page. The link is gone and the system
+  font stacks are now the design.
+
+- **Installing, updating or removing a plugin now says it needs a restart.**
+  The Plugins page only showed a passing toast, and its restart banner never
+  appeared for those actions (it only tracked enable/disable), so on Docker,
+  with no console to watch, the new or updated plugin silently stayed
+  inactive. The banner now names what is waiting ("Updated Reader to
+  1.4.0 — restart to apply") with the Restart now button, survives leaving
+  the page, and the catalog reflects what is on disk rather than what the
+  running process loaded.
+- **Collected editions never auto-downloaded.** Automatic search for a trade,
+  hardcover or omnibus appended an issue-style number ("Series TPB 001") that
+  no release carries, so it always came up empty while a manual search found it.
+  Collections are now searched by name (plus "v02"-style for later volumes) and
+  a numberless release is accepted for the first volume. Regular runs are
+  unchanged. Manual search, and download sources that build on the shared
+  search helpers, follow the same rules.
+
+- Official images now carry a signed release attestation that the hosted
+  metadata service uses to recognise genuine BackIssue builds. Nothing to
+  configure and nothing changes for users; builds from source keep working
+  on the service's standard tier.
+
+## [0.7.95] — 2026-09-05
+
+### Added
+
+- **Releases, richer.** Collected editions (trades, hardcovers, omnibuses) are
+  hidden by default behind a **Collections** chip; rows show the ship date,
+  cover date, series start year and volume; a release the feed couldn't place
+  on ComicVine gets a **Find** button that opens Add pre-filled with its name
+  and year; downloading a brand-new issue refreshes the series on its own
+  first. The weekly release notice names the first few issues, and a series
+  page shows **Next: #N · date** from this week's and next week's lists.
+
+### Fixed
+
+- The weekly release feed now carries a full issue name in its title field;
+  the Releases view no longer shows it as a second line under the series, and
+  it is never cached as the issue's story title.
+
+## [0.7.9] — 2026-09-04
+
+### Added
+
+- **Monitoring policies and per-issue picks.** Every series now has a
+  monitoring policy — **All issues**, **New issues from #…**, or **Off** — set
+  from the ⋯ menu on the series page or in bulk from the Library. On top of the
+  policy, any issue can be **picked** or **skipped** by hand (the target button
+  on issue rows and on the Wanted page); a pick always beats the policy, so
+  you can want one issue of a series you don't otherwise monitor, or skip one
+  issue of a run you do. Pressing Download on an issue the policy doesn't want
+  records a pick, so a failed grab keeps being retried. "Wanted" is now one
+  definition shared by the Wanted page, the search schedules and the RSS and
+  announce watchers.
+- **Wanted page: gaps, sorting, bulk selection.** The page shows what
+  automation is going after, with a *picked* marker on issues you asked for
+  and each series' policy; **All gaps** switches to every missing issue,
+  wanted or not, so anything can be wanted with one click. Sort by series,
+  newest/oldest release, or most/fewest wanted; tick rows (shift-click for a
+  range) to Want, Don't want or Download them together. Skipping a queued or
+  failed issue takes it out of the queue.
+- **Choose the default policy.** Settings → Downloading → **Monitor added
+  series** decides what a series gets when it enters the library (added by
+  hand, Discover, Releases, reading lists, requests, import): All issues,
+  New issues only, or Off. Download on add queues what that policy wants.
+- **You're told when a picked issue lands.** Whoever picked an issue (by
+  hand, from a list, or through an approved request) gets a notification when
+  it arrives, and the pick retires. Picks whose issue turned up by other means
+  (a scan, a pack) are swept up by the nightly wanted search.
+- **Ongoing / Ended filters** in the Library, from enriched publication
+  status, with the status shown on list rows; and **System → Tools → Refresh
+  series metadata**, which re-pulls every matched series (one request a
+  second, stops cleanly on a rate limit) so older series get that status,
+  enrichment and any issues published since.
+- **Want a whole reading list.** *Want all* on a list makes every issue on it
+  wanted: series already in the library get the issues picked, series that
+  aren't are added with monitoring off and just those issues picked.
+- **Download only the issues you asked for.** Settings → Downloading →
+  **Only the issues that were asked for**: when a series is added because of
+  specific issues — a reading-list entry, a release, a CBL import — it arrives
+  with monitoring off and just those issues picked, so only they are
+  downloaded (now, and again if a grab fails). Adding from the Library or
+  Discover, where no particular issue was in mind, still monitors the whole
+  run. Off by default, so nothing changes unless you turn it on.
+
+### Changed
+
+- **Library filters** gain **Monitored** beside **Not monitored**; series
+  monitoring new issues only show *new from #…* in the list view, and the bulk
+  bar has a **Monitoring…** action. The series page shows the policy as a
+  header tag, a **Wanted** count in the completion bar and a **Wanted** issue
+  filter; the old on/off *Auto-download* toggle is replaced by the policy menu.
+- Existing libraries migrate automatically: series that were auto-downloading
+  become **All issues**, everything else **Off** — nothing that was being
+  fetched stops. The Wanted page now defaults to wanted issues; the previous
+  every-gap view is the **All gaps** chip.
+
 ## [0.7.8] — 2026-09-04
 
 ### Added

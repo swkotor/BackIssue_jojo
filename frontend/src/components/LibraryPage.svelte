@@ -9,6 +9,7 @@
   import { fmt, humanBytes, windowRange } from '../lib/util.js';
   import Cover from './Cover.svelte';
   import { openAddModal } from './AddModal.svelte';
+  import { hscroll } from '../lib/hscroll.js';
   import { confirmDialog } from './DialogModal.svelte';
   import { isTrusted } from '../lib/auth.svelte.js';
   import { libraryFilterFor } from '../lib/plugins.svelte.js';
@@ -19,7 +20,10 @@
     { key: 'all', label: 'All' },
     { key: 'incomplete', label: 'Incomplete' },
     { key: 'followed', label: 'Followed' },
+    { key: 'monitored', label: 'Monitored' },
     { key: 'unmonitored', label: 'Not monitored' },
+    { key: 'ongoing', label: 'Ongoing' },
+    { key: 'ended', label: 'Ended' },
     { key: 'problems', label: 'Problems' },
     { key: 'ongoing', label: 'Continuing' },
     { key: 'ended', label: 'Finished' },
@@ -29,9 +33,6 @@
   // fork: the chip rail is long enough to squeeze the sort/view/action controls
   // off a narrow window, so it collapses to just the active chip. Device
   // preference, like the view toggle.
-  let chipsOpen = $state(localStorage.getItem('libraryChips') !== '0');
-  function toggleChips() { chipsOpen = !chipsOpen; localStorage.setItem('libraryChips', chipsOpen ? '1' : '0'); }
-  const activeFilter = $derived(FILTERS.find((f) => f.key === rail.filter) || FILTERS[0]);
 
   // fork: read progress for a series row. `read` counts FINISHED issues; the
   // denominator is the CV issue count, so it answers "how much of this series
@@ -156,6 +157,8 @@
     }
     rail.rows = [...(rail.rows || [])];
     notify(`${ids.length} series set to ${state}.`, 'ok');
+    railSelect.clear();
+    loadCollection(); // policy/picks changed server-side — chip counts and badges too
   }
 
   async function toggleMon(s) {
@@ -185,6 +188,25 @@
     const r = await apiPost('/api/collection/bulk', { ids: [...railSelect], action });
     if (r.error) return notify(r.error, 'error');
     notify(action === 'download-missing' ? `Queued ${fmt(r.queued)} issue(s).` : `Done — ${fmt(r.done)} series.`, 'ok');
+    railSelect.clear();
+    loadCollection();
+  }
+
+  // Bulk monitoring policy for the selection: all / new (from each series'
+  // newest known issue) / none.
+  async function monitorSelected(monitor) {
+    if (!railSelect.size) return notify('Select some series first.', 'info');
+    const label = monitor === 'all' ? 'Monitor every issue' : monitor === 'new' ? 'Monitor new issues only' : 'Stop monitoring';
+    if (!(await confirmDialog({
+      title: `${label} for ${railSelect.size} series?`,
+      message: monitor === 'all' ? 'Every missing issue of each series becomes wanted.'
+        : monitor === 'new' ? 'Only issues from each series\u2019 newest known issue onward are wanted — earlier gaps are left alone.'
+        : 'Nothing is fetched automatically for these series. Issues picked by hand stay wanted.',
+      confirmLabel: label,
+    }))) return;
+    const r = await apiPost('/api/collection/bulk', { ids: [...railSelect], action: 'monitor', monitor });
+    if (r.error) return notify(r.error, 'error');
+    notify(`Done — ${fmt(r.done)} series.`, 'ok');
     railSelect.clear();
     loadCollection();
   }
@@ -344,27 +366,18 @@
   <!-- toolbar: count · filters (with counts) · sort · view · actions -->
   <div class="libx__bar">
     <span class="libx__count">{isCollections ? 'Collections' : 'Library'} <span id="series-count">{rail.loaded ? fmt(rail.total) : ''}</span></span>
-    <div class="libx__filters">
-      <button class="libx__chiptoggle" title={chipsOpen ? 'Collapse the filters' : 'Show all filters'}
-        aria-expanded={chipsOpen} aria-label={chipsOpen ? 'Collapse filters' : 'Expand filters'} onclick={toggleChips}>
-        <Icon name={chipsOpen ? 'chevron-left' : 'chevron-right'} size={14} />
-      </button>
-      {#if chipsOpen}
-        {#each FILTERS as f (f.key)}
-          {@const n = rail.counts?.[f.key]}
-          <button class="libx__chip" class:is-active={rail.filter === f.key} onclick={() => pickFilter(f.key)}>
-            {f.label}{#if n}<span class="libx__chip-count">{fmt(n)}</span>{/if}
-          </button>
-        {/each}
-      {:else}
-        {@const n = rail.counts?.[activeFilter.key]}
-        <button class="libx__chip" class:is-active={rail.filter !== 'all'} title="Filters (collapsed) — click the arrow to show them all" onclick={toggleChips}>
-          {activeFilter.label}{#if n}<span class="libx__chip-count">{fmt(n)}</span>{/if}
+    <div class="libx__filters" use:hscroll>
+      {#each FILTERS as f (f.key)}
+        {@const n = rail.counts?.[f.key]}
+        <button class="libx__chip" class:is-active={rail.filter === f.key} onclick={() => pickFilter(f.key)}>
+          {f.label}{#if n}<span class="libx__chip-count">{fmt(n)}</span>{/if}
         </button>
-      {/if}
+      {/each}
     </div>
-    <!-- fork: watch-state narrowing — independent of the chips above, so
-         "Incomplete + Watched" is expressible. -->
+    <div class="libx__actions">
+    <!-- fork: watch-state narrowing — independent of the chips, so
+         "Incomplete + Watched" is expressible. Derived from the monitoring
+         policy + picks on the server (see WATCH_STATE_WHERE in db.js). -->
     <select id="coll-ws" class="libx__ws" class:is-on={!!rail.ws} title="Filter by series status" aria-label="Series status"
       value={rail.ws || ''} onchange={(e) => setQuery({ ws: e.currentTarget.value || null })}>
       <option value="">All statuses</option>
@@ -372,7 +385,6 @@
       <option value="paused">❚❚ Paused</option>
       <option value="unwatched">▬ Unwatched</option>
     </select>
-    <div class="libx__spacer"></div>
     <select id="coll-sort" class="libx__sort" title="Sort the collection" value={rail.sort}
       onchange={(e) => setQuery({ sort: e.currentTarget.value === 'title' ? null : e.currentTarget.value })}>
       <option value="title">A–Z</option>
@@ -393,10 +405,11 @@
       </button>
     {/if}
     {#if isTrusted()}
-      <button id="coll-select-btn" class="libx__act" class:is-active={rail.selecting} title="Select multiple series for bulk actions" onclick={toggleSelecting}><Icon name="check-square" size={14} /> Select</button>
-      <button id="cvmatch-btn" class="libx__act" title={cvTitle} disabled={cvBusy} onclick={startCvMatch}><span class="libx__cvicon"><Icon name="diamond" size={14} /></span>{cvText}</button>
+      <button id="coll-select-btn" class="libx__act" class:is-active={rail.selecting} title="Select multiple series for bulk actions" aria-label="Select" onclick={toggleSelecting}><Icon name="check-square" size={14} /><span class="libx__lbl">Select</span></button>
+      <button id="cvmatch-btn" class="libx__act" title={cvTitle} aria-label={cvText} disabled={cvBusy} onclick={startCvMatch}><span class="libx__cvicon"><Icon name="diamond" size={14} /></span><span class="libx__lbl">{cvText}</span></button>
       <button id="add-series-btn" class="libx__add" onclick={() => openAddModal()}><Icon name="plus" size={15} /> Add</button>
     {/if}
+    </div>
   </div>
 
   {#if rail.selecting}
@@ -411,6 +424,13 @@
         <option value="watched">Watched</option>
         <option value="paused">Paused</option>
         <option value="unwatched">Unwatched</option>
+      </select>
+      <select class="libx__movesel" title="Monitoring policy for the selected series"
+        onchange={(e) => { const v = e.currentTarget.value; e.currentTarget.value = ''; if (v) monitorSelected(v); }}>
+        <option value="">Monitoring…</option>
+        <option value="all">Monitor every issue</option>
+        <option value="new">Monitor new issues only</option>
+        <option value="none">Stop monitoring</option>
       </select>
       {#if (status.libraries || []).length}
         <select class="libx__movesel" title="Move the selected series into a library"
@@ -434,7 +454,7 @@
         <div class="libx__empty">
           <div class="libx__empty-art"><Icon name="home" size={26} /></div>
           <div class="libx__empty-title">Welcome back</div>
-          <div class="libx__empty-body">Your reading shelves appear here as you read. Pick a library from the sidebar to browse everything in it.</div>
+          <div class="libx__empty-body">Your reading shelves appear here as you read. Pick a library to browse everything in it. Shelves you've hidden can be turned back on from your profile.</div>
         </div>
       {:else if !railHasContent}
         <!-- Skeleton shelves while the plugin rails fetch — unmounts the moment
@@ -483,6 +503,7 @@
                 </span>
               {/if}
               {#if s.followed}<span class="libx-card__star" title="Followed"><Icon name="star" fill size={15} /></span>{/if}
+              {#if s.matched && s.monitor && s.monitor !== 'all'}<span class="libx-card__mon" title={s.monitor === 'new' ? `Monitoring new issues from #${s.monitor_from ?? '?'}` : 'Not monitored — nothing is fetched automatically'}><Icon name={s.monitor === 'new' ? 'zap' : 'pause'} size={12} /></span>{/if}
               {#if !s.matched}<span class="libx-card__matchchip">match…</span>{/if}
               {#if s.matched}<div class="libx-card__bar"><div class="libx-card__fill" class:is-done={isDone(s)} style="width:{pct(s)}%"></div></div>{/if}
             </div>
@@ -542,6 +563,9 @@
                   {:else if s.on_demand}<span class="libx-badge libx-badge--avail"><Icon name="download" size={12} /> {fmt(s.available)} available</span>
                   {:else if s.total > 0}<span class="libx-badge libx-badge--ok">complete</span>{/if}
                   {#if s.untagged > 0}<span class="libx-badge libx-badge--plain">{fmt(s.untagged)} untagged</span>{/if}
+                  {#if s.pub_status && s.pub_status !== 'Ongoing'}<span class="libx-badge libx-badge--plain" title="Publication status (from enriched metadata)">{s.pub_status.toLowerCase()}</span>{/if}
+                  {#if s.monitor === 'new'}<span class="libx-badge libx-badge--plain" title="Only issues from this number onward are wanted">new from #{s.monitor_from ?? '?'}</span>
+                  {:else if s.monitor === 'none' && s.missing > 0}<span class="libx-badge libx-badge--plain" title="Nothing is fetched automatically for this series">not monitored</span>{/if}
                   {#if s.corrupt > 0}<span class="libx-badge libx-badge--warn">{fmt(s.corrupt)} corrupt</span>{/if}
                   {#if s.restricted}<span class="libx-badge libx-badge--plain" title="Mature — hidden from roles without “View mature content”">mature</span>{/if}
                 {/if}
@@ -594,17 +618,15 @@
 
 <style>
   .libx { display: flex; flex-direction: column; height: 100%; min-height: 0; }
-  .libx__bar { display: flex; align-items: center; gap: 8px; padding: 11px 18px; border-bottom: 1px solid var(--line); flex: none; overflow-x: auto; scrollbar-width: none; }
-  .libx__bar::-webkit-scrollbar { display: none; }
+  /* The bar itself never scrolls: the chip row is the scroll container (with
+     edge fades), and the actions cluster — Add above all — stays on screen at
+     every width. Narrow screens put the actions on their own row. */
+  .libx__bar { display: flex; align-items: center; gap: 8px; padding: 11px 18px; border-bottom: 1px solid var(--line); flex: none; }
+  .libx__actions { display: flex; align-items: center; gap: 8px; flex: none; margin-left: auto; }
+  .libx__lbl { display: inline; }
   .libx__count { font: 13px var(--font-mono); color: var(--faint); white-space: nowrap; flex: none; }
   .libx__count span { color: var(--text); }
-  .libx__filters { display: flex; align-items: center; gap: 6px; flex: none; }
-  .libx__chiptoggle {
-    width: 26px; height: 32px; flex: none; display: grid; place-items: center;
-    border: 1px solid var(--line); border-radius: 8px; background: transparent;
-    color: var(--faint); cursor: pointer;
-  }
-  .libx__chiptoggle:hover { color: var(--text); border-color: var(--muted); }
+  .libx__filters { display: flex; align-items: center; gap: 6px; flex: 1 1 auto; min-width: 0; padding: 2px 0; }
   /* fork: series-status narrowing select */
   .libx__ws { flex: none; }
   .libx__ws.is-on { border-color: rgba(52,211,153,.55); color: #34d399; font-weight: 600; }
@@ -612,7 +634,6 @@
   .libx__chip.is-active { background: var(--accent); border-color: var(--accent); color: #fff; }
   .libx__chip-count { font: 600 10.5px var(--font-mono); background: var(--panel-2); color: var(--faint); border-radius: 999px; padding: 1px 6px; }
   .libx__chip.is-active .libx__chip-count { background: rgba(255,255,255,.2); color: #fff; }
-  .libx__spacer { flex: 1; min-width: 8px; }
   .libx__sort { height: 32px; padding: 0 10px; background: var(--ink); border: 1px solid var(--line); border-radius: 8px; color: var(--text); font: 12.5px var(--font-body); flex: none; }
   .libx__sort:focus { outline: none; border-color: var(--accent); }
   .libx__view { display: flex; background: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 2px; flex: none; }
@@ -647,6 +668,7 @@
   .libx-card__check { position: absolute; top: 7px; left: 7px; z-index: 3; width: 22px; height: 22px; border-radius: 6px; border: 2px solid rgba(255,255,255,.7); background: rgba(0,0,0,.35); display: grid; place-items: center; color: #fff; }
   .libx-card__check.is-on { border-color: var(--accent); background: var(--accent); }
   .libx-card__star { position: absolute; top: 7px; right: 7px; z-index: 3; color: var(--amber); filter: drop-shadow(0 1px 2px rgba(0,0,0,.6)); display: flex; }
+  .libx-card__mon { position: absolute; top: 7px; left: 7px; z-index: 3; width: 20px; height: 20px; border-radius: 6px; display: grid; place-items: center; background: rgba(12,10,18,.75); color: var(--muted); border: 1px solid rgba(255,255,255,.12); }
   .libx-card__matchchip { position: absolute; left: 7px; bottom: 12px; z-index: 3; font: 600 10px var(--font-body); text-transform: uppercase; letter-spacing: .04em; color: var(--ink); background: var(--amber); border-radius: 5px; padding: 3px 7px; }
   .libx-card__bar { position: absolute; left: 0; right: 0; bottom: 0; z-index: 3; height: 5px; background: rgba(0,0,0,.5); }
   .libx-card__fill { height: 100%; background: var(--accent); }
@@ -794,7 +816,16 @@
     .railskel__title, .railskel__card { animation: none; background: var(--panel); }
   }
 
+  @media (max-width: 960px) {
+    .libx__lbl { display: none; }
+    .libx__act { padding: 0 11px; }
+  }
   @media (max-width: 760px) {
+    .libx__bar { flex-wrap: wrap; row-gap: 10px; padding: 10px 12px; }
+    .libx__count { display: none; }
+    .libx__filters { order: 2; flex-basis: 100%; }
+    .libx__actions { margin-left: auto; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+    .libx__sort { max-width: 104px; }
     .libx-grid { grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 14px; }
     .libx-list__head, .libx-row { grid-template-columns: 46px 1fr auto auto 1fr 34px; }
     .libx-col--wide { display: none; }

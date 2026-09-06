@@ -207,28 +207,55 @@
   let addingSeries = $state(0); // cv_series_id in flight
   async function addSeries(it) {
     addingSeries = it.cv_series_id;
-    const r = await apiPost('/api/collection/add-cv', { comicvineId: it.cv_series_id });
+    // Every issue of that volume on THIS list is what the user is after — with
+    // "only the issues that were asked for" on, that's all that gets queued.
+    const cvIssueIds = rows.filter((x) => x.cv_series_id === it.cv_series_id && x.cv_issue_id).map((x) => x.cv_issue_id);
+    const r = await apiPost('/api/collection/add-cv', { comicvineId: it.cv_series_id, cvIssueIds, reason: `list:${det.id}` });
     addingSeries = 0;
     if (r.error) return notify(r.error, 'error');
-    notify(`Added "${it.series_title || 'series'}" to the library.`, 'ok');
+    const queued = r.queued ? (r.scope === 'requested'
+      ? ` — queued ${fmt(r.queued)} issue${r.queued === 1 ? '' : 's'} from this list`
+      : ` — queued ${fmt(r.queued)} missing issue${r.queued === 1 ? '' : 's'}`)
+      : r.picked ? ` — wanting ${fmt(r.picked)} issue${r.picked === 1 ? '' : 's'} from this list` : '';
+    notify(`Added "${it.series_title || 'series'}" to the library${queued}.`, 'ok');
     refresh(); // every item of that series resolves its series_id now
   }
 
-  // fork: mark every issue on this list wanted. Series the list references but
-  // the library doesn't track yet get added and parked as UNWATCHED, so only
-  // the list's own issues end up wanted — not the rest of the volume.
-  let wantBusy = $state(false);
-  async function wantList(wanted) {
-    wantBusy = true;
-    const r = await apiPost(`/api/lists/${det.id}/want`, { wanted, addMissingSeries: wanted });
-    wantBusy = false;
+  // Want the whole list: issues of series already in the library are picked,
+  // series that aren't get added unmonitored with their issues picked — so
+  // automation goes after exactly the list, nothing more.
+  const wantable = $derived(rows.filter((r) => !r.owned && r.cv_issue_id && r.cv_series_id));
+  let wanting = $state(false);
+  async function wantList() {
+    if (!wantable.length || wanting) return;
+    const unadded = new Set(wantable.filter((r) => !r.series_id).map((r) => r.cv_series_id)).size;
+    if (!(await confirmDialog({
+      title: `Want ${fmt(wantable.length)} issue${wantable.length === 1 ? '' : 's'} from this list?`,
+      message: (unadded ? `${fmt(unadded)} series ${unadded === 1 ? 'is' : 'are'} not in the library yet — ${unadded === 1 ? 'it is' : 'they are'} added without monitoring, so only the issues on this list are fetched. ` : '')
+        + 'Automation searches for every wanted issue and downloads it when a source has it.',
+      confirmLabel: 'Want them',
+    }))) return;
+    wanting = true;
+    let r;
+    try { r = await apiPost(`/api/lists/${det.id}/want`, {}); } catch { r = { error: 'Could not reach the app.' }; }
+    wanting = false;
     if (r?.error) return notify(r.error, 'error');
-    const bits = [`${wanted ? 'Wanted' : 'Un-wanted'} ${fmt(r.updated)} issue(s)`];
-    if (r.seriesAdded?.length) bits.push(`added ${fmt(r.seriesAdded.length)} series (unwatched)`);
-    if (r.dequeued) bits.push(`removed ${fmt(r.dequeued)} from the queue`);
-    if (r.skipped) bits.push(`${fmt(r.skipped)} skipped (series not in the library)`);
-    notify(bits.join(' · '), 'ok');
-    for (const e of r.errors || []) notify(e, 'error');
+    notify(`Wanting ${fmt(r.issues)} issue${r.issues === 1 ? '' : 's'}${r.added ? ` — added ${fmt(r.added)} series` : ''}${r.failed ? ` (${fmt(r.failed)} series could not be added)` : ''}.`, r.failed ? 'warn' : 'ok');
+    refresh();
+  }
+
+  // fork: the reverse — drop every issue on the list from wanted (picks
+  // cleared or skip-picked as the policy needs) and out of the download queue.
+  let unwanting = $state(false);
+  async function unwantList() {
+    const ids = rows.filter((r) => !r.owned && r.cv_issue_id && r.series_id).map((r) => r.cv_issue_id);
+    if (!ids.length || unwanting) return;
+    unwanting = true;
+    let r;
+    try { r = await apiPost('/api/issues/wanted', { cvIssueIds: ids, wanted: false }); } catch { r = { error: 'Could not reach the app.' }; }
+    unwanting = false;
+    if (r?.error) return notify(r.error, 'error');
+    notify(`Un-wanted ${fmt(ids.length)} issue${ids.length === 1 ? '' : 's'}${r.dequeued ? ` · removed ${fmt(r.dequeued)} from the queue` : ''}.`, 'ok');
     refresh();
   }
 
@@ -612,15 +639,10 @@
           <div class="listx__dsummary">{ownedCount}/{rows.length} owned{det.arc_cv_id ? ' · from a ComicVine arc' : det.source ? ' · from a CBL reading list' : ''}{det.mine === false ? ` · shared by ${det.owner || 'another user'}` : ''}{det.public && det.mine !== false ? ' · shared with everyone' : ''}</div>
         </div>
         <div class="listx__dactions">
-          {#if rows.length && can('library.manage')}
-            <button class="listx__want" disabled={wantBusy} onclick={() => wantList(true)}
-              title="Mark every issue on this list as wanted. Series not in the library are added and left unwatched, so only these issues get wanted.">
-              <Icon name="star" size={15} fill /> {wantBusy ? 'Working…' : `Want all (${fmt(rows.length)})`}
-            </button>
-            <button class="listx__unwant" disabled={wantBusy} onclick={() => wantList(false)}
-              title="Mark every issue on this list as not wanted (also removes them from the download queue)">
-              <Icon name="star" size={15} /> Unwant all
-            </button>
+          {#if wantable.length && can('library.manage')}
+            <button class="listx__want" disabled={wanting} title="Make every issue on this list wanted — series not in the library yet are added for just these issues" onclick={wantList}><Icon name="target" size={15} /> {wanting ? 'Wanting…' : `Want all (${fmt(wantable.length)})`}</button>
+            <button class="listx__unwant" disabled={unwanting} title="Mark every issue on this list as not wanted (also removes them from the download queue)"
+              onclick={unwantList}><Icon name="star" size={15} /> {unwanting ? 'Working…' : 'Unwant all'}</button>
           {/if}
           {#if missing.length && can('downloads.grab')}
             <button class="listx__dl" onclick={downloadMissing}><Icon name="download" size={15} /> Download missing ({fmt(missing.length)})</button>
@@ -741,6 +763,8 @@
   .listx__dsummary { font: 11.5px var(--font-mono); color: var(--faint); margin-top: 3px; }
   .listx__dactions { margin-left: auto; display: flex; gap: 9px; }
   .listx__dl { height: 36px; padding: 0 15px; border: none; background: var(--accent); color: #fff; border-radius: 8px; font: 600 12.5px var(--font-body); cursor: pointer; display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
+  .listx__want { height: 36px; padding: 0 14px; border-radius: 8px; border: 1px solid rgba(255,45,111,.45); background: rgba(255,45,111,.08); color: var(--accent); font: 600 12.5px var(--font-body); cursor: pointer; display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
+  .listx__want:disabled { opacity: .6; cursor: default; }
   .listx__share { display: inline-flex; align-items: center; gap: 6px; height: 36px; padding: 0 13px; border: 1px solid var(--line); background: transparent; color: var(--faint); border-radius: 8px; font: 600 12.5px var(--font-body); cursor: pointer; }
   .listx__share:hover { color: var(--text); border-color: var(--accent); }
   .listx__del { height: 36px; padding: 0 13px; border: 1px solid rgba(255,90,82,.35); background: transparent; color: var(--red); border-radius: 8px; font: 600 12.5px var(--font-body); cursor: pointer; }

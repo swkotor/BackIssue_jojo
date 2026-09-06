@@ -7,7 +7,7 @@ import fssync from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import config from './config.js';
 import { initCountWorker, workerGetRow } from './countWorker.js';
-import { listSeries, listIssues, queueIssues, countByStatus, requeueFailed, clearFailed, setFollowed, listQueue, cancelQueued, cancelIssue, collectionSeries, collectionCounts, collectionPage, buildCollCountSql, collCountRowToResult, seriesCollectionDetail, setSeriesPath, getSeriesById, getSeriesByCvId, getCvIssue, ensureCvIssueRow, clearIssuesForRedownload, listImportHistory, listFailedGrabs, listBlacklist, deleteBlacklistEntry, clearBlacklist, listWantedIssues, activePackGrabs, listCvIssues, setSeriesRestricted, isSeriesRestricted, setSeriesType, restrictedSeriesIds, isCvIssueRestricted, createLibrary, listLibraries, libraryFolders, updateLibrary, deleteLibrary, assignSeriesLibrary, setUserFollow, updateCvSeriesUser, updateCvIssueUser, resetCvSeriesUser, resetCvIssueUser, setSeriesWatchState, setIssuesWanted, clearIssueWants, seriesWantedCounts, dequeueUnwantedIssues, cvIssueIdsForIssueRows, WATCH_STATES } from './db.js';
+import { listSeries, listIssues, queueIssues, countByStatus, requeueFailed, clearFailed, setFollowed, listQueue, cancelQueued, cancelIssue, collectionSeries, collectionCounts, collectionPage, buildCollCountSql, collCountRowToResult, seriesCollectionDetail, setSeriesPath, getSeriesById, getSeriesByCvId, getCvIssue, ensureCvIssueRow, clearIssuesForRedownload, listImportHistory, listFailedGrabs, listBlacklist, deleteBlacklistEntry, clearBlacklist, listWantedIssues, activePackGrabs, listCvIssues, setSeriesRestricted, isSeriesRestricted, setSeriesType, restrictedSeriesIds, isCvIssueRestricted, createLibrary, listLibraries, libraryFolders, updateLibrary, deleteLibrary, assignSeriesLibrary, setUserFollow, updateCvSeriesUser, updateCvIssueUser, resetCvSeriesUser, resetCvIssueUser, setMonitor, setIssueWants, clearIssuePicks, wantStates, MONITOR_STATES, setSeriesWatchState, setIssuesWanted, clearIssueWants, seriesWantedCounts, dequeueUnwantedIssues, cvIssueIdsForIssueRows, WATCH_STATES } from './db.js';
 import { resolveSeriesDir, defaultRootedDir } from './paths.js';
 import { planSeries, refileSeries, planLibrary, canRefile } from './refile.js';
 import { seriesFolderFromPattern, fileStemFromPattern } from './naming.js';
@@ -17,7 +17,7 @@ import { testIndexer } from './newznab.js';
 import { testClient } from './nzbclients.js';
 import { testTorznabIndexer } from './torznab.js';
 import { testTorrentClient } from './torrentclients.js';
-import { pluginsDir, pluginCatalog, setPluginEnabled, registeredRoutes, registeredPermissions, registeredAuthProviders, registeredCredentialProviders, pluginLibraryTypes, registeredLibraryScanners, registeredCollectionFilters } from './plugins.js';
+import { pluginsDir, pluginCatalog, setPluginEnabled, markPluginPending, pendingPluginChanges, installedOnDisk, registeredRoutes, registeredPermissions, registeredAuthProviders, registeredCredentialProviders, pluginLibraryTypes, registeredLibraryScanners, registeredCollectionFilters } from './plugins.js';
 import { fetchCatalog, installPlugin, uninstallPlugin } from './plugincatalog.js';
 import { logWarn } from './logstore.js';
 import * as users from './users.js';
@@ -263,6 +263,8 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     [/^\/api\/naming\//, 'settings.manage'],
     // Reading lists + notifications are personal (each user manages their own;
     // ownership is enforced in the handlers) — any signed-in user, incl. writes.
+    // Wanting a whole list can add series to the library — library management.
+    [/^\/api\/lists\/\d+\/want$/, 'library.manage'],
     [/^\/api\/lists/, 'library.view'],
     // fork: the Publishers browser is a read view of the library
     [/^\/api\/publishers/, 'library.view'],
@@ -297,7 +299,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     [/^\/api\/blacklist(\/|$)/, 'downloads.grab'],
   ];
   const DOWNLOAD_RULES = [
-    /^\/api\/collection\/\d+\/(download|redownload)$/,
+    /^\/api\/collection\/\d+\/(download|redownload|wanted)$/, // picking an issue = asking for it, same as Download
     /^\/api\/redownload$/,
     /^\/api\/download$/,                  // bulk download-by-issue-id
     /^\/api\/wanted\/download-all$/,
@@ -508,7 +510,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
       }
     }
     users.authFailed(key);
-    return res.status(401).json({ error: 'wrong username or password' });
+    return res.status(401).json({ error: 'Wrong username or password.' });
   });
   app.post('/api/auth/logout', (req, res) => {
     users.destroySession(db, readCookie(req));
@@ -721,6 +723,31 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   app.get('/api/lists/cbl-catalog', async (req, res) => {
     try { res.json({ files: await cbl.cblCatalog() }); } catch (e) { listErr(res, e); }
   });
+  // Want a whole reading list: every issue on it becomes wanted — series already
+  // in the library get picks, series that aren't are added unmonitored with
+  // their issues picked (so nothing but the list's issues is fetched).
+  app.post('/api/lists/:id/want', async (req, res) => {
+    const l = lists.getList(db, req.user.id, Number(req.params.id), { includeRestricted: canRestricted(req) });
+    if (!l) return res.status(404).json({ error: 'not found' });
+    const reason = `list:${l.id}`;
+    const byVolume = new Map();
+    for (const it of l.items) {
+      if (!it.cv_series_id || !it.cv_issue_id || it.owned) continue;
+      if (!byVolume.has(it.cv_series_id)) byVolume.set(it.cv_series_id, { seriesId: it.series_id || null, ids: [] });
+      byVolume.get(it.cv_series_id).ids.push(it.cv_issue_id);
+    }
+    let added = 0, picked = 0, failed = 0;
+    for (const [cvVolumeId, v] of byVolume) {
+      let sid = v.seriesId;
+      if (sid == null) {
+        try { const r = await addFromCv(cvVolumeId, { monitor: 'none' }); sid = r?.seriesId ?? null; if (sid != null) added++; }
+        catch (e) { failed++; logWarn(`want list: could not add volume ${cvVolumeId}: ${e?.message || e}`, 'collection'); continue; }
+      }
+      if (sid == null) { failed++; continue; }
+      picked += setIssueWants(db, sid, v.ids, true, { reason, userId: req.user.id }).changed;
+    }
+    res.json({ added, picked, failed, issues: [...byVolume.values()].reduce((n, v) => n + v.ids.length, 0) });
+  });
   app.get('/api/lists/:id', (req, res) => {
     const l = lists.getList(db, req.user.id, Number(req.params.id), { includeRestricted: canRestricted(req) });
     if (!l) return res.status(404).json({ error: 'no such list' });
@@ -748,52 +775,6 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     try { lists.deleteList(db, req.user.id, Number(req.params.id)); res.json({ ok: true }); }
     catch (e) { listErr(res, e); }
   });
-  // --- fork: "want everything on this list" -------------------------------
-  // Marks every issue on the list explicitly wanted, and (optionally) adds any
-  // series the list references that we don't track yet. Newly added series are
-  // parked as UNWATCHED so nothing beyond the list's own issues gets wanted —
-  // the per-issue overrides written afterwards are what make the list issues
-  // wanted. Series already in the library keep their own watch state.
-  app.post('/api/lists/:id/want', async (req, res) => {
-    if (!users.roleGrants(db, req.user.role, 'library.manage', permCatalog)) {
-      return res.status(403).json({ error: "your role doesn't include the permission: Manage the library" });
-    }
-    const id = Number(req.params.id);
-    const body = req.body || {};
-    const addMissing = body.addMissingSeries !== false;
-    const load = () => lists.getList(db, req.user.id, id, { includeRestricted: canRestricted(req) });
-    let l = load();
-    if (!l) return res.status(404).json({ error: 'no such list' });
-
-    const errors = [];
-    const addedSeries = [];
-    if (addMissing) {
-      const need = [...new Set(l.items.filter((it) => !it.series_id && it.cv_series_id).map((it) => it.cv_series_id))];
-      for (const cvId of need) {
-        try {
-          const r = await addFromCv(cvId);
-          if (r?.seriesId != null) {
-            // Park it: only the list's own issues should be wanted.
-            setSeriesWatchState(db, r.seriesId, 'unwatched');
-            addedSeries.push({ id: r.seriesId, cv_id: cvId, title: r.title || null });
-          }
-        } catch (e) { errors.push(`series ${cvId}: ${String(e?.message || e)}`); }
-      }
-      if (addedSeries.length) l = load() || l;
-    }
-
-    // Only issues whose series we actually track can be wanted (an override on
-    // an untracked volume has nothing to download from).
-    const ids = l.items.filter((it) => it.series_id).map((it) => it.cv_issue_id);
-    const skipped = l.items.length - ids.length;
-    try {
-      const wanted = body.wanted === false ? false : true;
-      const n = setIssuesWanted(db, ids, wanted);
-      const dequeued = wanted ? 0 : dequeueUnwantedIssues(db, ids);
-      res.json({ updated: n, wanted, skipped, seriesAdded: addedSeries, dequeued, errors });
-    } catch (e) { res.status(500).json({ error: String(e?.message || e) }); }
-  });
-
   app.post('/api/lists/:id/items', (req, res) => {
     try { res.json({ added: lists.addItems(db, req.user.id, Number(req.params.id), (req.body || {}).cvIssueIds) }); }
     catch (e) { listErr(res, e); }
@@ -910,7 +891,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   // plugins register routes/jobs/sources at boot and can't be hot-unloaded).
   app.get('/api/plugins', (req, res) => {
     const plugins = pluginCatalog();
-    res.json({ plugins, restartRequired: plugins.some((p) => p.restartRequired) });
+    res.json({ plugins, restartRequired: plugins.some((p) => p.restartRequired), pending: pendingPluginChanges() });
   });
   // Restart the app process (plugin toggles apply at boot). Under Docker the
   // restart policy revives the container; bare processes re-exec themselves.
@@ -926,23 +907,25 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     if (enabled) disabled.delete(name); else disabled.add(name);
     saveSettings({ disabledPlugins: [...disabled].join(',') });
     const plugins = pluginCatalog();
-    res.json({ plugins, restartRequired: plugins.some((p) => p.restartRequired) });
+    res.json({ plugins, restartRequired: plugins.some((p) => p.restartRequired), pending: pendingPluginChanges() });
   });
 
   // Plugin catalog: the installable first-party plugins offered by the remote
-  // manifest, cross-referenced with what's already on disk.
+  // manifest, cross-referenced with what's on disk NOW (not what this process
+  // loaded at boot) so a just-installed or just-updated plugin reads as such.
   app.get('/api/plugins/catalog', async (req, res) => {
     let available;
     try { available = await fetchCatalog(); }
     catch (e) { return res.status(502).json({ error: 'could not reach the plugin catalog: ' + String(e?.message || e) }); }
-    const installed = new Map(pluginCatalog().map((p) => [p.name, p]));
+    const onDisk = installedOnDisk();
     const plugins = available.map((a) => {
-      const inst = installed.get(a.id);
+      const has = onDisk.has(a.id);
+      const ver = has ? onDisk.get(a.id) : null;
       return {
         id: a.id, name: a.name || a.id, description: a.description || '', version: a.version || null,
-        installed: !!inst,
-        installedVersion: inst?.version || null,
-        updateAvailable: !!(inst && a.version && inst.version && a.version !== inst.version),
+        installed: has,
+        installedVersion: ver,
+        updateAvailable: !!(has && a.version && ver && a.version !== ver),
       };
     });
     res.json({ plugins });
@@ -954,9 +937,11 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     catch { return res.status(502).json({ error: 'plugin catalog unreachable' }); }
     const entry = available.find((p) => p.id === id);
     if (!entry) return res.status(404).json({ error: 'plugin not found in the catalog' });
+    const wasInstalled = installedOnDisk().has(entry.id);
     try {
       const r = await installPlugin(entry);
-      res.json({ installed: r.id, version: r.version, restartRequired: true });
+      markPluginPending(r.id, wasInstalled ? 'updated' : 'installed', r.version);
+      res.json({ installed: r.id, version: r.version, updated: wasInstalled, restartRequired: true, pending: pendingPluginChanges() });
     } catch (e) {
       res.status(400).json({ error: 'install failed: ' + String(e?.message || e) });
     }
@@ -965,7 +950,8 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     const id = String((req.body || {}).id || '');
     try {
       const r = uninstallPlugin(id);
-      res.json({ removed: r.removed, restartRequired: true });
+      if (r.removed) markPluginPending(id, 'removed');
+      res.json({ removed: r.removed, restartRequired: true, pending: pendingPluginChanges() });
     } catch (e) {
       res.status(400).json({ error: String(e?.message || e) });
     }
@@ -1074,6 +1060,10 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
       return row && row.status === 'done' && (!row.file_path || !fssync.existsSync(row.file_path));
     });
     if (staleDone.length) clearIssuesForRedownload(db, staleDone);
+    // Asking for an issue by hand is a want: automation keeps after it if this
+    // grab fails, and the Wanted page can say why it's there. (No-op where the
+    // series' policy already wants it.)
+    setIssueWants(db, seriesId, cvIssueIds, true, { reason: 'manual', userId: req.user?.id ?? null });
     queueIssues(db, ids);
     startDownloads(ids);
     res.json({ queued: ids.length });
@@ -1274,6 +1264,8 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     const offset = Math.max(0, Number(req.query.offset) || 0);
     res.json(listWantedIssues(db, {
       limit, offset,
+      scope: req.query.scope === 'gaps' ? 'gaps' : 'wanted', // gaps = every missing issue, wanted or not
+      sort: String(req.query.sort || 'series'),
       userFollowedOnly: req.query.followed === '1', // the "Following" chip = the caller's ☆ stars
       hideUnreleased: req.query.hideUnreleased === '1',
       search: String(req.query.q || '').trim(),
@@ -1356,6 +1348,13 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
       for (const id of ids) setUserFollow(db, req.user.id, id, action === 'follow');
       return res.json({ done: ids.length });
     }
+    if (action === 'monitor') {
+      // Bulk monitoring policy: all / new (from the newest known issue) / none.
+      const monitor = String(req.body?.monitor || '');
+      if (!MONITOR_STATES.includes(monitor)) return res.status(400).json({ error: 'monitor must be all, new or none' });
+      for (const id of ids) setMonitor(db, id, monitor);
+      return res.json({ done: ids.length });
+    }
     if (action === 'move-library') {
       // Bulk move into a library (or back to the default with libraryId null).
       // Same semantics as the single-series move: the library's type (and
@@ -1378,6 +1377,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
         const missing = db.prepare(`SELECT ci.comicvine_id id, ci.issue_number, ci.name FROM cv_issues ci
           WHERE ci.cv_series_id=? AND NOT EXISTS (SELECT 1 FROM library_files lf WHERE lf.cv_issue_id=ci.comicvine_id AND lf.valid=1)`).all(s.cv_id);
         for (const m of missing) qids.push(ensureCvIssueRow(db, { seriesId: sid, cvIssueId: m.id, number: m.issue_number, title: m.name }));
+        setIssueWants(db, sid, missing.map((m) => m.id), true, { reason: 'manual', userId: req.user?.id ?? null });
       }
       queueIssues(db, qids);
       startDownloads(qids);
@@ -1388,15 +1388,23 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
 
   // Queue one tracked weekly release (series + issue number) straight from the
   // Releases drawer.
-  app.post('/api/releases/download', (req, res) => {
+  app.post('/api/releases/download', async (req, res) => {
     const seriesId = Number(req.body?.seriesId);
     const number = String(req.body?.number ?? '');
     const s = getSeriesById(db, seriesId);
     if (!s?.cv_id) return res.status(400).json({ error: 'series not matched to ComicVine' });
     const want = normalizeNumber(number);
-    const ci = listCvIssues(db, s.cv_id).find((x) => normalizeNumber(x.issue_number) === want);
-    if (!ci) return res.status(404).json({ error: `issue #${number} isn't in the ComicVine volume yet — Refresh the series first` });
+    const find = () => listCvIssues(db, s.cv_id).find((x) => normalizeNumber(x.issue_number) === want);
+    let ci = find();
+    // A release-day issue is often newer than the cached volume: refresh the
+    // volume once and look again before giving up.
+    if (!ci && typeof refreshVolume === 'function') {
+      try { await refreshVolume(seriesId); } catch { /* the message below explains */ }
+      ci = find();
+    }
+    if (!ci) return res.status(404).json({ error: `issue #${number} isn't listed on ComicVine yet — try again in a day or two` });
     const id = ensureCvIssueRow(db, { seriesId, cvIssueId: ci.comicvine_id, number: ci.issue_number, title: ci.name });
+    setIssueWants(db, seriesId, [ci.comicvine_id], true, { reason: 'release', userId: req.user?.id ?? null });
     queueIssues(db, [id]);
     startDownloads([id]);
     res.json({ queued: 1 });
@@ -1407,16 +1415,22 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     const b = req.body || {};
     const { items } = listWantedIssues(db, {
       limit: 500, offset: 0,
+      scope: b.scope === 'gaps' ? 'gaps' : 'wanted',
       userFollowedOnly: !!b.followed, hideUnreleased: !!b.hideUnreleased,
       search: String(b.q || '').trim(),
       userId: req.user?.id ?? 0, // "download all my Following" respects the caller's stars
     });
     const ids = [];
+    const bySeries = new Map();
     for (const it of items) {
       // Skip ones already moving through the pipeline.
       if (it.queue_status && ['queued', 'grabbed', 'downloading', 'tagging'].includes(it.queue_status)) continue;
       ids.push(ensureCvIssueRow(db, { seriesId: it.series_id, cvIssueId: it.cv_issue_id, number: it.issue_number, title: it.issue_name }));
+      if (!bySeries.has(it.series_id)) bySeries.set(it.series_id, []);
+      bySeries.get(it.series_id).push(it.cv_issue_id);
     }
+    // Downloading a gap by hand is a want (no-op for issues the policy already wants).
+    for (const [sid, cvIds] of bySeries) setIssueWants(db, sid, cvIds, true, { reason: 'manual', userId: req.user?.id ?? null });
     queueIssues(db, ids);
     startDownloads(ids);
     res.json({ queued: ids.length });
@@ -1428,7 +1442,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
 
   // Filter-chip keys — the badges are independent of the active filter, so
   // switching chips never changes them.
-  const COLLECTION_CHIP_KEYS = ['all', 'incomplete', 'followed', 'unmonitored', 'problems', 'unmatched', 'manga'];
+  const COLLECTION_CHIP_KEYS = ['all', 'incomplete', 'followed', 'monitored', 'unmonitored', 'ongoing', 'ended', 'problems', 'unmatched', 'manga'];
   // Chip counts run OFF the main thread (worker + its own read-only WAL
   // connection) behind a short TTL cache. better-sqlite3 is synchronous, and
   // this is the app's heaviest read: inline it froze the event loop ~0.5-1s at
@@ -1612,6 +1626,10 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     const d = seriesCollectionDetail(db, Number(req.params.id), req.user.id);
     if (!d) return res.status(404).json({ error: 'not found' });
     const row = getSeriesById(db, Number(req.params.id));
+    // What ships next for this series, from the weekly release list (this
+    // week + next), so the page can say "Next: #12 · 16 Sep".
+    d.upcoming = (state.releasesUpcoming || []).filter((u) => u.seriesId === Number(req.params.id))
+      .map(({ number, shipdate, issueId, owned, collected, week, year }) => ({ number, shipdate, issueId, owned, collected, week, year }));
     if (row) {
       // For an unmatched comic with no pinned path and no files, the fallback
       // would derive a folder from the source title — show "not set" instead.
@@ -1756,11 +1774,31 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     const row = getSeriesById(db, Number(req.params.id));
     res.json({ path: row?.path || null, location: row ? resolveSeriesDir(db, row) : null });
   });
-  // GLOBAL monitor flag — what download automation fetches (library.manage).
+  // Monitoring policy — what download automation fetches (library.manage).
+  // Body: { monitor: 'all' | 'new' | 'none', from?: issueNumber, clearPicks?: bool }
+  // or the legacy { monitored: bool } (all / none) the mobile apps send.
   app.post('/api/collection/:id/monitor', (req, res) => {
-    const monitored = !!(req.body && req.body.monitored);
-    setFollowed(db, Number(req.params.id), monitored);
-    res.json({ monitored });
+    const id = Number(req.params.id);
+    const b = req.body || {};
+    const monitor = typeof b.monitor === 'string' ? b.monitor : (b.monitored ? 'all' : 'none');
+    if (!MONITOR_STATES.includes(monitor)) return res.status(400).json({ error: 'monitor must be all, new or none' });
+    if (!getSeriesById(db, id)) return res.status(404).json({ error: 'not found' });
+    if (b.clearPicks === true) clearIssuePicks(db, id);
+    res.json(setMonitor(db, id, monitor, { from: b.from ?? null }));
+  });
+  // Per-issue wants — { cvIssueIds, want: true|false } cherry-picks or skips
+  // issues regardless of the series' policy; { cvIssueIds, clear: true } goes
+  // back to the policy. Returns each issue's resulting want state. Guarded like
+  // Download (DOWNLOAD_RULES): asking for an issue is asking for a download.
+  app.post('/api/collection/:id/wanted', (req, res) => {
+    const id = Number(req.params.id);
+    const b = req.body || {};
+    const cvIssueIds = Array.isArray(b.cvIssueIds) ? b.cvIssueIds.map(Number).filter(Boolean) : [];
+    if (!cvIssueIds.length) return res.status(400).json({ error: 'cvIssueIds required' });
+    if (!getSeriesById(db, id)) return res.status(404).json({ error: 'not found' });
+    const want = b.clear === true ? null : !!b.want;
+    const r = setIssueWants(db, id, cvIssueIds, want, { reason: String(b.reason || 'manual').slice(0, 64), userId: req.user?.id ?? null });
+    res.json({ ...r, issues: wantStates(db, id, cvIssueIds) });
   });
   // PERSONAL follow — the signed-in user's own pull list (any library.view user;
   // see PERM_RULES). No effect on automation.
@@ -1856,8 +1894,21 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   app.post('/api/collection/add-cv', async (req, res) => {
     const comicvineId = Number(req.body?.comicvineId);
     if (!comicvineId) return res.status(400).json({ error: 'comicvineId required' });
+    // The issues that prompted this add, when the caller knows them (a list
+    // row, a release, a CBL entry) — with the "only requested" setting on,
+    // download-on-add is scoped to these instead of the whole volume.
+    const wanted = Array.isArray(req.body?.cvIssueIds) ? req.body.cvIssueIds.map(Number).filter(Boolean) : [];
+    const onlyRequested = config.addDownloadOnlyRequested === true && wanted.length > 0;
     try {
-      const r = await addFromCv(comicvineId);
+      // "For these issues": the series arrives unmonitored with just those
+      // issues picked, so automation keeps after exactly what was asked for.
+      // Otherwise it gets the "Monitor added series" default. An existing
+      // series keeps whatever policy it has; the picks still land.
+      const r = await addFromCv(comicvineId, onlyRequested ? { monitor: 'none' } : {});
+      if (onlyRequested && r?.seriesId != null) {
+        setIssueWants(db, r.seriesId, wanted, true, { reason: String(req.body?.reason || 'requested').slice(0, 64), userId: req.user.id });
+        r.picked = wanted.length;
+      }
       // Adding into a library files it there too. A manga-lane add resolves its
       // destination itself: the first manga library, created on first use — no
       // chicken-and-egg where searching manga requires a library to exist.
@@ -1875,26 +1926,28 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
       // Adding implies personal interest: the adder follows it automatically
       // (the add itself sets the global monitor flag for automation).
       if (r?.seriesId != null) setUserFollow(db, req.user.id, r.seriesId, true);
-      // Adding implies wanting: queue every missing issue right away. Runs
-      // only under the ADDER's own download permission (a role that may
-      // reshape the library but not download gets the add, nothing more),
-      // and only while the autoDownloadOnAdd setting is on. With ZERO enabled
-      // sources, queueing would just manufacture a wall of failed items — skip
-      // it and tell the client why (r.noSources) so the UI can say so.
+      // Adding implies wanting: queue what the series' policy (and picks)
+      // want right away — every missing issue under 'all', only the newest
+      // under 'new', just the requested issues for a "for these issues" add,
+      // nothing under 'none'. Runs only under the ADDER's own download
+      // permission (a role that may reshape the library but not download gets
+      // the add, nothing more), and only while the autoDownloadOnAdd setting
+      // is on. With ZERO enabled sources, queueing would just manufacture a
+      // wall of failed items — skip it and tell the client why (r.noSources).
       const anySource = (listSources ? listSources() : []).length > 0;
       if (!anySource) r.noSources = true;
       if (config.autoDownloadOnAdd !== false && r.seriesId && anySource
           && users.roleGrants(db, req.user.role, 'downloads.grab', permCatalog)) {
         const missing = db.prepare(`
-          SELECT ci.comicvine_id, ci.issue_number, ci.name FROM cv_issues ci
-           WHERE ci.cv_series_id = ? AND NOT EXISTS
-             (SELECT 1 FROM library_files lf WHERE lf.cv_issue_id = ci.comicvine_id AND lf.valid = 1)
-        `).all(r.cvId);
+          SELECT ci.comicvine_id, ci.issue_number, ci.name FROM wanted_issues w
+          JOIN cv_issues ci ON ci.comicvine_id = w.cv_issue_id WHERE w.series_id = ?
+        `).all(r.seriesId);
         const ids = missing.map((ci) => ensureCvIssueRow(db, {
           seriesId: r.seriesId, cvIssueId: ci.comicvine_id, number: ci.issue_number, title: ci.name,
         }));
         if (ids.length) { queueIssues(db, ids); startDownloads(); }
         r.queued = ids.length;
+        r.scope = onlyRequested ? 'requested' : 'policy';
       }
       res.json(r);
     } catch (e) {

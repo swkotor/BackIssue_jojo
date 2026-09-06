@@ -21,7 +21,7 @@
 // Step 2's "only if the target already exists" guard is what keeps this honest:
 // it never invents a franchise, it only merges into one the library already has.
 
-import { readCountsForSeries } from './db.js';
+import { readCountsForSeries, watchStateOf, PICK_WANTS_SQL } from './db.js';
 
 export function initFranchiseTables(db) {
   db.exec(`
@@ -194,7 +194,7 @@ const MEMBER_SQL = `(s.followed = 1
 
 function libraryRows(db, { publisher = null, includeRestricted = true, userId = null } = {}) {
   const rows = db.prepare(`
-    SELECT s.id, s.title, s.year, s.cover_url, s.watch_state, s.cv_id,
+    SELECT s.id, s.title, s.year, s.cover_url, s.monitor, ${PICK_WANTS_SQL} pick_wants, s.cv_id,
            COALESCE(NULLIF(cv.publisher,''), 'Unknown') publisher,
            cv.image_url cv_cover, cv.start_year,
            (SELECT COUNT(*) FROM library_files lf WHERE lf.series_id = s.id AND lf.valid = 1) owned,
@@ -287,7 +287,7 @@ export function franchiseVolumes(db, publisher, key, { includeRestricted = true,
       .map((v) => ({
         id: v.id, title: v.title, year: v.year || v.start_year || null,
         cover: v.cover_url || v.cv_cover || null,
-        owned: v.owned, total: v.total, read: v.read || 0, watch_state: v.watch_state, cv_id: v.cv_id,
+        owned: v.owned, total: v.total, read: v.read || 0, watch_state: watchStateOf(v.monitor, v.pick_wants), cv_id: v.cv_id,
       }))
       .sort((a, b) => (b.year || 0) - (a.year || 0) || a.title.localeCompare(b.title)),
   };

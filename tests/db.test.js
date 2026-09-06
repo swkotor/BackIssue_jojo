@@ -622,7 +622,8 @@ test('collectionSeries: comic + manga rows keep their exact field shape (no eboo
   assert.equal(m.on_demand, false);
   // Exact key set is stable (guards against accidental shape drift).
   const keyset = Object.keys(c).sort().join(',');
-  assert.equal(keyset, ['active', 'available', 'corrupt', 'cover_url', 'cv_id', 'cv_locked', 'files', 'folder', 'followed', 'id', 'latest', 'matched', 'missing', 'monitored', 'on_demand', 'owned', 'publisher', 'restricted', 'size', 'source', 'sourced', 'title', 'total', 'type', 'untagged', 'year'].join(','));
+  // fork: rows also carry last/next issue dates, the read count and the derived watch_state.
+  assert.equal(keyset, ['active', 'available', 'corrupt', 'cover_url', 'cv_id', 'cv_locked', 'files', 'folder', 'followed', 'id', 'last_issue_date', 'latest', 'matched', 'missing', 'monitor', 'monitor_from', 'monitored', 'next_issue_date', 'on_demand', 'owned', 'pub_status', 'publisher', 'read', 'restricted', 'size', 'source', 'sourced', 'title', 'total', 'type', 'untagged', 'watch_state', 'year'].join(','));
 });
 
 test('collectionSeries: search, sort and library filter still work with on-demand ebooks mixed in', async () => {

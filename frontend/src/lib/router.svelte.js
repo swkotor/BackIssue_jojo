@@ -7,7 +7,7 @@ export const route = $state({ path: location.pathname, search: location.search }
 // Section page routes. They sit ON TOP of the base library/volume view —
 // opening one must NOT tear down the comic being viewed, so it's restored
 // intact when the page closes (Escape/Back).
-export const OVERLAY_PATHS = ['/settings', '/jobs', '/import', '/logs', '/tools', '/stats', '/history', '/wanted', '/queue', '/releases', '/plugins', '/users', '/lists'];
+export const OVERLAY_PATHS = ['/settings', '/jobs', '/import', '/logs', '/tools', '/stats', '/history', '/wanted', '/queue', '/releases', '/plugins', '/users', '/lists', '/publishers' /* fork */];
 
 function sync() {
   route.path = location.pathname;

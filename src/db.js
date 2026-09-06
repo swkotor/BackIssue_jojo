@@ -140,6 +140,17 @@ export function initSchema(db) {
   `);
 }
 
+export const MONITOR_STATES = ['all', 'new', 'none'];
+
+// Does the series' policy want this issue? Shared by the wanted_issues view
+// and the pick helpers (aliases: s = series, ci = cv_issues) so there is one
+// definition. 'new' compares issue numbers numerically — an issue without a
+// plain number (an annual, a special) is only wanted under 'all' or by pick.
+const POLICY_WANTS = `CASE s.monitor
+  WHEN 'all' THEN 1
+  WHEN 'new' THEN (s.monitor_from IS NOT NULL AND CAST(ci.issue_number AS REAL) >= CAST(s.monitor_from AS REAL))
+  ELSE 0 END`;
+
 // Add columns introduced after the first release to pre-existing databases.
 function migrate(db) {
   const cols = db.prepare('PRAGMA table_info(series)').all().map((c) => c.name);
@@ -212,49 +223,6 @@ function migrate(db) {
   db.exec('CREATE INDEX IF NOT EXISTS idx_series_type ON series(type)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_series_followed ON series(followed) WHERE followed=1');
 
-  // --- fork: explicit watch state + per-issue wanted overrides ---------------
-  // series.watch_state is a tri-state monitor flag:
-  //   'watched'   — new issues are automatically wanted (classic followed=1)
-  //   'paused'    — existing wants are kept, new issues arrive NOT wanted
-  //   'unwatched' — nothing in the series is wanted
-  // series.followed is kept in sync (1 for watched) so plugins and any query
-  // that still reads it keep working.
-  if (!cols.includes('watch_state')) {
-    db.exec("ALTER TABLE series ADD COLUMN watch_state TEXT NOT NULL DEFAULT 'paused'");
-    // Preserve today's behaviour: followed series become 'watched'; the rest
-    // become 'paused' (their existing backlog stays wanted, see issue_wants).
-    db.exec("UPDATE series SET watch_state = CASE WHEN followed=1 THEN 'watched' ELSE 'paused' END");
-  }
-  db.exec('CREATE INDEX IF NOT EXISTS idx_series_watch_state ON series(watch_state)');
-
-  // Explicit per-issue overrides, keyed by ComicVine issue id (the identity the
-  // wanted list is built from). A row here always wins over the series state,
-  // so a single issue can be pulled from an unwatched series, or dropped from a
-  // watched one.
-  db.exec(`CREATE TABLE IF NOT EXISTS issue_wants (
-    cv_issue_id INTEGER PRIMARY KEY,
-    series_id INTEGER,
-    wanted INTEGER NOT NULL DEFAULT 1,
-    source TEXT NOT NULL DEFAULT 'manual', -- 'manual' | 'freeze' (set when pausing)
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-  )`);
-  db.exec('CREATE INDEX IF NOT EXISTS idx_issue_wants_series ON issue_wants(series_id)');
-  db.exec('CREATE INDEX IF NOT EXISTS idx_issue_wants_wanted ON issue_wants(wanted)');
-
-  // One-time freeze for series that were NOT followed before this fork: their
-  // backlog was wanted purely because files exist on disk, so materialise it,
-  // otherwise flipping them to 'paused' above would silently un-want it.
-  const frozen = db.prepare("SELECT COUNT(*) n FROM issue_wants WHERE source='freeze'").get().n;
-  const needsFreeze = db.prepare("SELECT COUNT(*) n FROM series WHERE watch_state='paused'").get().n;
-  if (!frozen && needsFreeze) {
-    db.exec(`INSERT OR IGNORE INTO issue_wants (cv_issue_id, series_id, wanted, source)
-      SELECT ci.comicvine_id, s.id, 1, 'freeze'
-        FROM series s
-        JOIN cv_issues ci ON ci.cv_series_id = s.cv_id
-       WHERE s.watch_state='paused'
-         AND EXISTS(SELECT 1 FROM library_files lf WHERE lf.series_id=s.id AND lf.valid=1)
-         AND NOT EXISTS (SELECT 1 FROM library_files lf2 WHERE lf2.cv_issue_id = ci.comicvine_id AND lf2.valid=1)`);
-  }
   // restrictedSeriesIds runs per request for non-mature roles (and on several
   // queue/history routes unconditionally) — a partial index makes it an index
   // scan of the few restricted rows instead of a 320k-row table scan.
@@ -315,6 +283,78 @@ function migrate(db) {
   // handler's unique key (e.g. a file path) and cv_name/cv_year/cv_image carry
   // the handler's own metadata match for display.
   if (icCols.length && !icCols.includes('handler')) db.exec('ALTER TABLE import_candidates ADD COLUMN handler TEXT');
+  // ---- Monitoring: a policy per series, exceptions per issue, one view ----
+  // What automation fetches is a DECISION, kept apart from the FACT of a
+  // missing file. series.monitor is the policy:
+  //   'all'  — keep the run complete: every missing issue is wanted
+  //   'new'  — only issues numbered from series.monitor_from onward
+  //   'none' — nothing automatic
+  // issue_picks holds per-issue exceptions (want=1 cherry-picks an issue,
+  // want=0 skips one) that always beat the policy, plus who asked and why so
+  // reading lists, requests and notifications can build on them. `followed`
+  // is kept in sync (monitor != 'none') for plugins and the mobile apps.
+  if (!cols.includes('monitor')) {
+    db.exec("ALTER TABLE series ADD COLUMN monitor TEXT NOT NULL DEFAULT 'none'");
+    // Existing installs: the old on/off flag maps 1:1 — automation never
+    // searched unfollowed series, so nothing that was fetched stops.
+    db.exec("UPDATE series SET monitor = CASE WHEN followed=1 THEN 'all' ELSE 'none' END");
+  }
+  if (!cols.includes('monitor_from')) db.exec('ALTER TABLE series ADD COLUMN monitor_from TEXT');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_series_monitor ON series(monitor)');
+  db.exec(`CREATE TABLE IF NOT EXISTS issue_picks (
+    cv_issue_id INTEGER PRIMARY KEY,
+    series_id INTEGER NOT NULL,
+    want INTEGER NOT NULL DEFAULT 1,
+    reason TEXT,
+    by_user INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_issue_picks_series ON issue_picks(series_id, want)');
+  // The ONE definition of "wanted": policy, then picks, minus what's on disk.
+  // Every consumer (Wanted page, automation lanes, RSS/announce watchers,
+  // counts, plugins) joins this view, so none of them can drift. Recreated
+  // every boot so the definition can evolve without a data migration.
+  // The series gate is two index-able terms (monitor via idx_series_monitor,
+  // rowid IN the picked set) so SQLite's multi-index OR walks only monitored
+  // or picked series — an `OR EXISTS(...)` here probed every one of a 320k-row
+  // on-demand catalog and made the automation lanes ~6× slower.
+  db.exec('DROP VIEW IF EXISTS wanted_issues');
+  db.exec(`CREATE VIEW wanted_issues AS
+    SELECT s.id series_id, ci.comicvine_id cv_issue_id, ci.issue_number,
+           CASE WHEN p.want = 1 THEN 'pick' ELSE 'policy' END why,
+           p.reason, p.by_user
+      FROM series s
+      JOIN cv_issues ci ON ci.cv_series_id = s.cv_id
+      LEFT JOIN issue_picks p ON p.cv_issue_id = ci.comicvine_id
+     WHERE (s.monitor IN ('all','new') OR s.id IN (SELECT series_id FROM issue_picks WHERE want = 1))
+       AND COALESCE(p.want, ${POLICY_WANTS}) = 1
+       AND NOT EXISTS (SELECT 1 FROM library_files lf WHERE lf.cv_issue_id = ci.comicvine_id AND lf.valid = 1)`);
+  // --- fork: one-time migration from the fork's own watch_state/issue_wants
+  // model (pre-0.8.0) onto upstream's monitor/issue_picks. Upstream's own
+  // migration above already derived monitor from `followed`, which the fork
+  // kept in sync (1 only when watched), so: watched -> 'all', paused and
+  // unwatched -> 'none'. What remains is the per-issue layer: every explicit
+  // issue_wants row becomes a pick where it disagrees with the new policy
+  // (a "want" under 'none', a "skip" under 'all'); rows the policy already
+  // agrees with are redundant and dropped, matching setIssueWants' minimal-
+  // pick rule. Paused series therefore keep their frozen wanted set as picks.
+  // Owned issues need no pick. The old column and table go away afterwards so
+  // nothing can read stale state.
+  if (cols.includes('watch_state')) {
+    const have = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='issue_wants'").get();
+    if (have) {
+      db.exec(`INSERT OR IGNORE INTO issue_picks (cv_issue_id, series_id, want, reason, by_user)
+        SELECT iw.cv_issue_id, s.id, iw.wanted, 'migrated', NULL
+          FROM issue_wants iw
+          JOIN series s ON s.id = iw.series_id
+          JOIN cv_issues ci ON ci.comicvine_id = iw.cv_issue_id AND ci.cv_series_id = s.cv_id
+         WHERE ((iw.wanted = 1 AND s.monitor = 'none') OR (iw.wanted = 0 AND s.monitor <> 'none'))
+           AND NOT EXISTS (SELECT 1 FROM library_files lf WHERE lf.cv_issue_id = iw.cv_issue_id AND lf.valid = 1)`);
+      db.exec('DROP TABLE issue_wants');
+    }
+    db.exec('DROP INDEX IF EXISTS idx_series_watch_state');
+    db.exec('ALTER TABLE series DROP COLUMN watch_state');
+  }
   // The Mylar integration is gone — BackIssue replaces it.
   db.exec('DROP TABLE IF EXISTS mylar_series_map');
   // The dedicated tag log was folded into the Logs page (category 'tag').
@@ -642,54 +682,34 @@ export function recordImport(db, { seriesId = null, seriesTitle = null, issueTit
     VALUES (?,?,?,?,?,?,?,?)`).run(Date.now(), seriesId, seriesTitle, issueTitle, issueNumber, cvIssueId, source, path);
 }
 
-// fork: orderings for the Wanted page. Issues stay grouped by series (the page
-// renders one card per series), so every sort keys on a series-level value
-// first and then walks the issues in number order.
-// `missing` counts the series' still-wanted, still-unowned issues — the same
-// number the card's "N missing" pill shows.
-const WANTED_MISSING_SQL = `(SELECT COUNT(*) FROM cv_issues ci2
-   WHERE ci2.cv_series_id = s.cv_id
-     AND NOT EXISTS (SELECT 1 FROM library_files lf3 WHERE lf3.cv_issue_id = ci2.comicvine_id AND lf3.valid=1)
-     AND COALESCE((SELECT iw2.wanted FROM issue_wants iw2 WHERE iw2.cv_issue_id = ci2.comicvine_id),
-                  CASE WHEN s.watch_state='watched' THEN 1 ELSE 0 END) = 1)`;
-
-const WANTED_ORDERS = {
-  series: 'ORDER BY series_title, CAST(ci.issue_number AS REAL), ci.issue_number',
-  missing: `ORDER BY ${WANTED_MISSING_SQL} DESC, series_title, CAST(ci.issue_number AS REAL), ci.issue_number`,
-  'missing-asc': `ORDER BY ${WANTED_MISSING_SQL} ASC, series_title, CAST(ci.issue_number AS REAL), ci.issue_number`,
-  // newest releases first, across every series
-  newest: `ORDER BY (COALESCE(ci.store_date, ci.cover_date) IS NULL),
-    date(COALESCE(ci.store_date, ci.cover_date)) DESC, series_title, CAST(ci.issue_number AS REAL)`,
-  oldest: `ORDER BY (COALESCE(ci.store_date, ci.cover_date) IS NULL),
-    date(COALESCE(ci.store_date, ci.cover_date)) ASC, series_title, CAST(ci.issue_number AS REAL)`,
-};
-
-// Wanted = every ComicVine issue of a collection series (followed, or owned via a
-// valid file) that has NO valid file yet. `queue_status` carries the in-flight
-// state (queued/grabbed/failed…) when the issue has already been sent for
-// download, so the page can show a badge instead of a Download button.
-export function listWantedIssues(db, { limit = 200, offset = 0, followedOnly = false, userFollowedOnly = false, hideUnreleased = false, releasedWithinDays = 0, search = '', includeRestricted = true, userId = 0, sort = 'series' } = {}) {
+// Wanted = the wanted_issues view (the series' monitoring policy, then its
+// per-issue picks, minus what's on disk) — see the schema notes. `scope`:
+//   'wanted' (default) — what automation goes after; rows carry why/reason.
+//   'gaps'   — every missing issue of every collection series, wanted or not,
+//              each flagged `wanted` — the honest "what's missing" view.
+// `queue_status` carries the in-flight state (queued/grabbed/failed…) when the
+// issue has already been sent for download, so the page can show a badge
+// instead of a Download button. `sort`: series | newest | oldest | most | fewest.
+export function listWantedIssues(db, { limit = 200, offset = 0, scope = 'wanted', sort = 'series', followedOnly = false, userFollowedOnly = false, hideUnreleased = false, releasedWithinDays = 0, search = '', includeRestricted = true, userId = 0 } = {}) {
   // Two DISTINCT "follow" systems meet here:
-  //  - s.followed = GLOBAL automation flag (set on add, toggled as
-  //    "Auto-download"). `followedOnly` filters on it and is what the RSS
-  //    auto-grabber (buildWantedIndex) needs — it has no user.
+  //  - the monitoring policy (series.monitor, legacy `followed`) is GLOBAL —
+  //    it is what the automation lanes and the RSS/announce watchers fetch, and
+  //    the 'wanted' scope already applies it. `followedOnly` is accepted for
+  //    compatibility and is a no-op.
   //  - user_follows = the per-user ☆ star. `userFollowedOnly` filters on it
   //    and is what the Wanted page's "Following" chip + the row badges use.
-  // They must never be conflated: making `followedOnly` per-user once emptied
+  // They must never be conflated: making the global one per-user once emptied
   // the auto-grab index (no user → no matches → automation silently stopped).
-  // fork: an explicit issue_wants row always wins; otherwise the series'
-  // watch_state decides ('watched' wants everything missing, 'paused' and
-  // 'unwatched' want nothing that isn't explicitly flagged).
+  void followedOnly;
+  const gaps = scope === 'gaps';
   const conds = [
-    WANTED_SQL,
     `NOT EXISTS (SELECT 1 FROM library_files lf2 WHERE lf2.cv_issue_id = ci.comicvine_id AND lf2.valid=1)`,
   ];
+  // Gaps: a collection series = monitored, owns a file, or has a pick.
+  if (gaps) conds.unshift(`(s.monitor IN ('all','new') OR s.id IN (SELECT series_id FROM library_files WHERE valid=1)
+      OR s.id IN (SELECT series_id FROM issue_picks WHERE want=1))`);
   const args = { uid: userId };
   if (!includeRestricted) conds.push('s.restricted = 0');
-  // fork: automation used to filter on s.followed; wanted-ness is now the
-  // single source of truth, so a paused series' explicitly wanted issues still
-  // get searched. WANTED_SQL is already applied above, so this is a no-op.
-  if (followedOnly) conds.push('1=1');
   if (userFollowedOnly) conds.push('EXISTS(SELECT 1 FROM user_follows uf WHERE uf.series_id = s.id AND uf.user_id = @uid)');
   // Best-effort: most cached issues have no cover date (volume stubs don't carry
   // one), so this only hides issues we KNOW are future-dated — honest, not complete.
@@ -704,25 +724,49 @@ export function listWantedIssues(db, { limit = 200, offset = 0, followedOnly = f
     args.recentSince = `-${Math.floor(releasedWithinDays)} days`;
   }
   if (search) { conds.push('COALESCE(cv.name, s.title) LIKE @q'); args.q = `%${search}%`; }
-  const from = `FROM series s
+  // Per-series counts only when a sort needs them (one grouped pass).
+  const bySeries = sort === 'most' || sort === 'fewest';
+  const cte = !bySeries ? '' : gaps
+    ? `WITH sm AS (SELECT s.id series_id, COUNT(*) n FROM series s JOIN cv_issues ci ON ci.cv_series_id = s.cv_id
+         WHERE NOT EXISTS (SELECT 1 FROM library_files lf WHERE lf.cv_issue_id = ci.comicvine_id AND lf.valid=1) GROUP BY s.id) `
+    : 'WITH sm AS (SELECT series_id, COUNT(*) n FROM wanted_issues GROUP BY series_id) ';
+  const smJoin = bySeries ? 'LEFT JOIN sm ON sm.series_id = s.id' : '';
+  const from = gaps
+    ? `FROM series s
     JOIN cv_series cv ON cv.comicvine_id = s.cv_id
     JOIN cv_issues ci ON ci.cv_series_id = s.cv_id
+    LEFT JOIN wanted_issues w ON w.series_id = s.id AND w.cv_issue_id = ci.comicvine_id
+    ${smJoin}
+    WHERE ${conds.join(' AND ')}`
+    : `FROM wanted_issues w
+    JOIN series s ON s.id = w.series_id
+    JOIN cv_series cv ON cv.comicvine_id = s.cv_id
+    JOIN cv_issues ci ON ci.comicvine_id = w.cv_issue_id
+    ${smJoin}
     WHERE ${conds.join(' AND ')}`;
+  const num = 'CAST(ci.issue_number AS REAL), ci.issue_number';
+  const rel = 'COALESCE(ci.store_date, ci.cover_date)';
+  const ORDERS = {
+    series: `ORDER BY series_title, ${num}`,
+    newest: `ORDER BY (${rel} IS NULL), ${rel} DESC, series_title, ${num}`,
+    oldest: `ORDER BY (${rel} IS NULL), ${rel} ASC, series_title, ${num}`,
+    most: `ORDER BY COALESCE(sm.n, 0) DESC, series_title, ${num}`,
+    fewest: `ORDER BY COALESCE(sm.n, 0) ASC, series_title, ${num}`,
+  };
+  const order = ORDERS[sort] || ORDERS.series;
   // better-sqlite3 rejects unused named params: the COUNT only knows @uid
   // when the Following filter put it in the WHERE.
   const totalArgs = { ...args };
   if (!from.includes('@uid')) delete totalArgs.uid;
-  const total = db.prepare(`SELECT COUNT(*) n ${from}`).get(totalArgs).n;
-  const items = db.prepare(`SELECT s.id series_id, COALESCE(cv.name, s.title) series_title,
+  const total = db.prepare(`${cte}SELECT COUNT(*) n ${from}`).get(totalArgs).n;
+  const items = db.prepare(`${cte}SELECT s.id series_id, COALESCE(cv.name, s.title) series_title, s.monitor, s.monitor_from,
       EXISTS(SELECT 1 FROM user_follows uf WHERE uf.series_id = s.id AND uf.user_id = @uid) followed,
       cv.image_url series_cover,
-      ci.comicvine_id cv_issue_id, ci.issue_number, ci.name issue_name, ci.cover_date,
+      ci.comicvine_id cv_issue_id, ci.issue_number, ci.name issue_name, ci.cover_date, ci.store_date,
       (SELECT i.status FROM issues i WHERE i.url = 'cvissue:' || ci.comicvine_id) queue_status,
-      s.watch_state,
-      ${WANTED_MISSING_SQL} series_missing,
-      COALESCE((SELECT iw.wanted FROM issue_wants iw WHERE iw.cv_issue_id = ci.comicvine_id), s.watch_state='watched') wanted
+      ${gaps ? '(w.cv_issue_id IS NOT NULL)' : '1'} wanted, w.why, w.reason
     ${from}
-    ${WANTED_ORDERS[sort] || WANTED_ORDERS.series}
+    ${order}
     LIMIT @limit OFFSET @offset`).all({ ...args, limit, offset });
   return { items, total };
 }
@@ -951,7 +995,10 @@ const COLL_JOINS = `
 // (file_dir, cv_latest) live here, so this select is only ever run for a bounded
 // set of ids (a page), never the whole 150k membership set.
 function collFullCols(guard) {
-  return `SELECT s.id, s.title, s.publisher, s.year, s.cover_url, s.followed, s.watch_state, s.cv_id, s.cv_locked, s.url, s.restricted, s.type,
+  return `SELECT s.id, s.title, s.publisher, s.year, s.cover_url, s.followed, s.monitor, s.monitor_from, s.cv_id, s.cv_locked, s.url, s.restricted, s.type,
+      -- fork: derived publication status (Metron, else CV dates) and the count
+      -- of hand-picked wants, which together give the tri-state watch badge.
+      ${PUB_STATUS_SQL} pub_status, ${PICK_WANTS_SQL} pick_wants,
       (mf.series_id IS NOT NULL) my_follow,
       cv.name cv_name, cv.publisher cv_publisher, cv.start_year cv_year, cv.image_url cv_image,
       CASE WHEN ${guard} THEN COALESCE(iss.bc_total, 0) ELSE 0 END bc_total,
@@ -981,11 +1028,11 @@ function collFullCols(guard) {
 // and corrupt, are gated to the handful of series that can be non-trivial), so it
 // drives id-selection (for a page) and the fused chip counts.
 function collLeanCols(guard) {
-  return `SELECT s.id, s.title, s.type, s.cv_id, s.followed, s.watch_state, s.year,
+  return `SELECT s.id, s.title, s.type, s.cv_id, s.followed, s.monitor, s.year,
       -- fork: needed by the 'latest'/'next' sorts and the continuing/finished chips
       CASE WHEN s.cv_id IS NULL THEN NULL ELSE ${LAST_ISSUE_DATE_SQL} END last_issue_date,
       CASE WHEN s.cv_id IS NULL THEN NULL ELSE ${NEXT_ISSUE_DATE_SQL} END next_issue_date,
-      ${PUB_STATUS_SQL} pub_status,
+      ${PUB_STATUS_SQL} pub_status, ${PICK_WANTS_SQL} pick_wants,
       (mf.series_id IS NOT NULL) my_follow,
       CASE WHEN ${guard} THEN 0 ELSE COALESCE(lf.untagged, 0) END untagged,
       CASE WHEN COALESCE(lf.invalid_count, 0) = 0 THEN 0 ELSE
@@ -1008,9 +1055,8 @@ function membershipWhere({ guard, selfTypesLen, includeRestricted = true, librar
       ${restrictIds ? 'AND s.id IN (SELECT value FROM json_each(@restrictIds))' : ''}
       ${collectionsOnly && selfTypesLen ? `AND ${guard} AND COALESCE(iss.bc_total, 0) >= 2` : ''}
       ${search ? 'AND (s.title LIKE @q OR cv.name LIKE @q OR cv.publisher LIKE @q)' : ''}
-      ${ws ? "AND COALESCE(NULLIF(s.watch_state,''),'watched') = @ws" : ''}`;
+      ${ws ? `AND ${WATCH_STATE_WHERE[ws]}` : ''}`;
   const params = {
-    ...(ws ? { ws } : {}),
     ...(library != null ? { lib: library } : {}),
     ...(restrictIds ? { restrictIds: JSON.stringify(restrictIds) } : {}),
     ...(search ? { q: `%${search}%` } : {}),
@@ -1069,7 +1115,10 @@ function chipPredicateSql(filter, { guardOuter, seriesTypeList, params }) {
   const effType = `COALESCE(NULLIF(type,''),'comic')`;
   if (filter === 'incomplete') return 'cv_id IS NOT NULL AND cv_total > cv_owned';   // missing>0 (only CV series)
   if (filter === 'followed') return 'my_follow = 1';                                 // per-user star
+  if (filter === 'monitored') return 'COALESCE(followed,0) = 1';                     // monitor != none (followed is kept in sync)
   if (filter === 'unmonitored') return 'COALESCE(followed,0) = 0';                   // !monitored
+  if (filter === 'ongoing') return "pub_status = 'ongoing'";                        // fork: PUB_STATUS_SQL (Metron, else CV dates)
+  if (filter === 'ended') return "pub_status = 'ended'";
   if (filter === 'problems') return 'untagged > 0 OR corrupt > 0';
   // fork: publication status chips
   if (filter === 'ongoing') return "pub_status = 'ongoing'";
@@ -1156,35 +1205,35 @@ function mapCollectionRow(r) {
       const owned = r.bc_owned;
       const available = Math.max(0, r.bc_total - owned);
       return {
-        id: r.id, followed: r.my_follow ? 1 : 0, monitored: r.followed, cv_id: null, cv_locked: 0, sourced: false, matched: true, source: 'local',
+        id: r.id, followed: r.my_follow ? 1 : 0, monitored: r.followed, monitor: r.monitor || (r.followed ? 'all' : 'none'), monitor_from: r.monitor_from ?? null, pub_status: r.pub_status || null, cv_id: null, cv_locked: 0, sourced: false, matched: true, source: 'local',
         title: r.title, publisher: r.publisher, year: r.year, cover_url: r.cover_url, restricted: !!r.restricted, type: r.type,
         folder: dirBaseName(r.file_dir), files: r.file_count,
         total: r.bc_total, owned, missing: 0, available, on_demand: available > 0, untagged: 0, corrupt: r.corrupt,
         latest: null, active: 0, size: r.size_bytes,
-        watch_state: r.watch_state || 'watched', pub_status: r.pub_status || 'unknown',
+        watch_state: watchStateOf(r.monitor, r.pick_wants), pub_status: r.pub_status || 'unknown',
         last_issue_date: r.last_issue_date || null, next_issue_date: r.next_issue_date || null,
       };
     }
     return {
-      id: r.id, followed: r.my_follow ? 1 : 0, monitored: r.followed, cv_id: null, cv_locked: 0, sourced, matched: false, source: 'unmatched',
+      id: r.id, followed: r.my_follow ? 1 : 0, monitored: r.followed, monitor: r.monitor || (r.followed ? 'all' : 'none'), monitor_from: r.monitor_from ?? null, pub_status: r.pub_status || null, cv_id: null, cv_locked: 0, sourced, matched: false, source: 'unmatched',
       title: null, publisher: null, year: null, cover_url: null, restricted: !!r.restricted, type: r.type || 'comic',
       folder: dirBaseName(r.file_dir), files: r.file_count,
       total: 0, owned: 0, missing: 0, available: 0, on_demand: false, untagged: r.untagged, corrupt: r.corrupt,
       latest: null, active: r.active, size: r.size_bytes,
-      watch_state: r.watch_state || 'watched', pub_status: r.pub_status || 'unknown',
+      watch_state: watchStateOf(r.monitor, r.pick_wants), pub_status: r.pub_status || 'unknown',
       last_issue_date: r.last_issue_date || null, next_issue_date: r.next_issue_date || null,
     };
   }
   const total = r.cv_total;
   const owned = Math.min(r.cv_owned, r.cv_total);
   return {
-    id: r.id, followed: r.my_follow ? 1 : 0, monitored: r.followed, cv_id: r.cv_id, cv_locked: r.cv_locked, sourced, matched: true, source: 'cv',
+    id: r.id, followed: r.my_follow ? 1 : 0, monitored: r.followed, monitor: r.monitor || (r.followed ? 'all' : 'none'), monitor_from: r.monitor_from ?? null, pub_status: r.pub_status || null, cv_id: r.cv_id, cv_locked: r.cv_locked, sourced, matched: true, source: 'cv',
     title: r.cv_name || r.title, publisher: r.cv_publisher || null, year: r.cv_year || null, cover_url: r.cv_image || null,
     cv_name: r.cv_name, cv_year: r.cv_year, restricted: !!r.restricted, type: r.type || 'comic',
     total, owned, missing: Math.max(0, total - owned), available: 0, on_demand: false, untagged: r.untagged, corrupt: r.corrupt,
     latest: r.cv_latest, active: r.active, size: r.size_bytes,
     // fork: watch state, publication status and the Latest/Next issue dates
-    watch_state: r.watch_state || 'watched',
+    watch_state: watchStateOf(r.monitor, r.pick_wants),
     last_issue_date: r.last_issue_date || null,
     next_issue_date: r.next_issue_date || null,
     pub_status: r.pub_status || 'unknown',
@@ -1235,7 +1284,7 @@ export function collectionPage(db, { keys = [], filter = 'all', limit = null, of
     // Legacy fused path: map the whole set once, tally chips + rows in JS.
     let all = mapCollection(db, opts);
     // fork: watch-state narrowing applies to the legacy fused path too
-    if (opts.ws) all = all.filter((r) => (r.watch_state || 'watched') === opts.ws);
+    if (opts.ws) all = all.filter((r) => r.watch_state === opts.ws);
     const counts = {};
     for (const k of keys) counts[k] = k === 'all' ? all.length : all.filter((r) => seriesMatchesFilter(r, k)).length;
     const rows = filter && filter !== 'all' ? all.filter((r) => seriesMatchesFilter(r, filter)) : all;
@@ -1322,7 +1371,7 @@ export function collectionPage(db, { keys = [], filter = 'all', limit = null, of
         ${libTerm}
         ${restrictIds ? 'AND s.id IN (SELECT value FROM json_each(@restrictIds))' : ''}
         ${search ? 'AND (s.title LIKE @q OR cv.name LIKE @q OR cv.publisher LIKE @q)' : ''}
-        ${ws ? "AND COALESCE(NULLIF(s.watch_state,''),'watched') = @ws" : ''}
+        ${ws ? `AND ${WATCH_STATE_WHERE[ws]}` : ''}
         AND (${fastChipPred})
         ${FAST_ORDERS[sort]} LIMIT @lim OFFSET @off`).all(idParams)
     : db.prepare(`WITH ${collCtes(libraryScopeSql(library))},
@@ -1338,7 +1387,10 @@ export function collectionPage(db, { keys = [], filter = 'all', limit = null, of
 export function seriesMatchesFilter(r, filter) {
   return filter === 'incomplete' ? r.missing > 0
     : filter === 'followed' ? !!r.followed
+    : filter === 'monitored' ? !!r.monitored
     : filter === 'unmonitored' ? !r.monitored
+    : filter === 'ongoing' ? r.pub_status === 'ongoing'
+    : filter === 'ended' ? r.pub_status === 'ended'
     : filter === 'problems' ? (r.untagged > 0 || r.corrupt > 0)
     // fork: publication status
     : filter === 'ongoing' ? r.pub_status === 'ongoing'
@@ -1390,7 +1442,10 @@ export function seriesCollectionDetail(db, id, userId = null) {
       ? (db.prepare('SELECT 1 FROM user_follows WHERE user_id=? AND series_id=?').get(userId, id) ? 1 : 0)
       : 0,
     monitored: series.followed,
-    watchState: series.watch_state || (series.followed ? 'watched' : 'paused'),
+    monitor: series.monitor || (series.followed ? 'all' : 'none'),
+    monitor_from: series.monitor_from ?? null,
+    // fork: the tri-state watch badge, derived from the policy + picks (see watchStateOf)
+    watchState: watchStateOf(series.monitor, pickWantCount(db, id)),
     // fork: finished-issue count for the header's “x/y read · n%”
     read: readCountsForSeries(db, [id], userId).get(id) || 0,
     // fork: is the volume still running? Metron status wins; else CV dates.
@@ -1444,18 +1499,18 @@ export function seriesCollectionDetail(db, id, userId = null) {
       if (!filesByCv.has(f.cv_issue_id)) filesByCv.set(f.cv_issue_id, []);
       filesByCv.get(f.cv_issue_id).push(f);
     }
-    // fork: explicit want overrides for this series, so each issue row can show
-    // and toggle its own wanted state.
-    const wantById = new Map(
-      db.prepare('SELECT cv_issue_id, wanted FROM issue_wants WHERE series_id=?').all(id)
-        .map((r) => [r.cv_issue_id, !!r.wanted])
-    );
-    const seriesWatched = (series.watch_state || (series.followed ? 'watched' : 'paused')) === 'watched';
+    // Wanted-ness per issue (policy + picks, via the one view) and the picks
+    // themselves, so a row can say WHY it is (or isn't) wanted.
+    const wantedBy = new Map(db.prepare('SELECT cv_issue_id, why, reason FROM wanted_issues WHERE series_id=?').all(id).map((r) => [r.cv_issue_id, r]));
+    const pickBy = new Map(db.prepare('SELECT cv_issue_id, want, reason FROM issue_picks WHERE series_id=?').all(id).map((r) => [r.cv_issue_id, r]));
+    const picks = { want: 0, skip: 0 };
+    for (const [cvid, p] of pickBy) { if (validCvIds.has(cvid)) continue; if (p.want) picks.want++; else picks.skip++; }
     // fork: read/reading per issue, for the read markers in the issue list.
     const readById = readStateFor(db, cvIssues.map((ci) => ci.comicvine_id), userId);
     const issues = cvIssues.map((ci) => {
       const fs = filesByCv.get(ci.comicvine_id) || [];
       const bc = bcByNum.get(normalizeNumber(ci.issue_number)); // an in-flight/queued row, if any
+      const w = wantedBy.get(ci.comicvine_id), p = pickBy.get(ci.comicvine_id);
       const valid = fs.filter((f) => f.valid);
       const owned = valid.length > 0;
       const corrupt = fs.length > 0 && !owned;                 // file(s) on disk but none readable
@@ -1473,11 +1528,10 @@ export function seriesCollectionDetail(db, id, userId = null) {
         untagged,
         status: bc ? bc.status : 'pending',
         downloadable: !owned,              // any un-owned issue can be grabbed; a source is found at download time
-        // fork: wanted = explicit override if present, else the series state.
-        // wantOverride tells the UI whether this row is pinned (so it can show
-        // a "follows series" vs "pinned" affordance).
-        wanted: !owned && (wantById.has(ci.comicvine_id) ? wantById.get(ci.comicvine_id) : seriesWatched),
-        wantOverride: wantById.has(ci.comicvine_id) ? (wantById.get(ci.comicvine_id) ? 'wanted' : 'skipped') : null,
+        wanted: !!w,                       // automation goes after it (policy or pick)
+        why: w ? w.why : null,             // 'policy' | 'pick'
+        pick: p ? (p.want ? 'want' : 'skip') : null,
+        pick_reason: p ? p.reason : null,
         // fork: 'read' | 'reading' | null
         readState: readById.get(ci.comicvine_id) || null,
         files: fs.map(asIssueFile),
@@ -1485,6 +1539,7 @@ export function seriesCollectionDetail(db, id, userId = null) {
     });
     return {
       series: seriesOut, cv: cvOut, source: 'cv', sourced, issues, superseded, duplicates,
+      wanted: wantedBy.size, picks,
       // fork: is read tracking even available? Without the reader plugin every
       // issue would silently read as "unread", which is a lie — the UI hides
       // the markers entirely instead.
@@ -1544,9 +1599,11 @@ export function seriesCollectionDetail(db, id, userId = null) {
         ? (db.prepare('SELECT 1 FROM user_follows WHERE user_id=? AND series_id=?').get(userId, id) ? 1 : 0)
         : 0,
       monitored: series.followed,
-    watchState: series.watch_state || (series.followed ? 'watched' : 'paused'),
-    // fork: finished-issue count for the header's “x/y read · n%”
-    read: readCountsForSeries(db, [id], userId).get(id) || 0,
+      monitor: series.monitor || (series.followed ? 'all' : 'none'),
+      monitor_from: series.monitor_from ?? null,
+      watchState: watchStateOf(series.monitor, pickWantCount(db, id)),
+      // fork: finished-issue count for the header's “x/y read · n%”
+      read: readCountsForSeries(db, [id], userId).get(id) || 0,
       cv_id: null, cv_locked: 0, sourced, path: series.path,
       type: series.type || 'comic',
       library_id: series.library_id ?? null,
@@ -1809,11 +1866,11 @@ export function createCvSeries(db, { cvId, title, publisher = null, year = null,
   const url = 'cv:' + cvId;
   const existing = db.prepare('SELECT id FROM series WHERE url=?').get(url);
   if (existing) {
-    db.prepare('UPDATE series SET followed=1, cv_id=?, cv_locked=1 WHERE id=?').run(cvId, existing.id);
+    db.prepare("UPDATE series SET followed=1, monitor='all', monitor_from=NULL, cv_id=?, cv_locked=1 WHERE id=?").run(cvId, existing.id);
     return existing.id;
   }
   const info = db.prepare(
-    'INSERT INTO series (title, url, publisher, year, cover_url, cv_id, cv_locked, followed) VALUES (?,?,?,?,?,?,1,1)'
+    "INSERT INTO series (title, url, publisher, year, cover_url, cv_id, cv_locked, followed, monitor) VALUES (?,?,?,?,?,?,1,1,'all')"
   ).run(title, url, publisher, year, coverUrl, cvId);
   return info.lastInsertRowid;
 }
@@ -1887,10 +1944,15 @@ export function readyImportCandidates(db) {
 }
 
 export function setSeriesCv(db, seriesId, cvId, { locked = 0 } = {}) {
+  // Picks belong to the volume's issues: a different volume means they no
+  // longer apply (and would show as phantom "picked issues" on the series).
+  const cur = db.prepare('SELECT cv_id FROM series WHERE id=?').get(seriesId);
+  if (cur && cur.cv_id != null && Number(cur.cv_id) !== Number(cvId)) db.prepare('DELETE FROM issue_picks WHERE series_id=?').run(seriesId);
   return db.prepare('UPDATE series SET cv_id=?, cv_locked=? WHERE id=?').run(cvId, locked ? 1 : 0, seriesId).changes;
 }
 
 export function clearSeriesCv(db, seriesId) {
+  db.prepare('DELETE FROM issue_picks WHERE series_id=?').run(seriesId);
   return db.prepare('UPDATE series SET cv_id=NULL, cv_locked=0 WHERE id=?').run(seriesId).changes;
 }
 
@@ -1919,11 +1981,15 @@ export function untrackSeries(db, id) {
   if (!series) return { removed: false, files: [] };
   const files = db.prepare('SELECT path FROM library_files WHERE series_id=?').all(id).map((r) => r.path);
   db.prepare('DELETE FROM library_files WHERE series_id=?').run(id);
+  // Picks and personal follows go with the series — a stale skip left behind
+  // would silently apply if the same volume were added again.
+  db.prepare('DELETE FROM issue_picks WHERE series_id=?').run(id);
+  db.prepare('DELETE FROM user_follows WHERE series_id=?').run(id);
   if (String(series.url).startsWith('cv:') || SELF_DESCRIBED_TYPES.has(series.type || 'comic')) {
     db.prepare('DELETE FROM issues WHERE series_id=?').run(id);
     db.prepare('DELETE FROM series WHERE id=?').run(id);
   } else {
-    db.prepare('UPDATE series SET followed=0, cv_id=NULL, cv_locked=0, path=NULL WHERE id=?').run(id);
+    db.prepare("UPDATE series SET followed=0, monitor='none', monitor_from=NULL, cv_id=NULL, cv_locked=0, path=NULL WHERE id=?").run(id);
   }
   return { removed: true, files };
 }
@@ -1943,13 +2009,17 @@ export function mergeSeriesRows(db, keepId, dropId) {
     db.prepare('UPDATE issues SET series_id=? WHERE series_id=?').run(keepId, dropId);
     db.prepare('INSERT OR IGNORE INTO user_follows (user_id, series_id) SELECT user_id, ? FROM user_follows WHERE series_id=?').run(keepId, dropId);
     db.prepare('DELETE FROM user_follows WHERE series_id=?').run(dropId);
-    for (const t of ['grabs', 'scan_overrides', 'import_history', 'import_candidates']) {
+    for (const t of ['grabs', 'scan_overrides', 'import_history', 'import_candidates', 'issue_picks']) {
       try { db.prepare(`UPDATE ${t} SET series_id=? WHERE series_id=?`).run(keepId, dropId); } catch { /* table or column absent */ }
     }
     db.prepare('DELETE FROM series WHERE id=?').run(dropId);
-    db.prepare(`UPDATE series SET followed = MAX(followed, ?), path = COALESCE(path, ?), year = COALESCE(year, ?), publisher = COALESCE(publisher, ?),
+    // The keeper inherits the wider policy: anything beats 'none'.
+    const keepNone = (keep.monitor || 'none') === 'none', dropNone = (drop.monitor || 'none') === 'none';
+    const monitor = keepNone && !dropNone ? drop.monitor : (keep.monitor || (keep.followed ? 'all' : 'none'));
+    const monitorFrom = monitor === 'new' ? (keepNone ? drop.monitor_from : keep.monitor_from) : null;
+    db.prepare(`UPDATE series SET followed = MAX(followed, ?), monitor = ?, monitor_from = ?, path = COALESCE(path, ?), year = COALESCE(year, ?), publisher = COALESCE(publisher, ?),
                 url = CASE WHEN url LIKE 'cv:%' AND cv_id IS NOT NULL THEN 'cv:' || cv_id ELSE url END WHERE id=?`)
-      .run(drop.followed ? 1 : 0, drop.path || null, drop.year || null, drop.publisher || null, keepId);
+      .run(drop.followed ? 1 : 0, monitor, monitorFrom, drop.path || null, drop.year || null, drop.publisher || null, keepId);
   })();
   return true;
 }
@@ -1969,10 +2039,116 @@ export function setSeriesComplete(db, id, complete = 1) {
   db.prepare('UPDATE series SET complete=? WHERE id=?').run(complete ? 1 : 0, id);
 }
 
-// GLOBAL monitor flag (column named 'followed' for compatibility): drives the
-// download automation lanes and plugin queries.
+// Newest issue number ComicVine knows for the series — the default watermark
+// for 'new' ("from the latest issue onward").
+function newestIssueNumber(db, seriesId) {
+  const r = db.prepare(`SELECT MAX(CAST(ci.issue_number AS REAL)) n FROM cv_issues ci
+    JOIN series s ON s.cv_id = ci.cv_series_id WHERE s.id = ?`).get(seriesId);
+  return r?.n == null ? null : String(r.n);
+}
+const numText = (v) => { const n = Number(v); return v != null && v !== '' && Number.isFinite(n) ? String(n) : null; };
+
+// The monitoring policy — see the migration notes on series.monitor. 'new'
+// takes a starting issue number (`from`); when none is given it starts at the
+// newest issue ComicVine knows, i.e. "everything from here on". Keeps the
+// legacy `followed` flag in sync, and parks queue rows that stop being wanted.
+export function setMonitor(db, id, monitor, { from = null } = {}) {
+  if (!MONITOR_STATES.includes(monitor)) throw new Error(`monitor must be one of ${MONITOR_STATES.join(', ')}`);
+  const monitorFrom = monitor === 'new' ? (numText(from) ?? newestIssueNumber(db, id) ?? '0') : null;
+  db.prepare('UPDATE series SET monitor=?, monitor_from=?, followed=? WHERE id=?')
+    .run(monitor, monitorFrom, monitor === 'none' ? 0 : 1, id);
+  parkUnwanted(db, id);
+  return { monitor, monitor_from: monitorFrom, monitored: monitor === 'none' ? 0 : 1 };
+}
+
+// Legacy on/off flag (column named 'followed' for compatibility — plugins and
+// the mobile apps read it): on = monitor everything, off = monitor nothing.
 export function setFollowed(db, id, followed) {
-  db.prepare('UPDATE series SET followed=? WHERE id=?').run(followed ? 1 : 0, id);
+  return setMonitor(db, id, followed ? 'all' : 'none');
+}
+
+// Queue rows that stopped being wanted go back to 'pending' (parked): a
+// skipped issue must not keep downloading and a failed one must not keep
+// retrying. Rows already moving (downloading/grabbed/tagging) finish on their
+// own. Called after every policy or pick change.
+export function parkUnwanted(db, seriesId) {
+  return db.prepare(`UPDATE issues SET status='pending', error=NULL
+    WHERE series_id=? AND status IN ('queued','failed') AND url LIKE 'cvissue:%'
+      AND NOT EXISTS (SELECT 1 FROM wanted_issues w WHERE w.series_id = issues.series_id AND 'cvissue:' || w.cv_issue_id = issues.url)`)
+    .run(seriesId).changes;
+}
+
+// Per-issue exceptions. `want` true/false stores the MINIMAL pick: a row only
+// where the policy disagrees, so a later policy change is never shadowed by a
+// stale exception (and a "want" on an issue the policy already wants is a
+// no-op). `want` null clears the picks — back to the policy. A manual download
+// of a skipped issue goes through here too and un-skips it.
+export function setIssueWants(db, seriesId, cvIssueIds, want, { reason = 'manual', userId = null } = {}) {
+  const ids = [...new Set((cvIssueIds || []).map(Number).filter(Boolean))];
+  if (!ids.length) return { changed: 0 };
+  const inSeries = db.prepare('SELECT 1 FROM series s JOIN cv_issues ci ON ci.cv_series_id = s.cv_id WHERE s.id=? AND ci.comicvine_id=?');
+  const policyWants = db.prepare(`SELECT ${POLICY_WANTS} AS p FROM series s JOIN cv_issues ci ON ci.cv_series_id = s.cv_id WHERE s.id=? AND ci.comicvine_id=?`);
+  const up = db.prepare(`INSERT INTO issue_picks (cv_issue_id, series_id, want, reason, by_user) VALUES (?,?,?,?,?)
+    ON CONFLICT(cv_issue_id) DO UPDATE SET series_id=excluded.series_id, want=excluded.want, reason=excluded.reason, by_user=excluded.by_user, created_at=datetime('now')`);
+  const del = db.prepare('DELETE FROM issue_picks WHERE cv_issue_id=?');
+  let changed = 0;
+  db.transaction(() => {
+    for (const cvid of ids) {
+      if (!inSeries.get(seriesId, cvid)) continue;
+      if (want == null) { changed += del.run(cvid).changes; continue; }
+      const policy = Number(policyWants.get(seriesId, cvid)?.p) === 1;
+      if (policy === !!want) changed += del.run(cvid).changes; // the policy already agrees — no exception needed
+      else { up.run(cvid, seriesId, want ? 1 : 0, reason, userId); changed++; }
+    }
+    parkUnwanted(db, seriesId);
+  })();
+  return { changed };
+}
+
+// Picks whose issue is now on disk are fulfilled: return the "want" ones (so
+// whoever asked can be told) and drop them all — an owned issue needs no
+// exception, and a stale row would show as a phantom pick on the series.
+// `seriesId` null = the whole library (the nightly sweep).
+export function fulfilPicks(db, seriesId = null) {
+  const rows = db.prepare(`SELECT p.cv_issue_id, p.series_id, p.want, p.reason, p.by_user, ci.issue_number, ci.name,
+      COALESCE(cv.name, s.title) series_title
+    FROM issue_picks p
+    JOIN series s ON s.id = p.series_id
+    LEFT JOIN cv_issues ci ON ci.comicvine_id = p.cv_issue_id
+    LEFT JOIN cv_series cv ON cv.comicvine_id = s.cv_id
+    WHERE ${seriesId != null ? 'p.series_id = ? AND ' : ''}EXISTS (SELECT 1 FROM library_files lf WHERE lf.cv_issue_id = p.cv_issue_id AND lf.valid = 1)`)
+    .all(...(seriesId != null ? [seriesId] : []));
+  if (rows.length) db.prepare('DELETE FROM issue_picks WHERE cv_issue_id IN (SELECT value FROM json_each(?))').run(JSON.stringify(rows.map((r) => r.cv_issue_id)));
+  return rows.filter((r) => r.want === 1);
+}
+
+export function clearIssuePicks(db, seriesId) {
+  const n = db.prepare('DELETE FROM issue_picks WHERE series_id=?').run(seriesId).changes;
+  parkUnwanted(db, seriesId);
+  return n;
+}
+
+// Want state of specific issues of a series, for a UI to patch its rows after
+// a change: { cv_issue_id, wanted, why ('policy'|'pick'|null), pick ('want'|'skip'|null), reason }.
+export function wantStates(db, seriesId, cvIssueIds) {
+  const ids = [...new Set((cvIssueIds || []).map(Number).filter(Boolean))];
+  if (!ids.length) return [];
+  const w = db.prepare('SELECT cv_issue_id, why, reason FROM wanted_issues WHERE series_id=? AND cv_issue_id IN (SELECT value FROM json_each(?))').all(seriesId, JSON.stringify(ids));
+  const p = db.prepare('SELECT cv_issue_id, want, reason FROM issue_picks WHERE cv_issue_id IN (SELECT value FROM json_each(?))').all(JSON.stringify(ids));
+  const wm = new Map(w.map((r) => [r.cv_issue_id, r])), pm = new Map(p.map((r) => [r.cv_issue_id, r]));
+  return ids.map((id) => {
+    const wr = wm.get(id), pr = pm.get(id);
+    return { cv_issue_id: id, wanted: !!wr, why: wr ? wr.why : null, pick: pr ? (pr.want ? 'want' : 'skip') : null, reason: pr ? pr.reason : null };
+  });
+}
+
+// Wanted issues per series, for a bounded id list — { seriesId: n }.
+export function wantedCounts(db, seriesIds) {
+  const ids = [...new Set((seriesIds || []).map(Number).filter(Boolean))];
+  const out = {};
+  if (!ids.length) return out;
+  for (const r of db.prepare('SELECT series_id, COUNT(*) n FROM wanted_issues WHERE series_id IN (SELECT value FROM json_each(?)) GROUP BY series_id').all(JSON.stringify(ids))) out[r.series_id] = r.n;
+  return out;
 }
 
 // PERSONAL follow: this user's pull list. No effect on automation.
@@ -2005,9 +2181,6 @@ export function listQueue(db, limit = 200) {
      FROM issues i JOIN series s ON s.id = i.series_id
      LEFT JOIN cv_series cv ON cv.comicvine_id = s.cv_id
      WHERE i.status IN ('queued','downloading','grabbed','tagging','failed')
-       -- fork: never list an issue the user has explicitly unwanted
-       AND NOT EXISTS (SELECT 1 FROM issue_wants iw
-                        WHERE iw.wanted = 0 AND 'cvissue:' || iw.cv_issue_id = i.url)
      ORDER BY CASE i.status WHEN 'downloading' THEN 0 WHEN 'grabbed' THEN 1 WHEN 'tagging' THEN 2 WHEN 'queued' THEN 3 ELSE 4 END, i.id
      LIMIT ?`
   ).all(limit);
@@ -2015,9 +2188,7 @@ export function listQueue(db, limit = 200) {
 
 export function countQueue(db) {
   return db.prepare(`SELECT COUNT(*) n FROM issues i
-     WHERE i.status IN ('queued','downloading','grabbed')
-       AND NOT EXISTS (SELECT 1 FROM issue_wants iw
-                        WHERE iw.wanted = 0 AND 'cvissue:' || iw.cv_issue_id = i.url)`).get().n;
+     WHERE i.status IN ('queued','downloading','grabbed')`).get().n;
 }
 
 export function queuedCount(db) {
@@ -2048,17 +2219,41 @@ export function clearIssuesForRedownload(db, ids) {
 
 
 
-// --- fork: watch state & explicit per-issue wants ---------------------------
+// --- fork: watch state — a tri-state badge over upstream's monitor + picks --
+//
+// Upstream (0.8.0) models "what automation goes after" as a per-series policy
+// (series.monitor = all | new | none) plus per-issue picks (issue_picks). The
+// fork used to carry its own watch_state column with the same three-way idea:
+//   watched   → new issues are wanted automatically      ≡ monitor 'all'/'new'
+//   paused    → keep today's wants, add nothing new       ≡ monitor 'none' + want picks
+//   unwatched → nothing is wanted                         ≡ monitor 'none', no picks
+// Rather than keep two sources of truth, watch_state is now DERIVED from the
+// policy and the picks, and the fork's bulk setters translate onto upstream's
+// setMonitor / setIssueWants. Everything upstream reads (wanted_issues view,
+// search lanes, RSS, parkUnwanted) therefore sees exactly one definition.
+export const WATCH_STATES = ['watched', 'paused', 'unwatched'];
 
-// Is this cv_issue wanted? An explicit issue_wants row wins; otherwise the
-// series must be 'watched'. Used by the wanted list and every automation lane
-// so "wanted" means the same thing everywhere.
-export const WANTED_SQL = `(
-  COALESCE(
-    (SELECT iw.wanted FROM issue_wants iw WHERE iw.cv_issue_id = ci.comicvine_id),
-    CASE WHEN s.watch_state='watched' THEN 1 ELSE 0 END
-  ) = 1
-)`;
+// Un-owned hand-picked wants for a series — the thing that makes 'none' read
+// as "paused" rather than "unwatched". Owned picks are retired by fulfilPicks,
+// so the NOT EXISTS is only a guard against the window before it runs.
+export const PICK_WANTS_SQL = `(SELECT COUNT(*) FROM issue_picks p WHERE p.series_id = s.id AND p.want = 1
+   AND NOT EXISTS (SELECT 1 FROM library_files lfp WHERE lfp.cv_issue_id = p.cv_issue_id AND lfp.valid = 1))`;
+
+// SQL predicates for the ?ws= narrowing on the collection views (alias `s`).
+export const WATCH_STATE_WHERE = {
+  watched: "s.monitor IN ('all','new')",
+  paused: `(s.monitor = 'none' AND ${PICK_WANTS_SQL} > 0)`,
+  unwatched: `(s.monitor = 'none' AND ${PICK_WANTS_SQL} = 0)`,
+};
+
+export function watchStateOf(monitor, pickWants) {
+  if (monitor === 'all' || monitor === 'new') return 'watched';
+  return Number(pickWants) > 0 ? 'paused' : 'unwatched';
+}
+
+export function pickWantCount(db, seriesId) {
+  return db.prepare(`SELECT ${PICK_WANTS_SQL} n FROM series s WHERE s.id = ?`).get(seriesId)?.n || 0;
+}
 
 // fork: READ STATE. The reader plugin owns `reader_progress`
 // (user_id, issue_id, page, pages, completed), keyed by the ComicVine issue id
@@ -2121,95 +2316,92 @@ export function readCountsForSeries(db, seriesIds, userId) {
   return out;
 }
 
-export const WATCH_STATES = ['watched', 'paused', 'unwatched'];
 
-// Set the watch state for one or more series.
-//   watched   → clear overrides; everything missing is wanted, new issues too
-//   paused    → freeze the current wanted set as explicit rows, then stop
-//               auto-wanting anything new
-//   unwatched → clear overrides; nothing is wanted
+// Set the watch state for one or more series (bulk — the Library page selects
+// many at once), expressed in upstream's terms:
+//   watched   → monitor 'all' (skip picks are kept: "Forget picks" is explicit)
+//   paused    → freeze what is wanted right now into want picks, then 'none'
+//   unwatched → drop every pick, then 'none' (parkUnwanted clears the queue)
 // Returns the number of series updated.
 export function setSeriesWatchState(db, seriesIds, state) {
   if (!WATCH_STATES.includes(state)) throw new Error(`invalid watch state: ${state}`);
   const ids = (Array.isArray(seriesIds) ? seriesIds : [seriesIds]).map(Number).filter(Boolean);
   if (!ids.length) return 0;
-  const placeholders = ids.map(() => '?').join(',');
-
+  const frozen = db.prepare(`SELECT cv_issue_id FROM wanted_issues WHERE series_id = ?`);
   const tx = db.transaction(() => {
-    if (state === 'paused') {
-      // Materialise what is wanted right now so it survives the switch.
-      db.prepare(`INSERT OR REPLACE INTO issue_wants (cv_issue_id, series_id, wanted, source)
-        SELECT ci.comicvine_id, s.id, 1, 'freeze'
-          FROM series s
-          JOIN cv_issues ci ON ci.cv_series_id = s.cv_id
-         WHERE s.id IN (${placeholders})
-           AND ${WANTED_SQL}
-           AND NOT EXISTS (SELECT 1 FROM library_files lf WHERE lf.cv_issue_id = ci.comicvine_id AND lf.valid=1)`
-      ).run(...ids);
-    } else {
-      // watched / unwatched are absolute: drop overrides so the series state
-      // alone decides.
-      db.prepare(`DELETE FROM issue_wants WHERE series_id IN (${placeholders})`).run(...ids);
-      if (state === 'unwatched') {
-        // nothing in the series is wanted any more — clear its queue rows
-        // (including failed attempts, which the Queue page also lists)
-        db.prepare(`UPDATE issues SET status='skipped', error=NULL
-           WHERE series_id IN (${placeholders}) AND status IN ('queued','pending','failed')`).run(...ids);
+    for (const id of ids) {
+      if (state === 'paused') {
+        // Materialise the current wanted set BEFORE the policy flips to 'none',
+        // so the view's answer is what gets pinned. setIssueWants only stores a
+        // pick where the policy disagrees — under 'none' every want is one.
+        const keep = frozen.all(id).map((r) => r.cv_issue_id);
+        setMonitor(db, id, 'none');
+        if (keep.length) setIssueWants(db, id, keep, true, { reason: 'paused' });
+      } else if (state === 'unwatched') {
+        clearIssuePicks(db, id);
+        setMonitor(db, id, 'none');
+      } else {
+        setMonitor(db, id, 'all');
       }
     }
-    db.prepare(`UPDATE series SET watch_state=?, followed=? WHERE id IN (${placeholders})`)
-      .run(state, state === 'watched' ? 1 : 0, ...ids);
   });
   tx();
   return ids.length;
 }
 
-// Mark individual ComicVine issues wanted / not wanted. Explicit rows override
-// the series state in both directions.
+// Mark ComicVine issues wanted / not wanted across series (the Wanted and Queue
+// pages act on mixed selections). Groups by series and hands each group to
+// upstream's setIssueWants, which stores the minimal pick and parks queue rows.
+// `wanted` null clears the picks (back to the policy).
 export function setIssuesWanted(db, cvIssueIds, wanted) {
-  const ids = (Array.isArray(cvIssueIds) ? cvIssueIds : [cvIssueIds]).map(Number).filter(Boolean);
+  const ids = [...new Set((Array.isArray(cvIssueIds) ? cvIssueIds : [cvIssueIds]).map(Number).filter(Boolean))];
   if (!ids.length) return 0;
-  const ins = db.prepare(`INSERT INTO issue_wants (cv_issue_id, series_id, wanted, source)
-    VALUES (?, (SELECT s.id FROM series s JOIN cv_issues ci ON ci.cv_series_id = s.cv_id WHERE ci.comicvine_id=?), ?, 'manual')
-    ON CONFLICT(cv_issue_id) DO UPDATE SET wanted=excluded.wanted, source='manual'`);
-  const tx = db.transaction(() => { for (const id of ids) ins.run(id, id, wanted ? 1 : 0); });
-  tx();
-  return ids.length;
+  const bySeries = new Map();
+  const rows = db.prepare(`SELECT ci.comicvine_id cvid, s.id sid FROM cv_issues ci JOIN series s ON s.cv_id = ci.cv_series_id
+    WHERE ci.comicvine_id IN (SELECT value FROM json_each(?))`).all(JSON.stringify(ids));
+  for (const r of rows) { if (!bySeries.has(r.sid)) bySeries.set(r.sid, []); bySeries.get(r.sid).push(r.cvid); }
+  let n = 0;
+  db.transaction(() => {
+    for (const [sid, list] of bySeries) n += setIssueWants(db, sid, list, wanted).changed;
+  })();
+  return n;
 }
 
-// fork: when an issue stops being wanted, take it out of the download queue —
-// a queued/pending row for it is no longer something we intend to fetch.
-// Active grabs (already handed to a client) are left alone: cancelling those is
-// the Queue page's job and needs the client-side cancel.
+// Drop explicit picks so the issues follow their series policy again.
+export function clearIssueWants(db, cvIssueIds) {
+  return setIssuesWanted(db, cvIssueIds, null);
+}
+
+// Per-series wanted counts for the UI — same shape as upstream's wantedCounts.
+export function seriesWantedCounts(db, seriesIds) {
+  return wantedCounts(db, seriesIds);
+}
+
+// fork: when an issue stops being wanted, make sure it is out of the download
+// queue. parkUnwanted (run by setIssueWants) already parks rows matched by url,
+// but a queue row can carry an OLDER cv id (re-matched volume, sibling edition)
+// and then only matches by number — this catches those. Parked rows go back to
+// 'pending' like upstream's, so the two never disagree. In-flight rows
+// (downloading/grabbed/tagging) are left alone — they are already with a client
+// and must be cancelled from the Queue page.
 export function dequeueUnwantedIssues(db, cvIssueIds) {
   const ids = (Array.isArray(cvIssueIds) ? cvIssueIds : [cvIssueIds]).map(Number).filter(Boolean);
   if (!ids.length) return 0;
-  const ph = ids.map(() => '?').join(',');
-  // Issue rows are keyed to CV issues by the 'cvissue:<id>' url the queue uses.
-  const urls = ids.map((id) => 'cvissue:' + id);
-  // The Queue page lists queued/pending AND failed rows, so a failed attempt at
-  // something you no longer want has to go too. In-flight rows
-  // (downloading/grabbed/tagging) are left alone — those are already with a
-  // download client and must be cancelled from the Queue page.
-  const CLEARABLE = "status IN ('queued','pending','failed')";
-  let n = db.prepare(`UPDATE issues SET status='skipped', error=NULL
-     WHERE url IN (${ph}) AND ${CLEARABLE}`).run(...urls).changes;
-
-  // A queue row is linked to its CV issue by NUMBER as well as by url — the row
-  // can carry an older cv id (re-matched volume, sibling edition), in which case
-  // the url match above misses it. Clear those too: same series, same number.
+  const CLEARABLE = "status IN ('queued','failed')";
   const byNum = db.prepare(`SELECT i.id, i.issue_number FROM issues i
       JOIN series s ON s.id = i.series_id
       JOIN cv_issues ci ON ci.cv_series_id = s.cv_id
-     WHERE ci.comicvine_id = ? AND ${CLEARABLE}`);
+     WHERE ci.comicvine_id = ? AND ${CLEARABLE}
+       AND NOT EXISTS (SELECT 1 FROM wanted_issues w WHERE w.series_id = i.series_id AND w.cv_issue_id = ?)`);
   const numOf = db.prepare('SELECT issue_number FROM cv_issues WHERE comicvine_id = ?');
-  const clear = db.prepare("UPDATE issues SET status='skipped', error=NULL WHERE id = ?");
+  const clear = db.prepare("UPDATE issues SET status='pending', error=NULL WHERE id = ?");
+  let n = 0;
   for (const id of ids) {
     const want = numOf.get(id);
     if (!want) continue;
     const target = normalizeNumber(want.issue_number);
     if (!target) continue;
-    for (const row of byNum.all(id)) {
+    for (const row of byNum.all(id, id)) {
       if (normalizeNumber(row.issue_number) === target) n += clear.run(row.id).changes;
     }
   }
@@ -2218,7 +2410,7 @@ export function dequeueUnwantedIssues(db, cvIssueIds) {
 
 // fork: the Queue page works in `issues` row ids, not ComicVine ids. Map a set
 // of queue rows to the CV issues they represent (by url, else by number within
-// the row's series), so "unwant" from the queue writes the same override the
+// the row's series), so "unwant" from the queue writes the same pick the
 // series page does.
 export function cvIssueIdsForIssueRows(db, issueIds) {
   const ids = (Array.isArray(issueIds) ? issueIds : [issueIds]).map(Number).filter(Boolean);
@@ -2238,26 +2430,4 @@ export function cvIssueIdsForIssueRows(db, issueIds) {
     }
   }
   return [...out];
-}
-
-// Drop explicit overrides so the issues follow their series state again.
-export function clearIssueWants(db, cvIssueIds) {
-  const ids = (Array.isArray(cvIssueIds) ? cvIssueIds : [cvIssueIds]).map(Number).filter(Boolean);
-  if (!ids.length) return 0;
-  db.prepare(`DELETE FROM issue_wants WHERE cv_issue_id IN (${ids.map(() => '?').join(',')})`).run(...ids);
-  return ids.length;
-}
-
-// Per-series counts for the UI (how many issues are wanted right now).
-export function seriesWantedCounts(db, seriesIds) {
-  const ids = (Array.isArray(seriesIds) ? seriesIds : [seriesIds]).map(Number).filter(Boolean);
-  if (!ids.length) return {};
-  const rows = db.prepare(`SELECT s.id series_id, COUNT(*) n
-      FROM series s
-      JOIN cv_issues ci ON ci.cv_series_id = s.cv_id
-     WHERE s.id IN (${ids.map(() => '?').join(',')})
-       AND ${WANTED_SQL}
-       AND NOT EXISTS (SELECT 1 FROM library_files lf WHERE lf.cv_issue_id = ci.comicvine_id AND lf.valid=1)
-     GROUP BY s.id`).all(...ids);
-  return Object.fromEntries(rows.map((r) => [r.series_id, r.n]));
 }

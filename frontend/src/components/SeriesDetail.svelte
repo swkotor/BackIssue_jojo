@@ -1,11 +1,11 @@
 <script>
   import { goBack, navigate, route } from '../lib/router.svelte.js';
-  import { detail, detailSelected, flags, ops, loadCollection, reloadDetail, clearDetail, issueState, downloadCvIssues, redownloadCvIssues, redownloadIssues, watchDetailSweep } from '../lib/store.svelte.js';
+  import { detail, detailSelected, flags, ops, loadCollection, reloadDetail, clearDetail, issueState, downloadCvIssues, redownloadCvIssues, redownloadIssues, watchDetailSweep, refreshIssueStatuses } from '../lib/store.svelte.js';
   import { plugins, issueActions, seriesActions, issueActionsTick, issueCoverUrl, seriesViews, renderSeriesView } from '../lib/plugins.svelte.js';
   import { isTrusted, can } from '../lib/auth.svelte.js';
   import { apiGet, apiPost } from '../lib/api.js';
   import { notify } from '../lib/toasts.svelte.js';
-  import { fmt, humanBytes, issueMatchesFilter, windowRange } from '../lib/util.js';
+  import { fmt, humanBytes, issueMatchesFilter, windowRange, fmtDay } from '../lib/util.js';
 
   // List-view file columns come from the issue's best readable copy.
   const bestFile = (i) => (i.files || []).find((f) => f.valid) || null;
@@ -97,6 +97,12 @@
   const isUnmatched = $derived(!!det && det.source === 'unmatched');
   const issues = $derived(hasIssues ? det.issues : []);
   const missingIds = $derived(issues.filter((i) => !i.owned).map((i) => i.cv_issue_id));
+  const wantedCount = $derived(issues.filter((i) => i.wanted).length);
+  // What ships next, from the weekly release list (this week + next).
+  const nextShip = $derived.by(() => {
+    const list = (det?.upcoming || []).filter((u) => !u.owned && !u.collected && u.shipdate).sort((a, b) => String(a.shipdate).localeCompare(String(b.shipdate)));
+    return list[0] || null;
+  });
 
   const issueCountLabel = $derived(
     isCv && det.cv ? `${fmt(det.cv.issue_count)} issues`
@@ -131,14 +137,15 @@
   let issueView = $state(localStorage.getItem('issueView') || 'grid');
   function setIssueView(v) { issueView = v; localStorage.setItem('issueView', v); }
   const gridMode = $derived(issueView === 'grid');
-  const FILTERS = ['all', 'missing', 'saved', 'corrupt', 'untagged', 'failed'];
-  const FILTER_LABELS = { all: 'All', missing: 'Missing', saved: 'Saved', corrupt: 'Corrupt', untagged: 'Untagged', failed: 'Failed' };
+  const FILTERS = ['all', 'missing', 'wanted', 'saved', 'corrupt', 'untagged', 'failed'];
+  const FILTER_LABELS = { all: 'All', missing: 'Missing', wanted: 'Wanted', saved: 'Saved', corrupt: 'Corrupt', untagged: 'Untagged', failed: 'Failed' };
 
   // "find #" box: match against the row's text (number + title) — invaluable on
   // 2,000-issue series.
   function rowHidden(i) {
     const state = issueState(i);
-    if (!issueMatchesFilter(state, currentFilter)) return true;
+    // "Wanted" is a decision, not a file state — it lives beside the state filters.
+    if (currentFilter === 'wanted' ? !i.wanted : !issueMatchesFilter(state, currentFilter)) return true;
     const find = findText.trim().toLowerCase();
     if (find === '') return false;
     return !`${i.number || '—'} ${i.title || ''}`.toLowerCase().includes(find);
@@ -298,7 +305,7 @@
   // Live per-filter counts for the issue filter tabs.
   const filterCounts = $derived.by(() => {
     const c = {};
-    for (const f of FILTERS) c[f] = issues.filter((i) => issueMatchesFilter(issueState(i), f)).length;
+    for (const f of FILTERS) c[f] = f === 'wanted' ? issues.filter((i) => i.wanted).length : issues.filter((i) => issueMatchesFilter(issueState(i), f)).length;
     return c;
   });
 
@@ -336,41 +343,81 @@
     loadCollection();
   }
 
-  // The GLOBAL monitor flag — what download automation fetches. Library-manage
-  // roles flip it from the ⋯ menu; personal follows never touch it.
-  async function toggleMonitored() {
+  // Monitoring policy — what download automation fetches for this series:
+  // every missing issue, only new issues from a number onward, or nothing.
+  // Library-manage roles set it from the ⋯ menu; personal follows never touch
+  // it. Per-issue picks (below) override it either way.
+  const monitorKey = $derived(det?.series?.monitor || (s?.monitored ? 'all' : 'none'));
+  const monitorText = $derived(monitorKey === 'new' ? `Monitoring new issues from #${det?.series?.monitor_from ?? '?'}`
+    : monitorKey === 'all' ? 'Monitoring all issues' : 'Not monitored');
+  async function setMonitorPolicy(monitor) {
     if (!s) return;
-    const monitored = !s.monitored;
+    let from = null;
+    if (monitor === 'new') {
+      const newest = Math.max(0, ...issues.map((i) => parseFloat(i.number)).filter(Number.isFinite));
+      const v = await inputDialog({
+        title: 'Monitor new issues only',
+        message: 'Issues from this number onward are wanted and fetched as they appear; earlier gaps are left alone (you can still pick any of them by hand).',
+        value: String(det?.series?.monitor_from ?? newest), placeholder: 'Issue number', confirmLabel: 'Monitor',
+      });
+      if (v == null) return;
+      from = String(v).trim().replace(/^#/, '');
+      if (from === '' || !Number.isFinite(Number(from))) return notify('Enter an issue number, e.g. 150.', 'error');
+    }
+    let clearPicks = false;
+    const picked = det?.picks?.want || 0;
+    if (monitor === 'none' && picked > 0) {
+      const c = await choiceDialog({
+        title: 'Stop monitoring this series?',
+        message: `${fmt(picked)} issue${picked === 1 ? ' is' : 's are'} picked by hand. Keep wanting ${picked === 1 ? 'it' : 'them'}?`,
+        buttons: [{ label: 'Keep the picks', value: 'keep' }, { label: 'Forget them too', value: 'clear', danger: true }],
+      });
+      if (!c) return;
+      clearPicks = c === 'clear';
+    }
     try {
-      const r = await apiPost(`/api/collection/${s.id}/monitor`, { monitored });
+      const r = await apiPost(`/api/collection/${s.id}/monitor`, { monitor, from, clearPicks });
       if (r?.error) return notify(r.error, 'error');
+      detail.series.monitored = r.monitored;
     } catch { return notify('Could not update — is the app reachable?', 'error'); }
-    detail.series.monitored = monitored ? 1 : 0;
-    notify(monitored ? 'Auto-download enabled for this series.' : 'Auto-download disabled for this series.', 'ok');
+    notify(monitor === 'all' ? 'Monitoring every issue of this series.' : monitor === 'new' ? `Monitoring new issues from #${from}.` : 'Monitoring turned off for this series.', 'ok');
+    reloadDetail();
     loadCollection();
   }
-
-  // fork: pin/unpin an individual issue as wanted (Mylar-style toggle).
-  // An explicit flag overrides the series' watch state in both directions.
-  async function toggleWanted(i) {
-    const next = !i.wanted;
-    // Optimistic: flip the row, then persist. The issue list lives at
-    // detail.det.issues — reassign that array so Svelte re-renders.
-    i.wanted = next;
-    i.wantOverride = next ? 'wanted' : 'skipped';
-    if (detail.det?.issues) detail.det.issues = [...detail.det.issues];
-    try {
-      const r = await apiPost('/api/issues/wanted', { cvIssueIds: [i.cv_issue_id], wanted: next });
-      if (r?.error) throw new Error(r.error);
-      notify(next ? 'Marked wanted.' : 'Marked not wanted — removed from the queue.', 'ok');
-    } catch (e) {
-      i.wanted = !next;
-      i.wantOverride = null;
-      if (detail.det?.issues) detail.det.issues = [...detail.det.issues];
-      notify(String(e?.message || e) || 'Could not update this issue', 'error');
-    }
+  async function forgetPicks() {
+    if (!s) return;
+    const n = (det?.picks?.want || 0) + (det?.picks?.skip || 0);
+    if (!(await confirmDialog({ title: `Forget ${fmt(n)} picked issue${n === 1 ? '' : 's'}?`, message: 'Every issue goes back to what the monitoring policy says.', confirmLabel: 'Forget picks' }))) return;
+    const r = await apiPost(`/api/collection/${s.id}/monitor`, { monitor: monitorKey, from: det?.series?.monitor_from ?? null, clearPicks: true });
+    if (r?.error) return notify(r.error, 'error');
+    reloadDetail();
   }
 
+  // Per-issue wants: pick an issue the policy doesn't want, or skip one it
+  // does. The server stores only the exception and answers with each issue's
+  // resulting state, which is patched straight into the open rows.
+  async function setWants(cvIssueIds, want) {
+    if (!s || !cvIssueIds.length) return;
+    let r;
+    try { r = await apiPost(`/api/collection/${s.id}/wanted`, { cvIssueIds, want }); }
+    catch { return notify('Could not update — is the app reachable?', 'error'); }
+    if (r?.error) return notify(r.error, 'error');
+    const by = new Map((r.issues || []).map((x) => [x.cv_issue_id, x]));
+    for (const i of det.issues) {
+      const u = by.get(i.cv_issue_id);
+      if (u) { i.wanted = u.wanted; i.why = u.why; i.pick = u.pick; i.pick_reason = u.reason; }
+    }
+    if (det.picks) { det.picks.want = det.issues.filter((i) => i.pick === 'want').length; det.picks.skip = det.issues.filter((i) => i.pick === 'skip').length; }
+    refreshIssueStatuses(); // an unwanted queued/failed row comes back parked
+    if (cvIssueIds.length > 1) notify(want ? `Wanting ${fmt(cvIssueIds.length)} issues.` : `${fmt(cvIssueIds.length)} issues no longer wanted.`, 'ok');
+  }
+  const wantTitle = (i) => i.wanted
+    ? (i.why === 'pick' ? `Wanted — picked${i.pick_reason && i.pick_reason !== 'manual' ? ` (${i.pick_reason})` : ''}. Click to stop wanting it.` : 'Wanted — the series is monitored. Click to skip this issue.')
+    : (i.pick === 'skip' ? 'Skipped — click to want it again' : 'Not wanted — click to want just this issue');
+
+  // fork: the star toggles and the bulk "mark wanted" go through upstream's
+  // setWants, which stores the minimal pick and patches the rows in place.
+  const toggleWanted = (i) => setWants([i.cv_issue_id], !i.wanted);
   // Bulk version for the issues currently ticked on this page.
   // fork: flip an issue's read flag via the reader plugin's manual override
   // (POST /api/reader/issue/:id/mark). Optimistic, with the same store-shape
@@ -404,10 +451,8 @@
   async function markSelectedWanted(wanted) {
     const ids = [...detailSelected];
     if (!ids.length) return;
-    const r = await apiPost('/api/issues/wanted', { cvIssueIds: ids, wanted });
-    if (r?.error) return notify(r.error, 'error');
-    notify(`${ids.length} issue${ids.length === 1 ? '' : 's'} marked ${wanted ? 'wanted' : 'not wanted'}.`, 'ok');
-    reloadDetail();
+    await setWants(ids, wanted);
+    detailSelected.clear();
   }
 
   // fork: tri-state watch selector.
@@ -422,6 +467,7 @@
     } catch { return notify('Could not update — is the app reachable?', 'error'); }
     detail.series.watchState = state;
     detail.series.monitored = state === 'watched' ? 1 : 0;
+    reloadDetail(); // policy + picks changed server-side; rows carry why/pick
     notify({
       watched: 'Watched — new issues will be wanted automatically.',
       paused: 'Paused — existing wanted issues kept, new ones will not be added.',
@@ -617,7 +663,19 @@
 <svelte:window onresize={measure} />
 
 <section class="detail" bind:this={scroller} onscroll={onScroll}>
-  {#if !s}
+  {#if detail.failed}
+    <!-- A deleted, mistyped or restricted series id: say so, instead of a
+         header full of placeholders and a "is the app running?" note. -->
+    <div class="nopage">
+      <div class="nopage__card">
+        <div class="nopage__art"><Icon name={detail.notFound ? 'search' : 'alert-triangle'} size={24} /></div>
+        <div class="nopage__title">{detail.notFound ? 'This series isn’t in your library' : 'Couldn’t load this series'}</div>
+        <div class="nopage__text">{detail.notFound ? 'It may have been removed, or the link is wrong. Search your collection to find it, or add it again.' : 'The app didn’t answer. Check it is running and try again.'}</div>
+        {#if !detail.notFound}<div class="nopage__code">{detail.failReason || ''}</div>{/if}
+        <div class="nopage__actions"><button class="btn" onclick={goBack}><Icon name="arrow-left" size={14} /> Back to library</button></div>
+      </div>
+    </div>
+  {:else if !s}
     <div id="detail-empty" class="empty">
       <div class="empty__art"><Icon name="star" fill /></div>
       <div class="empty__title">Pick a series</div>
@@ -635,6 +693,14 @@
           <div class="series-tags">
             <span class="tag" id="series-pub">{s.publisher || 'Unknown publisher'}{det?.cv?.metron_imprint ? ` · ${det.cv.metron_imprint}` : ''}</span>
             <span class="tag tag--mono" id="series-issuecount">{issueCountLabel}</span>
+            {#if isCv && nextShip}
+              <span class="tag" id="series-next" title="From the weekly release list"><Icon name="calendar" size={12} /> Next: #{nextShip.number} · {fmtDay(nextShip.shipdate)}</span>
+            {/if}
+            {#if isCv}
+              <span class="tag mon-tag mon-tag--{monitorKey}" id="series-monitor" title="What download automation fetches for this series — change it under ⋯">
+                <Icon name={monitorKey === 'none' ? 'pause' : monitorKey === 'new' ? 'zap' : 'target'} size={12} /> {monitorText}
+              </span>
+            {/if}
             {#if det?.cv?.metron_series_type && !/single issue|ongoing/i.test(det.cv.metron_series_type)}
               <span class="tag" title="Series type (from enriched metadata)">{det.cv.metron_series_type}</span>
             {/if}
@@ -690,6 +756,7 @@
                 {#if hero.saved}<span class="sx-comp__leg sx-comp__leg--saved">{fmt(hero.saved)} saved</span>{/if}
                 {#if hero.downloading}<span class="sx-comp__leg sx-comp__leg--dl">{fmt(hero.downloading)} downloading</span>{/if}
                 {#if hero.missing}<span class="sx-comp__leg sx-comp__leg--miss">{fmt(hero.missing)} missing</span>{/if}
+                {#if wantedCount}<span class="sx-comp__leg sx-comp__leg--wanted" title="Automation searches for these">{fmt(wantedCount)} wanted</span>{/if}
                 {#if hero.corrupt}<span class="sx-comp__leg sx-comp__leg--bad">{fmt(hero.corrupt)} corrupt</span>{/if}
                 {#if hero.failed}<span class="sx-comp__leg sx-comp__leg--bad">{fmt(hero.failed)} failed</span>{/if}
                 {#if hero.untagged}<span class="sx-comp__leg sx-comp__leg--untagged">{fmt(hero.untagged)} untagged</span>{/if}
@@ -736,7 +803,7 @@
               {/if}
             {/each}
             {#if isTrusted()}
-              {@const ws = s.watchState || (s.monitored ? 'watched' : 'paused')}
+              {@const ws = s.watchState || (s.monitored ? 'watched' : 'unwatched')}
               {#if can('library.manage')}
                 <div class="wsbtns" role="group" aria-label="Series status">
                   <button class="wsbtn wsbtn--watched" class:is-on={ws === 'watched'}
@@ -773,7 +840,19 @@
                       <div class="menu__sep"></div>
                     {/if}
                     {#if !isLocal && can('library.manage')}
-
+                      <div class="menu__label">Monitoring</div>
+                      <button class="menu__item" class:is-current={monitorKey === 'all'} role="menuitemradio" aria-checked={monitorKey === 'all'} title="Keep the run complete — every missing issue is searched for"
+                        onclick={() => { moreOpen = false; if (monitorKey !== 'all') setMonitorPolicy('all'); }}><Icon name={monitorKey === 'all' ? 'check' : 'target'} /> All issues</button>
+                      <button class="menu__item" class:is-current={monitorKey === 'new'} role="menuitemradio" aria-checked={monitorKey === 'new'} title="Only issues from a number onward — earlier gaps are left alone"
+                        onclick={() => { moreOpen = false; setMonitorPolicy('new'); }}><Icon name={monitorKey === 'new' ? 'check' : 'zap'} /> New issues from #…</button>
+                      <button class="menu__item" class:is-current={monitorKey === 'none'} role="menuitemradio" aria-checked={monitorKey === 'none'} title="Nothing is fetched automatically — pick issues by hand"
+                        onclick={() => { moreOpen = false; if (monitorKey !== 'none') setMonitorPolicy('none'); }}><Icon name={monitorKey === 'none' ? 'check' : 'pause'} /> Off</button>
+                      {#if det?.picks && (det.picks.want || det.picks.skip)}
+                        {@const pn = det.picks.want + det.picks.skip}
+                        <button class="menu__item" role="menuitem" title="Drop the hand-picked exceptions — every issue follows the policy again"
+                          onclick={() => { moreOpen = false; forgetPicks(); }}><Icon name="rotate-ccw" /> Forget {fmt(pn)} picked issue{pn === 1 ? '' : 's'}</button>
+                      {/if}
+                      <div class="series-more__sep" role="separator"></div>
                     {/if}
                     {#if isTrusted()}
                       {#if !isLocal}
@@ -844,6 +923,12 @@
         {#if !pluginView && !isLocal}
           <div class="issues__head">
             <label class="checkall"><input type="checkbox" id="select-all" checked={visibleIssues.length > 0 && visibleIssues.every((i) => detailSelected.has(i.cv_issue_id))} onchange={(e) => selectAll(e.currentTarget.checked)} /> <span>Select all</span></label>
+            {#if isCv && detailSelected.size && can('downloads.grab')}
+              {@const selIds = issues.filter((i) => detailSelected.has(i.cv_issue_id) && !i.owned).map((i) => i.cv_issue_id)}
+              <!-- Selection-scoped want/unwant: picks for the selected gaps. -->
+              <button class="filter__btn wantbtn" disabled={!selIds.length} title="Want the selected issues — automation searches for them" onclick={() => setWants(selIds, true)}><Icon name="target" size={13} /> Want{selIds.length ? ` (${fmt(selIds.length)})` : ''}</button>
+              <button class="filter__btn wantbtn" disabled={!selIds.length} title="Stop wanting the selected issues" onclick={() => setWants(selIds, false)}><Icon name="ban" size={13} /> Unwant</button>
+            {/if}
             <div class="filter" id="filter">
               {#each FILTERS as f (f)}
                 {@const n = filterCounts[f]}
@@ -896,7 +981,7 @@
                 {@const cover = issueCoverUrl(i)}
                 <div class="icard"
                   class:is-read={i.readState === 'read'}
-                  class:is-corrupt={i.corrupt} class:is-checked={detailSelected.has(i.cv_issue_id)}
+                  class:is-corrupt={i.corrupt} class:is-checked={detailSelected.has(i.cv_issue_id)} class:is-wanted={i.wanted && !i.owned}
                   title={i.corrupt && corruptReason(i) ? 'Corrupt: ' + corruptReason(i) : (i.title || '')}>
                   <div class="icard__art" onclick={() => openIssueInfo(i.cv_issue_id, i.number)} role="button" tabindex="0"
                     onkeydown={(e) => { if (e.key === 'Enter') openIssueInfo(i.cv_issue_id, i.number); }}>
@@ -916,12 +1001,10 @@
                             onclick={() => a.run(i, detail.series)}>{@html typeof a.icon === 'function' ? a.icon(i) : a.icon}</button>
                         {/if}
                       {/each}
-                      {#if !i.owned}
-                        <button class="icard__btn" class:is-want={i.wanted}
-                          title={i.wanted ? 'Wanted — click to stop wanting it' : 'Not wanted — click to want this issue'}
-                          onclick={() => toggleWanted(i)}><Icon name="star" fill={!!i.wanted} /></button>
-                      {/if}
                       {#if can('downloads.grab')}
+                        {#if !i.owned && !i.corrupt}
+                          <button class="icard__btn icard__btn--want" class:is-on={i.wanted} title={wantTitle(i)} onclick={() => setWants([i.cv_issue_id], !i.wanted)}><Icon name="target" /></button>
+                        {/if}
                         {#if i.corrupt}
                           <button class="icard__btn icard__btn--warn" title="File is corrupt — re-download" onclick={() => redownloadCvIssues([i.cv_issue_id])}><Icon name="refresh" /></button>
                         {:else if !i.owned}
@@ -981,6 +1064,9 @@
                     <button class="issue__dl" title={typeof a.title === 'function' ? a.title(i) : a.title} onclick={(e) => { e.stopPropagation(); a.run(i, detail.series); }}>{@html typeof a.icon === 'function' ? a.icon(i) : a.icon}</button>
                   {/if}
                 {/each}
+                {#if !i.owned && !i.corrupt && can('downloads.grab')}
+                  <button class="issue__dl issue__want" class:is-on={i.wanted} title={wantTitle(i)} onclick={(e) => { e.stopPropagation(); setWants([i.cv_issue_id], !i.wanted); }}><Icon name="target" /></button>
+                {/if}
                 {#if i.corrupt && can('downloads.grab')}
                   <button class="issue__dl issue__dl--warn" title="File is corrupt — re-download" onclick={(e) => { e.stopPropagation(); redownloadCvIssues([i.cv_issue_id]); }}><Icon name="refresh" /></button>
                 {:else if i.owned}
@@ -988,12 +1074,8 @@
                 {:else if !i.corrupt && can('downloads.grab')}
                   <button class="issue__dl" title="Download this issue" onclick={(e) => { e.stopPropagation(); downloadCvIssues([i.cv_issue_id]); }}><Icon name="download" /></button>
                 {/if}
-                {#if !i.owned}
-                  <button class="issue__want" class:is-on={i.wanted}
-                    aria-label={i.wanted ? 'Wanted' : 'Want'}
-                    title={i.wanted
-                      ? (i.wantOverride === 'wanted' ? 'Wanted (pinned on this issue) — click to stop wanting it' : 'Wanted via the series status — click to skip this issue')
-                      : (i.wantOverride === 'skipped' ? 'Not wanted (pinned) — click to want it' : 'Not wanted — click to want this issue')}
+                {#if !i.owned && !can('downloads.grab')}
+                  <button class="issue__want" class:is-on={i.wanted} aria-label={i.wanted ? 'Wanted' : 'Want'} title={wantTitle(i)}
                     onclick={(e) => { e.stopPropagation(); toggleWanted(i); }}>
                     <Icon name="star" fill={!!i.wanted} size={15} />
                   </button>
@@ -1157,6 +1239,24 @@
   .sx-comp__leg--miss { color: var(--amber); }
   .sx-comp__leg--bad { color: var(--red); }
   .sx-comp__leg--untagged { color: var(--muted); }
+  .sx-comp__leg--wanted { color: var(--accent); }
+
+  /* Monitoring policy tag in the header + the ⋯ menu section. */
+  .mon-tag { display: inline-flex; align-items: center; gap: 5px; }
+  .mon-tag--all { color: var(--green); }
+  .mon-tag--new { color: var(--cyan); }
+  .mon-tag--none { color: var(--faint); }
+  .menu__label { padding: 6px 12px 2px; font: 600 10.5px var(--font-body); letter-spacing: .08em; text-transform: uppercase; color: var(--faint); }
+  :global(.series-more__menu .menu__item.is-current) { color: var(--accent); }
+
+  /* Want toggles: a wanted issue shows its target even when the row isn't hovered. */
+  .issue__want.is-on { opacity: 1; color: var(--accent); }
+  .issue__want.is-on:hover { color: #fff; background: var(--accent); }
+  :global(.icard__btn--want.is-on) { color: var(--accent); }
+  /* A wanted (unowned) card carries a small target mark at rest, so the grid
+     reads the same as the list without hovering. */
+  :global(.icard.is-wanted .icard__art::before) { content: ''; position: absolute; left: 7px; bottom: 7px; width: 9px; height: 9px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 2px rgba(12,10,18,.8); z-index: 2; pointer-events: none; }
+  .wantbtn { display: inline-flex; align-items: center; gap: 5px; }
 
   /* Count badge on the issue filter tabs. */
   .filter__count { margin-left: 6px; font: 600 10px var(--font-mono); background: var(--panel-2); color: var(--faint); border-radius: 999px; padding: 1px 6px; }

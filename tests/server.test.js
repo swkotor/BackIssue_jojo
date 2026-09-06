@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { openDb, upsertSeries, upsertIssue, upsertCvSeries, upsertCvIssue } from '../src/db.js';
+import { openDb, upsertSeries, upsertIssue, upsertCvSeries, upsertCvIssue, setMonitor } from '../src/db.js';
 import { createApp } from '../src/server.js';
 
 function makeApp() {
@@ -40,7 +40,14 @@ function makeApp() {
     confirmImportCandidate: (id) => { calls.importConfirm = id; return { id, status: 'ready' }; },
     skipImportCandidate: (id) => { calls.importSkip = id; return { id, status: 'skipped' }; },
     cvSetManual: async (id, cvId) => { calls.cvSet = { id, cvId }; return { series: { id }, cv: { id: cvId } }; },
-    addFromCv: async (cvId) => { calls.addedCv = cvId; return { seriesId: 5, outcome: 'created', cvId }; },
+    addFromCv: async (cvId, opts = {}) => {
+      calls.addedCv = cvId;
+      // like the real add: the series gets the requested policy ('none' for a
+      // "for these issues" add), else the default
+      const row = db.prepare('SELECT id FROM series WHERE cv_id=?').get(cvId);
+      if (row) setMonitor(db, row.id, opts.monitor || 'all');
+      return { seriesId: 5, outcome: row ? 'existing' : 'created', cvId };
+    },
     scanSeriesFolder: async (id) => { calls.scanned = id; return { started: true, dir: '/lib/X' }; },
     deleteComic: async (id, opts) => { calls.deleted = { id, ...opts }; return { deleted: true, deletedFiles: opts.deleteFiles ? 3 : 0 }; },
     refreshVolume: async (id) => { calls.refreshed = id; return { ok: true, issues: 7, detail: { issues: [] } }; },
@@ -695,7 +702,7 @@ test('add-cv auto-queues every missing issue of the added volume', async () => {
   const { app, db, calls } = makeApp();
   // what a real addFromCv leaves behind: the local series row (the stub
   // returns seriesId 5) and the CV volume's cached issue list
-  db.prepare("INSERT INTO series (id, title, url) VALUES (5, 'Earth X', 'cv:42')").run();
+  db.prepare("INSERT INTO series (id, title, url, cv_id) VALUES (5, 'Earth X', 'cv:42', 42)").run();
   upsertCvSeries(db, { id: 42, name: 'Earth X' });
   upsertCvIssue(db, { id: 901, cv_series_id: 42, issue_number: '1', name: 'One' });
   upsertCvIssue(db, { id: 902, cv_series_id: 42, issue_number: '2', name: 'Two' });
@@ -711,5 +718,65 @@ test('add-cv auto-queues every missing issue of the added volume', async () => {
     assert.equal(rows.length, 2);
     assert.ok(rows.every((x) => x.status === 'queued'));
     assert.ok(calls.downloads.length >= 1, 'the queue worker was kicked');
+  } finally { s.close(); }
+});
+
+test('add-cv with "only the issues that were asked for" queues just those; off, it still queues everything', async () => {
+  const config = (await import('../src/config.js')).default;
+  const seed = (db) => {
+    db.prepare("INSERT INTO series (id, title, url, cv_id) VALUES (5, 'Earth X', 'cv:42', 42)").run();
+    upsertCvSeries(db, { id: 42, name: 'Earth X' });
+    upsertCvIssue(db, { id: 901, cv_series_id: 42, issue_number: '1', name: 'One' });
+    upsertCvIssue(db, { id: 902, cv_series_id: 42, issue_number: '2', name: 'Two' });
+    upsertCvIssue(db, { id: 903, cv_series_id: 42, issue_number: '3', name: 'Three' });
+  };
+  const add = async (base, body) => (await fetch(`${base}/api/collection/add-cv`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })).json();
+  // ON: a list row for #2 adds the series and queues only #2
+  config.addDownloadOnlyRequested = true;
+  try {
+    const { app, db } = makeApp();
+    seed(db);
+    const s = await listen(app);
+    try {
+      const r = await add(`http://localhost:${s.address().port}`, { comicvineId: 42, cvIssueIds: [902] });
+      assert.equal(r.queued, 1);
+      assert.equal(r.scope, 'requested');
+      assert.deepEqual(db.prepare("SELECT url FROM issues WHERE status = 'queued' AND url LIKE 'cvissue:%' ORDER BY url").all().map((x) => x.url), ['cvissue:902']);
+      // an add with no issue in mind (Library / Discover) still fetches the whole run
+      const r2 = await add(`http://localhost:${s.address().port}`, { comicvineId: 42 });
+      assert.equal(r2.scope, 'policy');
+      assert.equal(db.prepare("SELECT COUNT(*) n FROM issues WHERE status = 'queued' AND url LIKE 'cvissue:%'").get().n, 3);
+    } finally { s.close(); }
+  } finally { config.addDownloadOnlyRequested = false; }
+  // OFF (default): the issue ids are ignored and everything missing is queued
+  {
+    const { app, db } = makeApp();
+    seed(db);
+    const s = await listen(app);
+    try {
+      const r = await add(`http://localhost:${s.address().port}`, { comicvineId: 42, cvIssueIds: [902] });
+      assert.equal(r.queued, 3);
+      assert.equal(r.scope, 'policy');
+    } finally { s.close(); }
+  }
+});
+
+test('releases/download refreshes the volume once when the issue is not cached yet, then explains', async () => {
+  const { app, db, calls } = makeApp();
+  db.prepare("INSERT INTO series (id, title, url, cv_id, followed, monitor) VALUES (9, 'Saga', 'cv:46568', 46568, 1, 'all')").run();
+  upsertCvSeries(db, { id: 46568, name: 'Saga' });
+  upsertCvIssue(db, { id: 1, cv_series_id: 46568, issue_number: '1', name: 'One' });
+  const s = await listen(app);
+  const base = `http://localhost:${s.address().port}`;
+  try {
+    // #1 is cached → queues without a refresh.
+    let r = await fetch(`${base}/api/releases/download`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ seriesId: 9, number: '1' }) });
+    assert.equal((await r.json()).queued, 1);
+    assert.equal(calls.refreshed, undefined);
+    // #2 is not → one refresh attempt, then a plain-language 404.
+    r = await fetch(`${base}/api/releases/download`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ seriesId: 9, number: '2' }) });
+    assert.equal(r.status, 404);
+    assert.equal(calls.refreshed, 9);
+    assert.match((await r.json()).error, /isn't listed on ComicVine yet/);
   } finally { s.close(); }
 });
