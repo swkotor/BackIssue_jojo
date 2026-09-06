@@ -701,7 +701,6 @@ function setScheduleCron(key, { cron, enabled } = {}) {
 // continuing/finished chips — lands on series cached before enrichment was on.
 // Volume-level only: the per-issue detail sweep is far too many requests to run
 // across a whole library, and carries nothing we need here.
-let refreshAllRunning = false;
 // fork: art for the Publishers browser. Publisher logos come from ComicVine's
 // /publishers resource; a franchise card borrows the art of the CHARACTER whose
 // name matches the group ("Batman", "X-Men"), which is what makes the grid read
@@ -795,29 +794,6 @@ async function refreshPublisherArt({ paceMs = 400, force = false } = {}) {
     publisherArtRunning = false;
   })().catch((e) => { job.fail(String(e?.message || e)); publisherArtRunning = false; });
   return { started: true, publishers: publishers.length, franchises: franchises.length };
-}
-
-async function refreshAllVolumes({ paceMs = 900 } = {}) {
-  if (refreshAllRunning) return { started: false, reason: 'already running' };
-  refreshAllRunning = true;
-  const ids = db.prepare('SELECT id FROM series WHERE cv_id IS NOT NULL ORDER BY id').all().map((r) => r.id);
-  const job = startJob('refresh-all', `Refresh metadata · ${ids.length} series`);
-  (async () => {
-    let done = 0; let failed = 0;
-    for (const id of ids) {
-      try {
-        const r = await refreshCvVolume(db, cvClient(), id);
-        if (!r?.ok) failed++;
-      } catch { failed++; }
-      done++;
-      job.progress({ done, total: ids.length });
-      await new Promise((r) => setTimeout(r, paceMs)); // stay polite to the API
-    }
-    logInfo(`Library metadata refresh finished: ${done - failed}/${done} volumes updated`, 'collection');
-    job.finish({ updated: done - failed, failed });
-    refreshAllRunning = false;
-  })().catch((e) => { job.fail(e); refreshAllRunning = false; });
-  return { started: true, series: ids.length, jobId: job.id };
 }
 
 async function refreshVolume(seriesId) {

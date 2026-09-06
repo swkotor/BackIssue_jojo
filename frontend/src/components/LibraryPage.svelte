@@ -25,14 +25,8 @@
     { key: 'ongoing', label: 'Ongoing' },
     { key: 'ended', label: 'Ended' },
     { key: 'problems', label: 'Problems' },
-    { key: 'ongoing', label: 'Continuing' },
-    { key: 'ended', label: 'Finished' },
     { key: 'unmatched', label: 'Unmatched' },
   ];
-
-  // fork: the chip rail is long enough to squeeze the sort/view/action controls
-  // off a narrow window, so it collapses to just the active chip. Device
-  // preference, like the view toggle.
 
   // fork: read progress for a series row. `read` counts FINISHED issues; the
   // denominator is the CV issue count, so it answers "how much of this series

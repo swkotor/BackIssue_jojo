@@ -341,6 +341,10 @@ function migrate(db) {
   // Owned issues need no pick. The old column and table go away afterwards so
   // nothing can read stale state.
   if (cols.includes('watch_state')) {
+    // A paused series may still carry followed=1 from before the fork kept
+    // the flag in sync, which upstream's migration read as 'all'. Paused
+    // meant "nothing new" — that is 'none'; its frozen wants become picks below.
+    db.exec("UPDATE series SET monitor='none', monitor_from=NULL, followed=0 WHERE watch_state='paused'");
     const have = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='issue_wants'").get();
     if (have) {
       db.exec(`INSERT OR IGNORE INTO issue_picks (cv_issue_id, series_id, want, reason, by_user)
@@ -2319,7 +2323,7 @@ export function readCountsForSeries(db, seriesIds, userId) {
 
 // Set the watch state for one or more series (bulk — the Library page selects
 // many at once), expressed in upstream's terms:
-//   watched   → monitor 'all' (skip picks are kept: "Forget picks" is explicit)
+//   watched   → monitor 'all', dropping the picks a pause froze (manual ones stay)
 //   paused    → freeze what is wanted right now into want picks, then 'none'
 //   unwatched → drop every pick, then 'none' (parkUnwanted clears the queue)
 // Returns the number of series updated.
@@ -2341,6 +2345,11 @@ export function setSeriesWatchState(db, seriesIds, state) {
         clearIssuePicks(db, id);
         setMonitor(db, id, 'none');
       } else {
+        // The freeze made by an earlier pause has done its job — under 'all'
+        // those picks are redundant and would only read as "picked" (and
+        // silently re-pause if the series went back to 'none'). Hand-made
+        // skips and wants are left alone.
+        db.prepare("DELETE FROM issue_picks WHERE series_id = ? AND reason = 'paused'").run(id);
         setMonitor(db, id, 'all');
       }
     }

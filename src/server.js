@@ -1713,13 +1713,6 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   });
   app.get('/api/tag-files', (req, res) => res.json(state.tagFiles || { running: false }));
   // Refresh a comic's metadata + issue list from ComicVine.
-  // fork: refresh metadata for the whole library (volume level, background job)
-  app.post('/api/cv/refresh-all', async (req, res) => {
-    if (typeof refreshAllVolumes !== 'function') return res.status(501).json({ error: 'not available' });
-    try { res.json(await refreshAllVolumes({})); }
-    catch (e) { res.status(500).json({ error: String(e?.message || e) }); }
-  });
-
   app.post('/api/collection/:id/refresh', async (req, res) => {
     try { res.json(await refreshVolume(Number(req.params.id))); }
     catch (e) { res.status(502).json({ error: String(e?.message || e) }); }
