@@ -910,6 +910,12 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     res.json({ plugins, restartRequired: plugins.some((p) => p.restartRequired), pending: pendingPluginChanges() });
   });
 
+  // fork: is this plugin one of Joel's forks? install-plugin-fork.sh writes the
+  // marker into the installed package.json.
+  const isForkedPlugin = (id) => {
+    try { return !!JSON.parse(fssync.readFileSync(path.join(pluginsDir(), id, 'package.json'), 'utf8')).jojoFork; }
+    catch { return false; }
+  };
   // Plugin catalog: the installable first-party plugins offered by the remote
   // manifest, cross-referenced with what's on disk NOW (not what this process
   // loaded at boot) so a just-installed or just-updated plugin reads as such.
@@ -921,11 +927,16 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     const plugins = available.map((a) => {
       const has = onDisk.has(a.id);
       const ver = has ? onDisk.get(a.id) : null;
+      // fork: a plugin installed from one of Joel's forks (install-plugin-fork.sh
+      // stamps package.json with jojoFork) is never offered a catalog "update" —
+      // that would silently replace the fork with upstream's zip.
+      const forked = has && isForkedPlugin(a.id);
       return {
         id: a.id, name: a.name || a.id, description: a.description || '', version: a.version || null,
         installed: has,
         installedVersion: ver,
-        updateAvailable: !!(has && a.version && ver && a.version !== ver),
+        forked,
+        updateAvailable: !forked && !!(has && a.version && ver && a.version !== ver),
       };
     });
     res.json({ plugins });
@@ -938,6 +949,9 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     const entry = available.find((p) => p.id === id);
     if (!entry) return res.status(404).json({ error: 'plugin not found in the catalog' });
     const wasInstalled = installedOnDisk().has(entry.id);
+    if (wasInstalled && isForkedPlugin(entry.id)) {
+      return res.status(409).json({ error: `${entry.id} is installed from your fork — update it with install-plugin-fork.sh, not from the catalog` });
+    }
     try {
       const r = await installPlugin(entry);
       markPluginPending(r.id, wasInstalled ? 'updated' : 'installed', r.version);
