@@ -1084,7 +1084,7 @@ const NEXT_ISSUE_DATE_SQL = `(SELECT MIN(COALESCE(ci.store_date, ci.cover_date))
    WHERE ci.cv_series_id=s.cv_id AND COALESCE(ci.store_date, ci.cover_date) IS NOT NULL
      AND date(COALESCE(ci.store_date, ci.cover_date)) > date('now'))`;
 
-const PUB_STATUS_SQL = `CASE
+export const PUB_STATUS_SQL = `CASE
     WHEN s.cv_id IS NULL THEN 'unknown'
     WHEN cv.metron_status IS NOT NULL AND TRIM(cv.metron_status) <> ''
       THEN CASE WHEN LOWER(cv.metron_status) IN ('ongoing','hiatus') THEN 'ongoing' ELSE 'ended' END
