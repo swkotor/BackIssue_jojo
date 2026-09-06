@@ -1,0 +1,35 @@
+# Manual "pull a refresh of upstream BackIssue" button.
+#
+# Gitea → BackIssue_jojo → Actions → Upstream sync → Run workflow.
+#
+# The runner (act_runner on Unraid) does no git work itself: it SSHes into the
+# Unraid host with a key whose authorized_keys entry is pinned with
+# command="/mnt/user/appdata/backissue-jojo/update.sh", so this key can run
+# that script and nothing else. update.sh fetches upstream, merges into the
+# fork, build-gates, boot-gates against a copy of the live catalog, pushes the
+# merge back to Gitea (which mirrors to GitHub) and redeploys the live
+# container in place — or stops and leaves the container untouched, raising an
+# Unraid notification, on a conflict or a failed gate. Its output is the job log.
+#
+# The same script runs weekly from cron; this is just the on-demand trigger.
+name: Upstream sync
+
+on:
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run update.sh on Unraid over a command-restricted SSH key
+        env:
+          UNRAID_SSH_KEY: ${{ secrets.UNRAID_SSH_KEY }}
+        run: |
+          set -eu
+          command -v ssh >/dev/null || (apt-get update -qq && apt-get install -y -qq openssh-client >/dev/null)
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$UNRAID_SSH_KEY" > ~/.ssh/unraid
+          chmod 600 ~/.ssh/unraid
+          # The command is fixed server-side; whatever is passed here is ignored.
+          ssh -i ~/.ssh/unraid -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+              -o ServerAliveInterval=30 root@192.168.2.44 upstream-sync
