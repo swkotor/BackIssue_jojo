@@ -1,4 +1,5 @@
 <script>
+  import { untrack } from 'svelte';
   import { goBack, navigate, route } from '../lib/router.svelte.js';
   import { detail, detailSelected, flags, ops, loadCollection, reloadDetail, clearDetail, issueState, downloadCvIssues, redownloadCvIssues, redownloadIssues, watchDetailSweep, refreshIssueStatuses } from '../lib/store.svelte.js';
   import { plugins, issueActions, seriesActions, issueActionsTick, issueCoverUrl, seriesViews, renderSeriesView } from '../lib/plugins.svelte.js';
@@ -414,6 +415,12 @@
   const wantTitle = (i) => i.wanted
     ? (i.why === 'pick' ? `Wanted — picked${i.pick_reason && i.pick_reason !== 'manual' ? ` (${i.pick_reason})` : ''}. Click to stop wanting it.` : 'Wanted — the series is monitored. Click to skip this issue.')
     : (i.pick === 'skip' ? 'Skipped — click to want it again' : 'Not wanted — click to want just this issue');
+
+  // fork: plugin series actions (reader's Mark read / Mark unread) label
+  // themselves by the current selection ("Mark 2 read"), and the selection is
+  // not something their label functions can subscribe to — bump the actions
+  // tick whenever it changes so the buttons re-render.
+  $effect(() => { void detailSelected.size; untrack(() => { issueActionsTick.n++; }); });
 
   // fork: the star toggles and the bulk "mark wanted" go through upstream's
   // setWants, which stores the minimal pick and patches the rows in place.
@@ -1038,8 +1045,7 @@
                 onkeydown={(e) => { if (e.key === 'Enter') toggleIssue(i, range.start + vi, e.shiftKey); }}>
                 <input type="checkbox" value={i.cv_issue_id}
                   checked={detailSelected.has(i.cv_issue_id)}
-                  onclick={(e) => e.stopPropagation()}
-                  onchange={() => toggleIssue(i, range.start + vi)} />
+                  onclick={(e) => { e.stopPropagation(); toggleIssue(i, range.start + vi, e.shiftKey); }} />
                 <span class="issue__num">{i.number || '—'}</span>
                 {#if readTracking}
                   <button class="issue__read issue__read--{i.readState || 'unread'}"
