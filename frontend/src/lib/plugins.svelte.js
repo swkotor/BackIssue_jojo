@@ -216,6 +216,10 @@ const bi = {
 // The server-rendered shell installs a stub BackIssue before any plugin
 // script can run; adopt whatever it queued, then take the global over.
 for (const fn of window.BackIssue?._q || []) bi._clients.push(fn);
+// fork: the reader plugin's Mark read / Mark unread look for the checked issues
+// on window.BackIssue (not on the api object they were handed), so without
+// this they silently act on the whole series instead of the selection.
+bi.selectedIssues = () => [...detailSelected];
 window.BackIssue = bi;
 export const BackIssue = bi;
 
