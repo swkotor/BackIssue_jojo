@@ -8,6 +8,70 @@ by the maintainers when changes merge, so concurrent PRs don't conflict here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The event-loop watchdog now actually restarts a wedged server in Docker.**
+  The app ran as the container's first process, and the kernel ignores a
+  process's own kill signal in that position, so the watchdog's restart was
+  silently a no-op (a stalled production server survived it for an hour).
+  The official images now start under `tini`, which also reaps the
+  health-check probes that piled up as zombie processes during a stall. A
+  server that still finds itself as PID 1 logs a warning saying how to fix it.
+
+## [0.8.1] — 2026-09-08
+
+### Added
+
+- **Diagnostics from the mobile apps.** A phone signed in to the server can
+  send its own diagnostics report (device, app build, connection and
+  playback failures) through the server, which wraps it into a support
+  package and returns a code. An admin's phone sends the full package; any
+  other user's phone sends a lite one with no settings, folders, indexers or
+  server log.
+- **Send to support.** Next to the download, "Send to BackIssue support"
+  uploads the same package to the hosted service, authenticated with the
+  install's own metadata key, and shows a short code to quote in the
+  report. The package is kept for 60 days and only the BackIssue team can
+  open it. An optional note travels with it.
+- **Support package.** System → Tools → Getting help downloads one zip to
+  attach to a bug report: version and build, runtime and host, disk and
+  database size, settings with every key, password and token redacted,
+  installed plugins, libraries, jobs and schedules, queued and failed
+  downloads, recent history and the last two thousand log entries with
+  secrets blanked. No comics, user names or e-mail addresses are included.
+
+### Fixed
+
+- **Memory no longer climbs after cover and page resizing.** Freed image
+  buffers stayed resident in glibc's allocator; on a large library the
+  server sat at 4 GB after a few bursts of cover renders. The Docker images
+  now run the app with jemalloc, which returns that memory, and fall back
+  to a two-arena malloc where it is missing. Child processes are not
+  preloaded.
+
+### Fixed
+
+- **One collection load on reload, not two.** The web app requested the
+  first library page and the chip counts twice at boot.
+
+### Fixed
+
+- **Mobile library filters answer in milliseconds, not seconds.** The
+  unpaginated collection list the mobile apps use mapped every series row,
+  including the whole on-demand ebook and audiobook catalogs, before
+  dropping the non-comic rows. On a large library that cost about four
+  seconds per filter change. The exclusion now happens in the query.
+
+### Fixed
+
+- **A frozen server restarts itself.** If the main thread stops responding
+  for two minutes, or the heap sits at V8's limit for a minute and a half,
+  a watchdog thread kills the process so Docker's restart policy brings up
+  a fresh one, instead of the site silently timing out for hours. Memory
+  use is logged every ten minutes so a leak leaves a trend in the log.
+  `BACKISSUE_WATCHDOG=0` turns it off. The browser image now carries the
+  same health check as the standard one.
+
 ## [0.8.0] — 2026-09-05
 
 ### Fixed

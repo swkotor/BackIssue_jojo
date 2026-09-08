@@ -42,7 +42,7 @@ if (process.env.BUILD_CHANNEL && process.env.BUILD_CHANNEL !== 'release') {
   APP_VERSION += `-${process.env.BUILD_CHANNEL}${sha ? '.' + sha : ''}`;
 }
 
-export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvSearch, cvVolumeInfo, cvIssueInfo, arcSearch, arcIssues, cblResolve, cleanupSeriesFiles, runImportScan, runImport, importState, runTool, toolsState, runLibraryRefile, refileState, stats, listSources, queueProgress, packProgress, cancelGrab, testCvKeys, usenetSearch, usenetGrab, torrentSearch, torrentGrabPack, searchSources, manualGrabResult, grabSourcePack, searchPacks, grabPack, setAliases, pluginRoutes = [], pluginClientAssets = [], matchImportCandidate, confirmImportCandidate, skipImportCandidate, cvSetManual, addFromCv, scanSeriesFolder, deleteComic, refreshVolume, refreshAllVolumes, refreshPublisherArt, tagSeriesFiles, checkReleases, listJobs, clearJobs, listLogs, clearLogs, listSchedules, setScheduleCron, runScheduleNow, getSettings, saveSettings, requestRestart, state }) {
+export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvSearch, cvVolumeInfo, cvIssueInfo, arcSearch, arcIssues, cblResolve, cleanupSeriesFiles, runImportScan, runImport, importState, runTool, toolsState, runLibraryRefile, refileState, stats, listSources, queueProgress, packProgress, cancelGrab, testCvKeys, usenetSearch, usenetGrab, torrentSearch, torrentGrabPack, searchSources, manualGrabResult, grabSourcePack, searchPacks, grabPack, setAliases, pluginRoutes = [], pluginClientAssets = [], matchImportCandidate, confirmImportCandidate, skipImportCandidate, cvSetManual, addFromCv, scanSeriesFolder, deleteComic, refreshVolume, refreshPublisherArt, tagSeriesFiles, checkReleases, listJobs, clearJobs, listLogs, clearLogs, listSchedules, setScheduleCron, runScheduleNow, getSettings, saveSettings, requestRestart, supportPackage, supportSend, supportSendMobile, state }) {
   const startDownloads = (arg) => {
     if (!state.queue.running) {
       state.queue.running = true;
@@ -246,6 +246,11 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   // without being able to reshape the library).
   const PERM_RULES = [
     [/^\/api\/settings/, 'settings.manage'], [/^\/api\/indexers/, 'settings.manage'],
+    // A mobile app's diagnostics may come from any signed-in user (the
+    // handler sends a lite package unless they are an admin); the full
+    // support package carries settings (redacted) and logs — admin only.
+    [/^\/api\/support\/mobile$/, 'library.view'],
+    [/^\/api\/support/, 'settings.manage'],
     // Connection tests reach arbitrary hosts with credentials (SSRF + probing)
     // — admin only. Routes are named <thing>/test, so match /test at the end.
     [/\/test$/, 'settings.manage'],
@@ -1307,6 +1312,50 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
       sort: String(req.query.sort || 'series'),
     }));
   });
+  // ---- Support package ----
+  // One zip with version, runtime, settings (secrets redacted), plugins,
+  // libraries, jobs, recent downloads and the log — what a bug report needs.
+  app.get('/api/support/package', async (req, res) => {
+    if (!supportPackage) return res.status(501).json({ error: 'Support package not available' });
+    try {
+      const { buffer, filename } = await supportPackage();
+      res.set('Content-Type', 'application/zip');
+      res.set('Content-Disposition', `attachment; filename="${filename}"`);
+      res.set('Cache-Control', 'no-store');
+      res.send(buffer);
+    } catch (e) {
+      res.status(500).json({ error: `Could not build the support package: ${e?.message || e}` });
+    }
+  });
+
+  // POST /api/support/send — build the package and hand it to the hosted
+  // support service, which answers with a short code the user quotes in
+  // their report. Same admin permission as the download.
+  app.post('/api/support/send', async (req, res) => {
+    if (!supportSend) return res.status(501).json({ error: 'Sending to support is not available' });
+    try {
+      const note = String(req.body?.note || '').slice(0, 200);
+      res.json(await supportSend({ note }));
+    } catch (e) {
+      res.status(502).json({ error: String(e?.message || e) });
+    }
+  });
+
+  // POST /api/support/mobile — a phone's diagnostics report. Wrapped into a
+  // support package (full when the sender is an admin, lite otherwise) and
+  // sent to the hosted support service; answers with the code.
+  app.post('/api/support/mobile', async (req, res) => {
+    if (!supportSendMobile) return res.status(501).json({ error: 'Sending to support is not available' });
+    const report = req.body && typeof req.body === 'object' ? req.body : {};
+    if (JSON.stringify(report).length > 300 * 1024) return res.status(413).json({ error: 'Diagnostics report too large' });
+    const full = !!users.roleGrants(db, req.user.role, 'settings.manage', permCatalog);
+    try {
+      res.json(await supportSendMobile({ report, full, user: { id: req.user.id, role: req.user.role } }));
+    } catch (e) {
+      res.status(502).json({ error: String(e?.message || e) });
+    }
+  });
+
   app.get('/api/tools', (req, res) => res.json(toolsState()));
   app.post('/api/tools/:tool', (req, res) => res.json(runTool(req.params.tool, req.body || {})));
 

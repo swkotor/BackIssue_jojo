@@ -4,6 +4,11 @@ import { processPack } from './pack.js';
 import { createApp } from './server.js';
 import config from './config.js';
 import { loadSettings, currentSettings, saveSettings } from './settings.js';
+import { buildSupportPackage } from './support.js';
+import { sendSupportPackage } from './cv.js';
+import { pluginCatalog as supportPluginCatalog, registeredSources as supportSources, registeredNotifiers as supportNotifiers, pluginsDir as supportPluginsDir } from './plugins.js';
+import { listLibraries as supportLibraries, libraryStats as supportLibraryStats, listImportHistory as supportImportHistory } from './db.js';
+import { loadAttestation as supportBuildInfo } from './attest.js';
 import { loadPlugins, registeredStartups, registeredRoutes, registeredJobs, registeredClientAssets, registeredImportHandlers } from './plugins.js';
 import { spawn } from 'node:child_process';
 import fsp from 'node:fs/promises';
@@ -27,6 +32,7 @@ import { createDownloadMonitor } from './downloadmonitor.js';
 import { tagAllUntagged, convertAllCbr, removeAllDuplicates, verifyLibrary, relinkAllCv, scanEntireLibrary, backupDatabase, renameAllFiles, removeGhostSeries } from './tools.js';
 import { collectionStats } from './stats.js';
 import { installConsoleCapture, attachLogDb, listLogs, clearLogs, logInfo, logWarn, logError, logCounts, logCategories } from './logstore.js';
+import { startWatchdog } from './watchdog.js';
 import { runCvMatch as runCvMatchLib, cacheAndLink, addSeriesFromCv, refreshCvVolume, refreshAllIssueDetails, rankCandidates, rematchMismatched, mergeDuplicateSeries } from './cvmatch.js';
 import { getSeriesById, seriesCollectionDetail, untrackSeries, getCvIssue, upsertSeries, setSeriesPath,
   ensureCvIssueRow, recordGrab, getGrab, setGrabStatus, setIssueStatus, setSeriesAliases, setSeriesType, listLibraries, libraryFolders, createLibrary, assignSeriesLibrary, seriesSearchNames,
@@ -127,6 +133,11 @@ try {
 // otherwise vanish silently leaves a reason in the Logs page. Installed right
 // after the log DB is attached so even an early-boot failure is recorded.
 logInfo(`BackIssue started (pid ${process.pid}, node ${process.version})`, 'app');
+// The container entrypoint preloads jemalloc for this process (see the
+// Dockerfiles); children must not inherit it — Chromium in particular brings
+// its own allocator and a preloaded one is not something we have tested.
+delete process.env.LD_PRELOAD;
+
 process.on('uncaughtException', (err) => {
   try { logError(`Uncaught exception — app is stopping: ${err?.stack || err}`, 'app'); } catch { /* ignore */ }
   console.error('Uncaught exception:', err);
@@ -1390,6 +1401,21 @@ async function prepareRedownload(issueIds) {
   }
 }
 
+// The support package (System → Tools): built the same way whether it is
+// downloaded or sent to the hosted support service.
+const appVersionNow = () => { try { return JSON.parse(fss.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version; } catch { return '0.0.0'; } };
+const buildSupportPackageNow = (extra = {}) => buildSupportPackage({
+    ...extra,
+    db, config, settings: currentSettings,
+    version: appVersionNow(),
+    build: supportBuildInfo(),
+    dataDir: nodePath.dirname(config.dbPath || ''), dbPath: config.dbPath || '', pluginsDir: supportPluginsDir(),
+    plugins: supportPluginCatalog, jobs: () => listJobs(60), schedules: () => scheduler.list(),
+    logs: (o) => ({ logs: listLogs(o) }), sources: supportSources, notifiers: supportNotifiers,
+    libraries: () => supportLibraries(db), libraryStats: () => supportLibraryStats(db), state,
+    importHistory: () => supportImportHistory(db, { limit: 100 }).items,
+  });
+
 const app = createApp({
   db, runDownloads, state,
   prepareRedownload,
@@ -1446,6 +1472,18 @@ const app = createApp({
   setScheduleCron,
   runScheduleNow: (key) => scheduler.runNow(key),
   getSettings: currentSettings,
+  supportPackage: () => buildSupportPackageNow(),
+  supportSend: async ({ note = '' } = {}) => {
+    const pkg = await buildSupportPackageNow();
+    return sendSupportPackage(config, pkg.buffer, { version: appVersionNow(), note });
+  },
+  supportSendMobile: async ({ report = {}, full = false, user = null } = {}) => {
+    const mobile = { ...report, sentBy: user ? { id: user.id, role: user.role } : null, serverVersion: appVersionNow() };
+    const pkg = await buildSupportPackageNow({ lite: !full, extraFiles: { 'mobile.json': JSON.stringify(mobile, null, 2) } });
+    const label = [report.platform, report.app].filter(Boolean).join(' ');
+    const note = `mobile${label ? ' ' + label : ''}${report.note ? ': ' + String(report.note) : ''}`.slice(0, 200);
+    return sendSupportPackage(config, pkg.buffer, { version: appVersionNow(), note });
+  },
   saveSettings,
   requestRestart,
 });
@@ -1453,6 +1491,18 @@ const httpServer = app.listen(config.port, () => {
   console.log(`UI ready: http://localhost:${config.port}`);
 });
 scheduler.start();
+
+// A wedged main thread (a runaway loop, or a heap pinned at V8's limit) takes
+// every route and timer down with it and can't even honour SIGTERM. The
+// watchdog worker notices and kills the process, so the supervisor's restart
+// policy brings back a fresh one instead of a silent, hours-long outage.
+// BACKISSUE_WATCHDOG=0 disables it; BACKISSUE_WATCHDOG_STALL_MS tunes it.
+if (process.env.BACKISSUE_WATCHDOG !== '0') {
+  startWatchdog({
+    stallMs: Number(process.env.BACKISSUE_WATCHDOG_STALL_MS) || undefined,
+    log: { info: (m) => logInfo(m, 'app'), warn: (m) => logWarn(m, 'app') },
+  });
+}
 
 // Resume the download queue after a restart. Queued rows survive in the DB
 // but the worker only ever started when NEW work arrived — so a queue that
