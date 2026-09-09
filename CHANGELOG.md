@@ -8,6 +8,66 @@ by the maintainers when changes merge, so concurrent PRs don't conflict here.
 
 ## [Unreleased]
 
+### Added
+
+- Reading lists now report how many volumes they span and the first few covers,
+  so a list is recognisable before you open it.
+- Filling a reading list's gaps can target specific issues instead of every
+  unowned one in the list.
+
+## [0.8.2] - 2026-09-08
+
+### Fixed
+
+- **A collected edition no longer arrives in place of a single issue.** A trade
+  or omnibus numbers its volume where an issue numbers itself, so a request for
+  issue 12 could be answered with volume 12 of a collection — a much larger
+  file, filed under that issue and marked done, so the real issue was never
+  fetched again. A release that announces itself as a collection is now refused
+  when the series being downloaded is not itself a collected run. Collections
+  still match their own releases, a series whose name carries an edition word
+  is unaffected, and a manual search still lists everything so you can choose.
+
+### Changed
+
+- **Download sites are managed together, apart from plugins.** A site the app
+  can download from is no longer a plugin of its own: sites live in a
+  `sources/` folder, all of them maintained in one place, and appear under
+  **Download sites** on the Plugins page with a link to their settings. The
+  plugin list stays about plugins as the number of sites grows. A site whose
+  code has to live elsewhere can still be a plugin, and when a plugin offers a
+  site that is already installed, the installed one is used and the log says
+  which plugin was ignored.
+
+- **A source is only searched for the library types it serves.** A comics site
+  is no longer asked for a manga chapter, and a manga site is no longer asked
+  for a western comic, so a manual search stops waiting on requests that could
+  never match. Sources that carry anything, such as the indexer-backed ones,
+  are unaffected.
+
+### Added
+
+- **One FlareSolverr setting for every source.** The service that gets past
+  Cloudflare is something you run, not a property of any one site, so it now
+  lives once in **Settings → Downloading** instead of being asked for by each
+  source. An address already set on a source is carried over automatically,
+  and still wins for that source if you keep it.
+- **Sources say whether they need the browser build.** The app ships in two
+  builds, and the lean one has no browser at all. A source now declares what
+  it needs, and the app always takes the cheapest route that works: plain
+  HTTP, then FlareSolverr, and the built-in browser only as a last resort. A
+  source that genuinely cannot work without a browser stays switched off on
+  the lean build and says so on its settings card, instead of failing every
+  download it is handed.
+- **A toolkit for download-site sources.** A plugin now describes a site in a
+  few dozen lines — how to search it and where a result's file or page images
+  are — and the app supplies the rest: browser-like HTTP with Cloudflare
+  handling (FlareSolverr when configured), per-site request pacing, the
+  shared release matcher, archive checking and CBR-to-CBZ conversion, page
+  image assembly into a CBZ or PDF, and a settings card with a Test button
+  that the Settings page renders by itself. Manga and manhwa sites, whose
+  chapters are lists of page images, are a first-class shape.
+
 ### Fixed
 
 - **The event-loop watchdog now actually restarts a wedged server in Docker.**

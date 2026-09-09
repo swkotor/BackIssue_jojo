@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { pluginApi, registeredSources, loadPluginsFromDir, pluginCatalog, setPluginEnabled, markPluginPending, pendingPluginChanges, clearPluginPending, installedOnDisk } from '../src/plugins.js';
+import { pluginApi, registeredSources, loadPluginsFromDir, pluginCatalog, setPluginEnabled, markPluginPending, pendingPluginChanges, clearPluginPending, installedOnDisk, registeredClientAssets } from '../src/plugins.js';
 
 test('registerSource adds a source and is idempotent by id', () => {
   const before = registeredSources().length;
@@ -167,4 +167,62 @@ test('registerRemoteBookSource: validated, idempotent by id, and returned by reg
   pluginApi.registerRemoteBookSource({ id: 'no-mat', listPage: async () => ({}) });
   pluginApi.registerRemoteBookSource({ listPage: async () => ({}), materialize: async () => ({}) }); // no id
   assert.equal(registeredRemoteBookSources().length, before + 1);
+});
+
+test('a bundled source is catalogued as a source, not a plugin', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-sources-'));
+  fs.mkdirSync(path.join(dir, 'examplesite'));
+  fs.writeFileSync(path.join(dir, 'examplesite', 'index.js'),
+    "export default function register(api) { api.registerSource({ id: 'examplesite', label: 'Example Site', isEnabled: () => true, find: async () => null, fetch: async () => ({}) }); }\n");
+
+  const loaded = await loadPluginsFromDir(dir, pluginApi, [], 'source');
+  assert.deepEqual(loaded, ['examplesite']);
+  const row = pluginCatalog().find((p) => p.name === 'examplesite');
+  assert.equal(row.kind, 'source', 'the page can tell the two apart');
+  assert.equal(row.loaded, true);
+  assert.equal(row.counts.sources, 1);
+
+  // A plugin that ships the same site does not replace what the app bundles.
+  const pdir = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-dupsrc-'));
+  fs.mkdirSync(path.join(pdir, 'examplecopy'));
+  fs.writeFileSync(path.join(pdir, 'examplecopy', 'index.js'),
+    "export default function register(api) { api.registerSource({ id: 'examplesite', label: 'A copy', isEnabled: () => true, find: async () => null, fetch: async () => ({}) }); }\n");
+  await loadPluginsFromDir(pdir, pluginApi, []);
+  const registered = registeredSources().filter((s) => s.id === 'examplesite');
+  assert.equal(registered.length, 1, 'registered once');
+  assert.equal(registered[0].label, 'Example Site', 'and it is the built-in one');
+
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(pdir, { recursive: true, force: true });
+});
+
+test('a plugin whose site is already installed is skipped, not half-loaded', async () => {
+  // The site, installed from sources/.
+  const sdir = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-site-'));
+  fs.mkdirSync(path.join(sdir, 'movedsite'));
+  fs.writeFileSync(path.join(sdir, 'movedsite', 'index.js'),
+    "export default function register(api) { api.registerSource({ id: 'movedsite', label: 'Moved Site', isEnabled: () => true, find: async () => null, fetch: async () => ({}) }); }\n");
+  await loadPluginsFromDir(sdir, pluginApi, [], 'source');
+
+  // The same site still installed the old way, as a plugin. Loading it would
+  // register nothing new but would still inject its own settings panel beside
+  // the card the app draws — two of every control on the settings page.
+  const pdir = fs.mkdtempSync(path.join(os.tmpdir(), 'bi-old-'));
+  fs.mkdirSync(path.join(pdir, 'movedsite'));
+  fs.writeFileSync(path.join(pdir, 'movedsite', 'index.js'),
+    "export default function register(api) { api.registerSource({ id: 'movedsite', label: 'Old copy', isEnabled: () => true, find: async () => null, fetch: async () => ({}) }); api.registerClientAsset({ js: 'client/ui.js' }); }\n");
+  const assetsBefore = registeredClientAssets().length;
+  const loaded = await loadPluginsFromDir(pdir, pluginApi, []);
+
+  assert.deepEqual(loaded, [], 'the plugin is not loaded at all');
+  assert.equal(registeredClientAssets().length, assetsBefore, 'so its settings panel never renders');
+  const row = pluginCatalog().find((p) => p.name === 'movedsite' && p.kind === 'plugin');
+  assert.equal(row.superseded, true, 'and the page can say it is safe to remove');
+  assert.equal(row.loaded, false);
+  const registered = registeredSources().filter((s) => s.id === 'movedsite');
+  assert.equal(registered.length, 1);
+  assert.equal(registered[0].label, 'Moved Site', 'the installed site is the one in use');
+
+  fs.rmSync(sdir, { recursive: true, force: true });
+  fs.rmSync(pdir, { recursive: true, force: true });
 });
