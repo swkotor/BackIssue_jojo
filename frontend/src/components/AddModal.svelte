@@ -22,11 +22,21 @@
   import { status } from '../lib/status.svelte.js';
   import Cover from './Cover.svelte';
 
-  // Manga lane: searches the metadata server's manga catalog instead of
-  // ComicVine, and adds series into the Manga library (created on first add).
-  let mangaMode = $state(false);
-  const mangaLib = $derived((status.libraries || []).find((l) => l.type === 'manga'));
-  const sourceLabel = $derived(mangaMode ? 'the manga catalog' : 'ComicVine');
+  // Which catalog the search talks to: ComicVine for comics; the metadata
+  // server's manga catalog (series join the Manga library, created on first
+  // add); and — where a Books or Audiobooks library and its plugin exist —
+  // the book and audiobook catalogs, whose adds go to the download sources
+  // rather than tracking a series.
+  let mode = $state('comic');
+  const mangaMode = $derived(mode === 'manga');
+  const bookMode = $derived(mode === 'ebook' || mode === 'audiobook');
+  const libOf = (type) => (status.libraries || []).find((l) => l.type === type);
+  const mangaLib = $derived(libOf('manga'));
+  const bookLib = $derived(libOf('ebook'));
+  const audioLib = $derived(libOf('audiobook'));
+  const sourceLabel = $derived(mode === 'manga' ? 'the manga catalog' : mode === 'ebook' ? 'the books catalog' : mode === 'audiobook' ? 'the audiobooks catalog' : 'ComicVine');
+  const thing = $derived(mode === 'ebook' ? 'book' : mode === 'audiobook' ? 'audiobook' : 'series');
+  const plugin = $derived(mode === 'ebook' ? 'ebooks' : 'audiobooks');
 
   const open = $derived(modals.stack.includes('add'));
 
@@ -36,7 +46,7 @@
 
   let timer;
   function onInput() { clearTimeout(timer); timer = setTimeout(() => search(m.query), 200); }
-  function setManga(on) { if (mangaMode === on) return; mangaMode = on; search(m.query); }
+  function setMode(next) { if (mode === next) return; mode = next; search(m.query); }
 
   let searching = $state(false);
   let needsKey = $state(false); // missing-ComicVine-key dead end → guided fix
@@ -48,6 +58,24 @@
     const seq = ++searchSeq;
     if (q.trim().length < 2) { m.results = null; m.error = ''; searching = false; return; }
     searching = true; m.error = ''; needsKey = false;
+
+    // Books and audiobooks: the plugin's catalog, each result already marked
+    // with what the shelf holds and what is wanted. Rows take the series row's
+    // shape so one list renders them all.
+    if (bookMode) {
+      let r;
+      try { r = await apiGet(`/api/${plugin}/catalog/search?q=` + encodeURIComponent(q)); }
+      catch { if (seq === searchSeq) { m.error = 'Search failed — is the app reachable?'; searching = false; } return; }
+      if (seq !== searchSeq) return;
+      searching = false;
+      if (r.error) { m.error = r.error; m.results = null; return; }
+      m.results = (r.results || []).map((b) => ({
+        id: b.id, name: b.title, start_year: b.year, image_url: b.cover, inLibrary: b.inLibrary, seriesId: b.seriesId,
+        _meta: [b.author, b.publisher, b.pages ? fmt(b.pages) + ' pages' : null, b.minutes ? Math.round(b.minutes / 60) + 'h' : null, b.narrators?.length ? 'read by ' + b.narrators.join(', ') : null].filter(Boolean).join(' · '),
+        _label: b.wanted ? 'Wanted' : 'Add', _busy: false, _done: !!b.wanted,
+      }));
+      return;
+    }
 
     // A pasted CV URL, "cv:12345", or bare volume id resolves that exact volume
     // and pins it first — common names ("Batman") have so many volumes that a
@@ -88,8 +116,34 @@
     m.results = pinned ? [pinned, ...rows] : rows;
   }
 
+  // Leaving the modal for a series. The route is /volume/:id — "In library"
+  // pointed at /series/:id, which is not a route at all, so the one button
+  // that was meant to work landed on Page not found.
+  function openSeries(seriesId) {
+    closeModal('add');
+    navigate('/volume/' + seriesId);
+  }
+
   async function add(v) {
     v._busy = true; v._label = 'Adding…';
+    // A book or audiobook: it goes on the wanted list and the download
+    // sources are asked for it now; the button says what happened.
+    if (bookMode) {
+      try {
+        const r = await apiPost(`/api/${plugin}/catalog/add`, { id: v.id });
+        if (r.error) { notify('Add failed: ' + r.error, 'error'); v._busy = false; v._label = 'Add'; return; }
+        const s = r.status;
+        const inLib = s === 'imported' || s === 'on-shelf';
+        v._label = inLib ? 'In library' : ['grabbed', 'downloading', 'active'].includes(s) ? 'Downloading' : 'Wanted';
+        v._done = true;
+        // Only a book already on the shelf has a series to open; one that was
+        // merely wanted has nothing to point at yet.
+        if (r.seriesId) v.seriesId = r.seriesId;
+        if (r.note) notify(r.note, s === 'error' ? 'error' : inLib || s === 'grabbed' || s === 'downloading' ? 'success' : 'info');
+        if (inLib) loadCollection();
+      } catch { notify('Add failed', 'error'); v._busy = false; v._label = 'Add'; }
+      return;
+    }
     try {
       const r = await apiPost('/api/collection/add-cv', { comicvineId: v.id, manga: mangaMode });
       if (r.error) { notify('Add failed: ' + r.error, 'error'); v._busy = false; v._label = 'Add'; return; }
@@ -98,6 +152,7 @@
         r.noSources ? 'Added (no sources enabled)' :
         r.outcome === 'created' ? 'Added' : 'Already in library';
       v._done = true;
+      if (r.seriesId) v.seriesId = r.seriesId;   // so the row can open it
       if (r.noSources) notify('Added. Nothing was queued — no download sources are enabled (Settings → Download sources).', 'info');
       // The first manga add materializes the Manga library — without a folder
       // its downloads file into the comics root, so point at the fix.
@@ -113,20 +168,26 @@
 
 {#if open}
   <div id="add-modal" class="modal addx-overlay" onclick={(e) => { if (e.target === e.currentTarget) closeModal('add'); }}>
-    <div class="addx" use:trapFocus role="dialog" aria-label="Add series">
+    <div class="addx" use:trapFocus role="dialog" aria-label="Add {thing}">
       <div class="addx__head">
         <div class="addx__icon"><Icon name="plus" size={18} /></div>
         <div class="addx__titles">
-          <div class="addx__title">Add a series</div>
-          <div class="addx__sub">Search {sourceLabel} and start tracking it</div>
+          <div class="addx__title">Add {thing === 'audiobook' ? 'an' : 'a'} {thing}</div>
+          <div class="addx__sub">Search {sourceLabel} and {bookMode ? 'get it from your download sources' : 'start tracking it'}</div>
         </div>
         <button id="add-modal-x" class="addx__x" aria-label="Close" onclick={() => closeModal('add')}><Icon name="close" size={16} /></button>
       </div>
 
       <div class="addx__switch-row">
         <div class="addx__switch" role="tablist">
-          <button class="addx__seg" class:is-on={!mangaMode} role="tab" aria-selected={!mangaMode} onclick={() => setManga(false)}><Icon name="book" size={14} /> Comics</button>
-          <button class="addx__seg" class:is-on={mangaMode} role="tab" aria-selected={mangaMode} title={mangaLib ? `Added series join the ${mangaLib.name} library` : 'Your Manga library is created on the first add'} onclick={() => setManga(true)}><Icon name="book" size={14} /> Manga</button>
+          <button class="addx__seg" class:is-on={mode === 'comic'} role="tab" aria-selected={mode === 'comic'} onclick={() => setMode('comic')}><Icon name="book" size={14} /> Comics</button>
+          <button class="addx__seg" class:is-on={mode === 'manga'} role="tab" aria-selected={mode === 'manga'} title={mangaLib ? `Added series join the ${mangaLib.name} library` : 'Your Manga library is created on the first add'} onclick={() => setMode('manga')}><Icon name="book" size={14} /> Manga</button>
+          {#if bookLib}
+            <button class="addx__seg" class:is-on={mode === 'ebook'} role="tab" aria-selected={mode === 'ebook'} title={`Added books are fetched by your download sources into ${bookLib.name}`} onclick={() => setMode('ebook')}><Icon name="book" size={14} /> Books</button>
+          {/if}
+          {#if audioLib}
+            <button class="addx__seg" class:is-on={mode === 'audiobook'} role="tab" aria-selected={mode === 'audiobook'} title={`Added audiobooks are fetched by your download sources into ${audioLib.name}`} onclick={() => setMode('audiobook')}><Icon name="book" size={14} /> Audiobooks</button>
+          {/if}
         </div>
       </div>
 
@@ -150,10 +211,11 @@
           <div class="addx__prompt">
             <div class="addx__prompt-art"><Icon name="search" size={20} /></div>
             <div>Type at least 2 characters to search {sourceLabel}.</div>
-            {#if !mangaMode}<div class="addx__tip">Can’t find a series? Paste its ComicVine URL or id (e.g. <code>cv:166619</code>) to jump straight to it.</div>{/if}
+            {#if mode === 'comic'}<div class="addx__tip">Can’t find a series? Paste its ComicVine URL or id (e.g. <code>cv:166619</code>) to jump straight to it.</div>{/if}
+            {#if bookMode}<div class="addx__tip">Search by title, author or ISBN. An added {thing} is fetched by your download sources and filed into the library.</div>{/if}
           </div>
         {:else if noResults}
-          <div class="addx__empty">No series found for “{ql}”.</div>
+          <div class="addx__empty">No {thing === 'series' ? 'series' : thing + 's'} found for “{ql}”.</div>
         {:else if m.results}
           {#each m.results as v (v.id)}
             <div class="addx__row" class:is-dim={v.inLibrary}>
@@ -163,12 +225,18 @@
                   {#if v.site_detail_url}<a class="addx__link" href={v.site_detail_url} target="_blank" rel="noreferrer" title="View details">{v.name || '?'}</a>{:else}{v.name || '?'}{/if}
                   {#if v.start_year}<span class="addx__year">({v.start_year})</span>{/if}
                 </div>
-                <div class="addx__meta">{v.publisher || ''}{v.publisher ? ' · ' : ''}{fmt(v.count_of_issues || 0)} issues</div>
+                <div class="addx__meta">{#if v._meta !== undefined}{v._meta}{:else}{v.publisher || ''}{v.publisher ? ' · ' : ''}{fmt(v.count_of_issues || 0)} issues{/if}</div>
               </div>
               {#if v.inLibrary}
-                <button class="addx__btn addx__btn--ghost" title="Already in your library — open it" onclick={() => { closeModal('add'); navigate('/series/' + v.seriesId); }}>In library</button>
+                <button class="addx__btn addx__btn--ghost" title="Already in your library — open it" onclick={() => openSeries(v.seriesId)}>In library</button>
               {:else if v._done}
-                <button class="addx__btn addx__btn--done" disabled>{v._label}</button>
+                <!-- Just added. Keep the outcome as the label (how many issues
+                     queued is the useful part) and make it open the series,
+                     the same as the In library row. A book that is only wanted
+                     has no series yet, so that one stays a plain label. -->
+                <button class="addx__btn addx__btn--done" class:is-open={!!v.seriesId}
+                  disabled={!v.seriesId} title={v.seriesId ? 'Open the series' : undefined}
+                  onclick={() => v.seriesId && openSeries(v.seriesId)}>{v._label}</button>
               {:else}
                 <button class="addx__btn {v._label === 'Add' ? 'addx__btn--add' : 'addx__btn--ghost'}" disabled={v._busy || v._label !== 'Add'} onclick={() => add(v)}>{v._label}</button>
               {/if}
@@ -226,6 +294,8 @@
   .addx__btn--ghost { border: 1px solid var(--line); background: transparent; color: var(--muted); }
   .addx__btn--ghost:disabled { cursor: default; }
   .addx__btn--done { border: 1px solid rgba(95,211,138,.4); background: rgba(95,211,138,.1); color: var(--green); cursor: default; }
+  .addx__btn--done.is-open { cursor: pointer; }
+  .addx__btn--done.is-open:hover { background: rgba(95,211,138,.2); }
 
   .addx__prompt { padding: 44px 20px; text-align: center; color: var(--faint); font-size: 13px; }
   .addx__prompt-art { width: 46px; height: 46px; margin: 0 auto 12px; border-radius: 12px; background: var(--panel-2); display: grid; place-items: center; color: #6f6885; }

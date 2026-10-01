@@ -2,19 +2,26 @@
   // The Library: a poster wall of every volume (grid), or a dense table
   // (list) for power flows. Replaces the old side rail as the main '/' view.
   import { navigate, route, setQuery } from '../lib/router.svelte.js';
-  import { rail, railSelect, ops, loadCollection, loadMoreCollection } from '../lib/store.svelte.js';
+  import { rail, railSelect, ops, loadCollection, loadMoreCollection, setLibrarySort } from '../lib/store.svelte.js';
   import { status } from '../lib/status.svelte.js';
-  import { apiPost } from '../lib/api.js';
+  import { apiGet, apiPost } from '../lib/api.js';
   import { notify } from '../lib/toasts.svelte.js';
   import { fmt, humanBytes, windowRange } from '../lib/util.js';
   import Cover from './Cover.svelte';
   import { openAddModal } from './AddModal.svelte';
   import { hscroll } from '../lib/hscroll.js';
   import { confirmDialog } from './DialogModal.svelte';
-  import { isTrusted } from '../lib/auth.svelte.js';
+  import { isTrusted, can } from '../lib/auth.svelte.js';
   import { libraryFilterFor } from '../lib/plugins.svelte.js';
   import FiltersModal from './FiltersModal.svelte';
   import Icon from '../lib/Icon.svelte';
+  import { contextMenu, openContextMenu } from './ContextMenu.svelte';
+  import { openCvPicker } from './CvPickerModal.svelte';
+  import { openEditMetadata } from './EditMetadataModal.svelte';
+  import { pickList } from '../lib/lists.js';
+
+  // Which card is under the pointer, so its actions button can fade in.
+  let hovered = $state(null);
 
   const FILTERS = [
     { key: 'all', label: 'All' },
@@ -25,6 +32,7 @@
     { key: 'ongoing', label: 'Ongoing' },
     { key: 'ended', label: 'Ended' },
     { key: 'problems', label: 'Problems' },
+    { key: 'empty', label: 'Nothing downloaded' },
     { key: 'unmatched', label: 'Unmatched' },
   ];
 
@@ -162,6 +170,115 @@
     if (r?.error) { s.followed = follow ? 0 : 1; notify(r.error, 'error'); }
   }
 
+  // One series' worth of the bulk actions, run against just that series. The
+  // bulk endpoint already takes a list of ids, so a right-click acts on the
+  // card under the pointer without first entering selection mode.
+  async function oneBulk(s, action, extra = {}) {
+    const r = await apiPost('/api/collection/bulk', { ids: [s.id], action, ...extra });
+    if (r?.error) return notify(r.error, 'error');
+    if (action === 'download-missing') notify(`Queued ${fmt(r.queued)} issue(s).`, 'ok');
+    loadCollection();
+  }
+
+  // Scan one series' folder. Goes through the shared ops.scan state so the
+  // progress and the completion toast are the same ones the series page shows.
+  async function scanSeries(s) {
+    if (ops.scan.running) return notify('A folder scan is already running.', 'info');
+    ops.scan = { running: true, seriesId: s.id, done: 0, total: 0 };
+    try { await apiPost('/api/collection/' + s.id + '/scan'); }
+    catch { notify('Scan failed', 'error'); ops.scan = { running: false }; }
+  }
+
+  // The metadata editor wants the ComicVine record and the resolved folder,
+  // which a library row does not carry — fetch the detail first. One request,
+  // and only when the action is actually chosen.
+  async function editMetadata(s) {
+    let d;
+    try { d = await apiGet('/api/collection/' + s.id); }
+    catch (e) { return notify('Could not load that series: ' + (e?.message || e), 'error'); }
+    if (d?.error) return notify(d.error, 'error');
+    openEditMetadata(s.id, d.cv, d.series, d.location);
+  }
+
+  // Same dry-run-then-confirm flow as the series page: never move files
+  // without saying how many, and never silently skip a collision.
+  async function renameFiles(s) {
+    let plan;
+    try { plan = (await apiPost(`/api/collection/${s.id}/refile`, { dryRun: true })).plan || []; }
+    catch (e) { return notify('Could not plan the rename: ' + (e?.message || e), 'error'); }
+    const moves = plan.filter((x) => x.status === 'move').length;
+    const collisions = plan.filter((x) => x.status === 'skip:collision').length;
+    if (!moves) return notify(collisions ? `Nothing to do — ${collisions} file(s) would collide.` : 'Files already match the pattern.', 'info');
+    if (!(await confirmDialog({
+      title: `Rename ${moves} file${moves === 1 ? '' : 's'}?`,
+      message: `Files for “${s.title}” are moved/renamed to match your folder and file patterns${collisions ? ` (${collisions} would collide and are skipped)` : ''}.`,
+      confirmLabel: 'Rename files',
+    }))) return;
+    let r;
+    try { r = await apiPost(`/api/collection/${s.id}/refile`, {}); }
+    catch (e) { r = { error: String(e?.message || e) }; }
+    if (r.error) return notify(r.error, 'error');
+    notify(`Renamed ${r.moved} file${r.moved === 1 ? '' : 's'}${r.skipped ? `, ${r.skipped} skipped` : ''}.`, 'ok');
+    loadCollection();
+  }
+
+  // Right-click menu for a series card. Built on open so Follow/Unfollow and
+  // the ticked monitoring policy reflect the row as it stands.
+  function seriesMenuItems(s) {
+    const monitor = s.monitor || (s.monitored ? 'all' : 'none');
+    const items = [
+      { id: 'open', label: 'Open', icon: 'library', run: () => navigate('/volume/' + s.id + libParams()) },
+      { id: 'follow', label: s.followed ? 'Unfollow' : 'Follow', icon: s.followed ? 'star' : 'star', run: () => toggleMon(s) },
+    ];
+    if (can('downloads.grab')) {
+      items.push('sep');
+      items.push({ id: 'dl', label: 'Download missing issues', icon: 'download', run: () => oneBulk(s, 'download-missing') });
+    }
+    if (isTrusted()) {
+      items.push('sep');
+      // The library-management actions that used to need a trip into the
+      // series page. Matching and metadata only mean anything once the series
+      // is matched, so they are offered accordingly.
+      items.push({ id: 'scan', label: 'Scan folder', icon: 'search', disabled: ops.scan.running, run: () => scanSeries(s) });
+      if (s.matched) {
+        items.push({ id: 'edit', label: 'Edit metadata…', icon: 'edit', run: () => editMetadata(s) });
+        items.push({ id: 'refile', label: 'Rename files', icon: 'edit', run: () => renameFiles(s) });
+      }
+      items.push({ id: 'match', label: s.matched ? 'Fix match…' : 'Match to ComicVine…', icon: 'diamond', run: () => openCvPicker(s.id, s.matched ? s.title : (s.folder || s.title), null, {}) });
+    }
+    if (can('library.manage')) {
+      items.push('sep');
+      items.push({ id: 'mon-all', label: 'Monitor: all issues', icon: monitor === 'all' ? 'check' : 'target', disabled: monitor === 'all', run: () => oneBulk(s, 'monitor', { monitor: 'all' }) });
+      items.push({ id: 'mon-new', label: 'Monitor: new issues only', icon: monitor === 'new' ? 'check' : 'zap', disabled: monitor === 'new', run: () => oneBulk(s, 'monitor', { monitor: 'new' }) });
+      items.push({ id: 'mon-none', label: 'Monitor: off', icon: monitor === 'none' ? 'check' : 'pause', disabled: monitor === 'none', run: () => oneBulk(s, 'monitor', { monitor: 'none' }) });
+      items.push('sep');
+      items.push({
+        id: 'remove', label: 'Remove from library…', icon: 'trash', danger: true,
+        run: async () => {
+          if (!(await confirmDialog({
+            title: `Remove ${s.title}?`,
+            message: 'It is removed from the collection \u2014 its files stay on disk.',
+            confirmLabel: 'Remove', danger: true,
+          }))) return;
+          await oneBulk(s, 'remove');
+        },
+      });
+    }
+    return items;
+  }
+
+  // Select/clear every series in the current view. Rows load a page at a
+  // time, so this can only honestly offer what is loaded — the label says so
+  // when there is more, rather than quietly selecting a subset.
+  const allLoadedSelected = $derived(rail.rows.length > 0 && rail.rows.every((r) => railSelect.has(r.id)));
+  function toggleSelectAll() {
+    if (allLoadedSelected) { railSelect.clear(); return; }
+    for (const r of rail.rows) railSelect.add(r.id);
+    if (rail.total > rail.rows.length) {
+      notify(`Selected the ${fmt(rail.rows.length)} loaded — scroll to load the rest of ${fmt(rail.total)}.`, 'info');
+    }
+  }
+
   function toggleSelecting() {
     rail.selecting = !rail.selecting;
     railSelect.clear();
@@ -184,6 +301,32 @@
     notify(action === 'download-missing' ? `Queued ${fmt(r.queued)} issue(s).` : `Done — ${fmt(r.done)} series.`, 'ok');
     railSelect.clear();
     loadCollection();
+  }
+
+  // Whole volumes onto a reading list. A run often spans several ComicVine
+  // volumes of one title, and building it a series page at a time is the long
+  // way round — so the selection goes on in the order it is shown, each
+  // series' issues in issue order, and the list's own reorder does the rest.
+  async function addSelectedToList() {
+    if (!railSelect.size) return notify('Select some series first.', 'info');
+    // On-screen order, so the run reads the way the Library is sorted. Anything
+    // selected before a filter change is no longer on screen; it still goes on,
+    // after the rows that are.
+    const shown = rail.rows.filter((r) => railSelect.has(r.id));
+    const ids = [...shown.map((r) => r.id), ...[...railSelect].filter((id) => !shown.some((r) => r.id === id))];
+    const issues = shown.reduce((n, r) => n + (r.total || 0), 0);
+    const about = issues ? `about ${fmt(issues)} issue${issues === 1 ? '' : 's'}` : 'their issues';
+    const listId = await pickList({
+      message: `Adding every issue of ${fmt(ids.length)} series (${about}), in the order they are shown.`,
+      newName: shown[0]?.title || '',
+    });
+    if (!listId) return;
+    const res = await apiPost(`/api/lists/${listId}/series`, { seriesIds: ids });
+    if (res.error) return notify(res.error, 'error');
+    const skipped = res.skipped ? ` ${fmt(res.skipped)} series had no ComicVine issues to add.` : '';
+    notify(res.added ? `Added ${fmt(res.added)} issue(s) to the list.${skipped}`
+      : `Nothing to add — already on that list.${skipped}`, res.added || !res.skipped ? 'ok' : 'info');
+    railSelect.clear();
   }
 
   // Bulk monitoring policy for the selection: all / new (from each series'
@@ -380,7 +523,7 @@
       <option value="unwatched">▬ Unwatched</option>
     </select>
     <select id="coll-sort" class="libx__sort" title="Sort the collection" value={rail.sort}
-      onchange={(e) => setQuery({ sort: e.currentTarget.value === 'title' ? null : e.currentTarget.value })}>
+      onchange={(e) => { const v = e.currentTarget.value; setLibrarySort(v); setQuery({ sort: v === 'title' ? null : v }); }}>
       <option value="title">A–Z</option>
       <option value="added">Recently added</option>
       <option value="missing">Most missing</option>
@@ -409,6 +552,10 @@
   {#if rail.selecting}
     <div id="coll-bulkbar" class="libx__bulk">
       <span id="coll-bulk-count" class="libx__bulk-count">{railSelect.size} selected</span>
+      <button id="coll-select-all" class="libx__link" onclick={toggleSelectAll}>
+        <Icon name="check-square" size={14} />
+        {allLoadedSelected ? 'Clear' : (rail.total > rail.rows.length ? `Select ${fmt(rail.rows.length)} loaded` : 'Select all')}
+      </button>
       <button class="libx__link" onclick={() => bulk('follow')}><Icon name="star" fill size={14} /> Follow</button>
       <button class="libx__link" onclick={() => bulk('unfollow')}><Icon name="star" size={14} /> Unfollow</button>
       <button class="libx__link" onclick={() => bulk('download-missing')}><Icon name="download" size={14} /> Download missing</button>
@@ -419,6 +566,8 @@
         <option value="paused">Paused</option>
         <option value="unwatched">Unwatched</option>
       </select>
+      <button class="libx__link" title="Add every issue of the selected series to a reading list"
+        onclick={addSelectedToList}><Icon name="menu" size={14} /> Add to list</button>
       <select class="libx__movesel" title="Monitoring policy for the selected series"
         onchange={(e) => { const v = e.currentTarget.value; e.currentTarget.value = ''; if (v) monitorSelected(v); }}>
         <option value="">Monitoring…</option>
@@ -480,6 +629,8 @@
         {#if range.padTop > 0}<div class="libx-grid__pad" style="height:{range.padTop}px"></div>{/if}
         {#each rail.rows.slice(range.start, range.end) as s (s.id)}
           <div class="libx-card ws-{s.watch_state || 'watched'}" class:is-selected={rail.selecting && railSelect.has(s.id)}
+            use:contextMenu={() => seriesMenuItems(s)}
+            onpointerenter={() => { hovered = s.id; }} onpointerleave={() => { if (hovered === s.id) hovered = null; }}
             onclick={(e) => open(s, e)} role="button" tabindex="0" onkeydown={(e) => { if (e.key === 'Enter') open(s, e); }}>
             <div class="libx-card__art" class:is-unmatched={!s.matched}>
               <Cover coverUrl={s.matched ? s.cover_url : null} title={s.matched ? s.title : (s.folder || '?')} />
@@ -497,6 +648,12 @@
                 </span>
               {/if}
               {#if s.followed}<span class="libx-card__star" title="Followed"><Icon name="star" fill size={15} /></span>{/if}
+              {#if !rail.selecting}
+                <button class="libx-card__more" class:is-shown={hovered === s.id}
+                  title="Actions" aria-label="Actions for {s.title}"
+                  onclick={(e) => { e.stopPropagation(); openContextMenu(e, seriesMenuItems(s)); }}
+                ><Icon name="more-horizontal" size={16} /></button>
+              {/if}
               {#if s.matched && s.monitor && s.monitor !== 'all'}<span class="libx-card__mon" title={s.monitor === 'new' ? `Monitoring new issues from #${s.monitor_from ?? '?'}` : 'Not monitored — nothing is fetched automatically'}><Icon name={s.monitor === 'new' ? 'zap' : 'pause'} size={12} /></span>{/if}
               {#if !s.matched}<span class="libx-card__matchchip">match…</span>{/if}
               {#if s.matched}<div class="libx-card__bar"><div class="libx-card__fill" class:is-done={isDone(s)} style="width:{pct(s)}%"></div></div>{/if}
@@ -534,6 +691,8 @@
         {#if range.padTop > 0}<div style="height:{range.padTop}px"></div>{/if}
         {#each rail.rows.slice(range.start, range.end) as s (s.id)}
           <div class="libx-row ws-{s.watch_state || 'watched'}" class:is-selected={rail.selecting && railSelect.has(s.id)}
+            use:contextMenu={() => seriesMenuItems(s)}
+            onpointerenter={() => { hovered = s.id; }} onpointerleave={() => { if (hovered === s.id) hovered = null; }}
             onclick={(e) => open(s, e)} role="button" tabindex="0" onkeydown={(e) => { if (e.key === 'Enter') open(s, e); }}>
             {#if rail.selecting}
               <input type="checkbox" class="libx-row__cb" checked={railSelect.has(s.id)}
@@ -599,6 +758,13 @@
               <span></span>
               <button class="libx-row__star" class:is-on={s.followed} title={s.followed ? 'Followed — click to unfollow' : 'Not followed — click to follow'} aria-label={s.followed ? 'Unfollow' : 'Follow'} onclick={(e) => { e.stopPropagation(); toggleMon(s); }}><Icon name="star" fill={!!s.followed} size={15} /></button>
             {:else}<span class="libx-col--wide"></span><span class="libx-col--wide"></span><span></span><span></span>{/if}
+            {:else}<span></span>{/if}
+            {#if !rail.selecting}
+              <button class="libx-row__more" class:is-shown={hovered === s.id}
+                title="Actions" aria-label="Actions for {s.title}"
+                onclick={(e) => { e.stopPropagation(); openContextMenu(e, seriesMenuItems(s)); }}
+              ><Icon name="more-horizontal" size={16} /></button>
+            {/if}
           </div>
         {/each}
         {#if range.padBottom > 0}<div style="height:{range.padBottom}px"></div>{/if}

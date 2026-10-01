@@ -8,6 +8,160 @@ by the maintainers when changes merge, so concurrent PRs don't conflict here.
 
 ## [Unreleased]
 
+### Added
+
+- **Add whole series to a reading list from the Library** (#9). Select mode's
+  bulk bar gains **Add to list**, which puts every issue of every selected
+  series on a list in one step, in the order the Library is showing them and by
+  issue number within each series. A run that ComicVine splits across several
+  volumes is now a few picks rather than a trip through each series page, and
+  the list's own reordering handles the rest. The dialog says how many issues
+  that will be before you commit, and a selected series with no ComicVine
+  issues to contribute is reported rather than silently skipped.
+
+### Fixed
+
+- **A very long reading list no longer bogs the page down.** Lists can now be
+  built in a couple of clicks, and a single series can carry thousands of
+  issues, so the list page renders only the rows near the viewport past 200
+  items, the way a long series page already did. A 4,239-issue list went from
+  134,000 elements on the page to 3,000, first paint from 2.5s to 1s, and
+  scrolling about five times quicker.
+
+- **Reading lists are runs now.** A list's page is built around where you are
+  in it rather than what share of it you own. Its issues sit on one spine with
+  a node each: the rail is filled to the point you have reached and grey after
+  it, read issues are ticked and dimmed, and exactly one issue is promoted as
+  **Read next** with its own cover and button. **Continue** at the top opens
+  that issue. An issue you do not own is drawn as a gap, labelled with its
+  position in the run, and the spine stops at it instead of filling through it,
+  though Continue still skips ahead to the next issue you can actually read.
+  The header counts reads, in-progress issues and missing ones, keeping
+  ownership as a separate, separately labelled number. The index gives every
+  list a tick per issue and a status (New, a read count, or Done), and pins a
+  **Continue** card for the run you read most recently that still has somewhere
+  to go. Without the reader installed a list shows ownership and order exactly
+  as before, and makes no claim about what has been read.
+
+- **Find and clear failed adds** (#8). A **Nothing downloaded** filter lists
+  every series with no file to its name, which is what a mass-add leaves behind
+  when the downloads fail. The bulk bar also gains **Select all**, so clearing
+  them is filter, select, Remove. On a list longer than one page the button
+  says how many are loaded rather than pretending to select the rest.
+- **Quick actions on Library cards** (#5). Every series card and row has an
+  actions menu, reached from the **⋯ button** that appears on hover, a
+  right-click, or a long press. Issues carry the same button, on the poster
+  card and at the end of a list row. It carries the library-management actions that
+  previously meant opening the series first: **Scan folder**, **Edit
+  metadata**, **Rename files** and **Fix match** (or **Match to ComicVine** for
+  a series that has none yet).
+- **Right-click menus on series and issues.** A series card in the Library, and
+  an issue in either the grid or the list on a series page, now open a menu on
+  right-click (press and hold on a touch screen). A series offers open, follow,
+  download missing, its monitoring policy, and remove; an issue offers whatever
+  the installed plugins contribute first (with the reader, that is Read, Mark as
+  read/unread and Read later), then issue details, download or re-download, and
+  want or skip. The menu is built when it opens, so it always reflects that row
+  as it stands, it only lists what your role can do, and right-clicking never
+  disturbs a selection you are part-way through building.
+
+  On a touch screen the same menu opens on a **long press**, with a short
+  buzz where the device supports one. Lifting your finger afterwards does not
+  also open the row, a quick tap still opens it as before, and starting to
+  scroll cancels the press rather than opening a menu you did not ask for.
+- **Date formats for file naming.** The `{date}` token in a file pattern still
+  writes "November 2011", but it now takes a modifier for the parts on their
+  own: `{date:m}` the two-digit month, `{date:y}` the year, `{date:mon}` the
+  short month name. So `{series} V{year} #{issue} ({date:m}-{date:y})` files as
+  `Batman V2011 #001 (11-2011).cbz`. The month keeps its leading zero, so March
+  is `03` and sorts with the rest of the year. Existing patterns are unchanged,
+  an unrecognised modifier falls back to the full form, and an issue with no
+  cover date drops the whole bracket rather than leaving `(-)` behind.
+- **Assign a file to an issue by hand.** On a series page, each file the app
+  could not match to an issue now has an *Assign to issue* picker: choose
+  the issue and the file links to it at once. The choice is remembered per
+  file, so rescans, re-matches and metadata refreshes keep it (a re-match to
+  a different volume drops it). For files whose number the app cannot read,
+  or reads wrongly, without renaming or retagging anything. A file that
+  linked to the wrong issue can be moved from that issue's own file list
+  (open the issue, *Move to another issue…*), and a hand assignment undone
+  there too.
+
+### Fixed
+
+- **Adding a series now takes you to it** (#4). After a successful add the
+  button showed the outcome ("Added — 12 queued") but was dead, leaving no way
+  to reach the new series without closing the dialog and hunting for it. It now
+  opens the series, keeping the outcome as its label. The neighbouring **"In
+  library" button was broken too**, in a worse way: it pointed at a path that
+  has never been a route, so the one button meant to work landed on Page not
+  found. Both now go to the same place.
+- The Library's **sort is remembered** (#6). It was carried in the URL, so it
+  survived Back, a reload and the series page's Library button, but any trip
+  through the sidebar built a fresh URL and dropped it, putting you back at
+  A–Z. The choice is now kept as a preference and reapplied whenever you arrive
+  without one, including from a sidebar library and in a new session. A sort
+  named in the URL still wins, so a shared or bookmarked link is unchanged.
+- **Add to reading list was unusable with more than a few lists.** The choices
+  were laid out as one unwrapping row of footer buttons inside a 440px dialog,
+  so with a dozen lists most of them sat off the side of the screen, with
+  nothing to scroll and no way to reach them. A long set of choices now stacks
+  into a scrollable list. Dialogs are also capped at the height of the screen
+  and scroll their body, so no dialog can run off the edge again.
+- A matched series' row carried no file count internally, unlike every other
+  kind of row. Nothing user-visible depended on it until now, but any check for
+  "does this series have files" read it as none.
+- An issue poster card with several plugin actions pushed the last of its hover
+  buttons outside the card, where they could not be clicked. The row of buttons
+  now wraps.
+- Files named "Series (Year) Volume 01 Issue 002" read the volume number as
+  the issue number, so every file in the folder landed as issue 1 and the
+  rest showed as missing. An explicit issue marker ("Issue 002", "No. 12",
+  "Issue #3") now names the issue outright, and a volume marker ("Volume
+  01", "Vol. 3", "v2") is never mistaken for one — unless it is the only
+  number in the name, as on a trade.
+
+## [0.8.4] - 2026-09-14
+
+### Added
+
+- **Books and audiobooks from your download sources.** A plugin can now ask
+  the app to download a book or audiobook (`api.downloadMedia`) and the same
+  sources that serve comics go looking: usenet and torrent search the book
+  and audiobook categories with a matcher built for how book releases are
+  named (author and title, no issue number; the right kind of file), and a
+  site source takes part when its definition declares `types: ['ebook']` or
+  `['audiobook']`. The plugin that owns the library type files the result
+  (`api.registerMediaHandler`) and whoever asked is told when it lands
+  (`api.onMediaDownload`). The Requests plugin uses this to fill approved
+  book requests. A book with an ISBN is asked for by ISBN first on catalog
+  sites, so the exact edition wins over a look-alike. A site source may
+  `verify` what it downloaded and refuse it (an EPUB whose own metadata
+  says it is a translation, say); the next-best candidate is tried.
+- **Sites behind DDoS-Guard.** Its interstitial is recognised as a challenge,
+  a FlareSolverr "solve" that hands back the interstitial (the manual captcha
+  it escalates headless browsers to) is reported as one rather than parsed
+  as a page, and once the app's own browser clears a site, its cookies are
+  reused for plain requests to it. A site source can mark a setting
+  `secret: true` to have it masked on its card.
+
+- **Books and audiobooks show in the queue.** A book being searched for,
+  downloaded by a site source, or fetched by a download client is a row on
+  the Queue page with its source and progress, counts toward the sidebar
+  badge, and can be cancelled while a client has it. The log says which
+  source was searched, what release was picked, and what was filed.
+- **Add finds books and audiobooks.** With a Books or Audiobooks library
+  (and its plugin), the Add button gains a tab for it: search the catalog,
+  see what is already on the shelf, add one and the download sources are
+  asked for it.
+
+### Fixed
+
+- One browser per process: a site source that needs the browser now shares
+  the one a plugin already launched instead of starting a second Chromium
+  on the same profile, which Chromium refuses ("Opening in existing browser
+  session").
+
 ## [0.8.3] - 2026-09-09
 
 ### Added

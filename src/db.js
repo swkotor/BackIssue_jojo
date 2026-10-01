@@ -39,6 +39,13 @@ export function initSchema(db) {
       series_id INTEGER NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+    -- A file assigned to a ComicVine issue by hand (its number could not be
+    -- read, or was read wrongly). Keyed by path; every relink honours it.
+    CREATE TABLE IF NOT EXISTS file_issue_overrides (
+      path TEXT PRIMARY KEY,
+      cv_issue_id INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
     CREATE TABLE IF NOT EXISTS library_files (
       path TEXT PRIMARY KEY, dir TEXT, name TEXT, size INTEGER, mtime INTEGER,
       page_count INTEGER, has_metadata INTEGER DEFAULT 0,
@@ -273,6 +280,11 @@ function migrate(db) {
   // Indexer guid of the grabbed release, so a failure can blacklist that exact
   // release (not just its title) and future searches skip it.
   if (grabCols.length && !grabCols.includes('release_guid')) db.exec('ALTER TABLE grabs ADD COLUMN release_guid TEXT');
+  // Media grabs (a book or audiobook for a plugin library, kind='media') carry
+  // what to do with the file once it lands (JSON payload) and who asked for it
+  // (ref, e.g. 'requests:12') so the asker can find its grab again.
+  if (grabCols.length && !grabCols.includes('payload')) db.exec('ALTER TABLE grabs ADD COLUMN payload TEXT');
+  if (grabCols.length && !grabCols.includes('ref')) db.exec('ALTER TABLE grabs ADD COLUMN ref TEXT');
   // Library type inferred by the import scan (ComicInfo's Manga tag).
   const icCols = db.prepare('PRAGMA table_info(import_candidates)').all().map((c) => c.name);
   if (icCols.length && !icCols.includes('series_type')) db.exec('ALTER TABLE import_candidates ADD COLUMN series_type TEXT');
@@ -580,11 +592,28 @@ export function getIssueById(db, id) {
 // strings, but a malformed indexer response can leak other shapes.
 const guidStr = (g) => (typeof g === 'string' && g) || (typeof g === 'number' ? String(g) : null);
 
-export function recordGrab(db, { issueId = 0, source, client = null, downloadId = null, category = null, title = null, seriesId = null, kind = 'issue', releaseGuid = null }) {
-  // issue_id is NOT NULL in the schema; pack grabs have no single issue → 0 sentinel.
+export function recordGrab(db, { issueId = 0, source, client = null, downloadId = null, category = null, title = null, seriesId = null, kind = 'issue', releaseGuid = null, payload = null, ref = null }) {
+  // issue_id is NOT NULL in the schema; pack and media grabs have no single issue → 0 sentinel.
   return db.prepare(
-    `INSERT INTO grabs (issue_id, source, client, download_id, category, title, series_id, kind, release_guid) VALUES (?,?,?,?,?,?,?,?,?)`
-  ).run(issueId ?? 0, source, client, downloadId != null ? String(downloadId) : null, category, title, seriesId, kind, guidStr(releaseGuid)).lastInsertRowid;
+    `INSERT INTO grabs (issue_id, source, client, download_id, category, title, series_id, kind, release_guid, payload, ref) VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+  ).run(issueId ?? 0, source, client, downloadId != null ? String(downloadId) : null, category, title, seriesId, kind, guidStr(releaseGuid),
+    payload == null ? null : JSON.stringify(payload), ref == null ? null : String(ref)).lastInsertRowid;
+}
+
+/** A grab's JSON payload, parsed ({} when absent or unreadable). */
+export function grabPayload(grab) {
+  try { return grab?.payload ? JSON.parse(grab.payload) : {}; } catch { return {}; }
+}
+
+/** Media grabs (a book or audiobook for a plugin library) still on a client. */
+export function activeMediaGrabs(db) {
+  return db.prepare("SELECT * FROM grabs WHERE kind='media' AND status='active' ORDER BY id").all();
+}
+
+/** The grabs filed under a ref ('requests:12'), newest first — so the asker
+ *  can show "downloading from usenet" or "failed: …" against its own row. */
+export function grabsByRef(db, ref, { limit = 5 } = {}) {
+  return db.prepare('SELECT * FROM grabs WHERE ref=? ORDER BY id DESC LIMIT ?').all(String(ref), limit);
 }
 
 // Normalize a release title to a stable comparison key: lowercase, drop a comic
@@ -873,6 +902,27 @@ export function clearScanOverride(db, dir) {
   return db.prepare('DELETE FROM scan_overrides WHERE dir = ?').run(dir).changes;
 }
 
+// A file → ComicVine issue assignment made by hand. The scanner reads a
+// number from the tag, then the filename; when neither is right (or there),
+// the person who knows the book says which issue it is, and that sticks
+// through rescans, re-matches and metadata refreshes until cleared.
+export function setFileIssueOverride(db, path, cvIssueId) {
+  db.prepare("INSERT INTO file_issue_overrides (path, cv_issue_id, created_at) VALUES (?, ?, datetime('now')) ON CONFLICT(path) DO UPDATE SET cv_issue_id=excluded.cv_issue_id, created_at=excluded.created_at")
+    .run(path, Number(cvIssueId));
+}
+export function getFileIssueOverride(db, path) {
+  const r = db.prepare('SELECT cv_issue_id FROM file_issue_overrides WHERE path = ?').get(path);
+  return r ? r.cv_issue_id : undefined;
+}
+/** path → cv_issue_id for every assigned file of one series. */
+export function fileIssueOverridesForSeries(db, seriesId) {
+  const rows = db.prepare('SELECT o.path, o.cv_issue_id FROM file_issue_overrides o JOIN library_files f ON f.path = o.path WHERE f.series_id = ?').all(seriesId);
+  return new Map(rows.map((r) => [r.path, r.cv_issue_id]));
+}
+export function clearFileIssueOverride(db, path) {
+  return db.prepare('DELETE FROM file_issue_overrides WHERE path = ?').run(path).changes;
+}
+
 // --- Library health index ---
 export function upsertLibraryFile(db, r) {
   // series_id/issue_id are NOT touched on conflict — the link is preserved across
@@ -1044,7 +1094,8 @@ function collLeanCols(guard) {
           AND NOT EXISTS (SELECT 1 FROM library_files g WHERE g.series_id=s.id AND g.valid=1
             AND g.cv_issue_id IS NOT NULL AND g.cv_issue_id=bad.cv_issue_id)) END corrupt,
       CASE WHEN s.cv_id IS NULL THEN 0 ELSE (SELECT COUNT(*) FROM cv_issues ci WHERE ci.cv_series_id=s.cv_id) END cv_total,
-      COALESCE(lf.cv_owned, 0) cv_owned`;
+      COALESCE(lf.cv_owned, 0) cv_owned,
+      COALESCE(lf.file_count, 0) file_count`;
 }
 
 // A collection MEMBER = followed OR owns a valid file OR the caller personally
@@ -1128,6 +1179,10 @@ function chipPredicateSql(filter, { guardOuter, seriesTypeList, params }) {
   // fork: publication status chips
   if (filter === 'ongoing') return "pub_status = 'ongoing'";
   if (filter === 'ended') return "pub_status = 'ended'";
+  // Nothing on disk at all. A mass-add whose downloads failed leaves exactly
+  // this: followed series with no file to their name. (Membership keeps them
+  // in the collection precisely because they are followed.)
+  if (filter === 'empty') return 'COALESCE(file_count, 0) = 0';
   if (filter === 'unmatched') return `cv_id IS NULL AND COALESCE(${guardOuter},0) = 0`; // !matched
   if (filter === 'comics') return `${effType} NOT IN (${seriesTypeList}) OR ${effType} = 'comic'`;
   if (SERIES_TYPES.includes(filter)) { params['lane_' + filter] = filter; return `${effType} = @lane_${filter}`; }
@@ -1235,6 +1290,9 @@ function mapCollectionRow(r) {
     id: r.id, followed: r.my_follow ? 1 : 0, monitored: r.followed, monitor: r.monitor || (r.followed ? 'all' : 'none'), monitor_from: r.monitor_from ?? null, pub_status: r.pub_status || null, cv_id: r.cv_id, cv_locked: r.cv_locked, sourced, matched: true, source: 'cv',
     title: r.cv_name || r.title, publisher: r.cv_publisher || null, year: r.cv_year || null, cover_url: r.cv_image || null,
     cv_name: r.cv_name, cv_year: r.cv_year, restricted: !!r.restricted, type: r.type || 'comic',
+    // The other two branches carry this; without it a matched series looked
+    // like it had no files at all to anything reading the mapped row.
+    folder: dirBaseName(r.file_dir), files: r.file_count,
     total, owned, missing: Math.max(0, total - owned), available: 0, on_demand: false, untagged: r.untagged, corrupt: r.corrupt,
     latest: r.cv_latest, active: r.active, size: r.size_bytes,
     // fork: watch state, publication status and the Latest/Next issue dates
@@ -1440,6 +1498,7 @@ export function seriesMatchesFilter(r, filter) {
     // fork: publication status
     : filter === 'ongoing' ? r.pub_status === 'ongoing'
     : filter === 'ended' ? r.pub_status === 'ended'
+    : filter === 'empty' ? !((r.files ?? r.file_count ?? 0) > 0)
     // Self-described rows are matched by construction — never "unmatched".
     : filter === 'unmatched' ? !r.matched
     // Library-type lanes. The comics lane means "not any other known type",
@@ -1464,7 +1523,8 @@ export function seriesCollectionDetail(db, id, userId = null) {
   const asFile = (f) => ({ path: f.path, name: f.name, valid: f.valid, has_metadata: f.has_metadata, error: f.error, size: f.size, page_count: f.page_count });
   // Per-issue copies omit the full path — the UI only shows name/size/health,
   // and on a 2,000-issue series the (JSON-escaped) paths dominated the payload.
-  const asIssueFile = (f) => ({ name: f.name, valid: f.valid, has_metadata: f.has_metadata, error: f.error, size: f.size, page_count: f.page_count });
+  const assigned = new Set(db.prepare('SELECT o.path FROM file_issue_overrides o JOIN library_files f ON f.path = o.path WHERE f.series_id = ?').all(series.id).map((r) => r.path));
+  const asIssueFile = (f) => ({ name: f.name, valid: f.valid, has_metadata: f.has_metadata, error: f.error, size: f.size, page_count: f.page_count, assigned: assigned.has(f.path) });
   // Invalid files already superseded by a valid copy of the same CV issue —
   // safe-to-remove duplicates (see removeSupersededFiles).
   const validCvIds = new Set(files.filter((f) => f.valid && f.cv_issue_id != null).map((f) => f.cv_issue_id));

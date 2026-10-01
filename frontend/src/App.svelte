@@ -1,7 +1,7 @@
 <script>
   import { untrack } from 'svelte';
   import { route, navigate, goBack, OVERLAY_PATHS, activeDrawer } from './lib/router.svelte.js';
-  import { rail, railSelect, detail, loadCollection, openVolume, clearDetail, loadFlags, startOpsTracking } from './lib/store.svelte.js';
+  import { rail, railSelect, detail, loadCollection, openVolume, clearDetail, loadFlags, startOpsTracking, librarySort } from './lib/store.svelte.js';
   import Icon from './lib/Icon.svelte';
   import { startStatusPolling } from './lib/status.svelte.js';
   import { startEvents } from './lib/events.svelte.js';
@@ -39,6 +39,7 @@ import EditMetadataModal from './components/EditMetadataModal.svelte';
   import DialogModal from './components/DialogModal.svelte';
   import Onboarding from './components/Onboarding.svelte';
   import Toasts from './components/Toasts.svelte';
+  import ContextMenu from './components/ContextMenu.svelte';
 
   // Section pages are always mounted (plugin slots inject into them) —
   // a body class picks which one is visible (app.css hides .home under it).
@@ -124,7 +125,7 @@ import EditMetadataModal from './components/EditMetadataModal.svelte';
     const p = new URLSearchParams(route.search);
     const filter = p.get('filter') || 'all';
     const q = p.get('q') || '';
-    const sort = p.get('sort') || 'title';
+    const sort = p.get('sort') || librarySort();
     const library = p.get('library') || '';
     const facet = p.get('facet') || '';
     const collections = p.get('collections') === '1';
@@ -252,3 +253,4 @@ import EditMetadataModal from './components/EditMetadataModal.svelte';
 <Onboarding />
 
 <Toasts />
+<ContextMenu />

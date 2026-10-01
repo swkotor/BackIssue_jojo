@@ -3,6 +3,7 @@
   import { goBack, navigate, route } from '../lib/router.svelte.js';
   import { detail, detailSelected, flags, ops, loadCollection, reloadDetail, clearDetail, issueState, downloadCvIssues, redownloadCvIssues, redownloadIssues, watchDetailSweep, refreshIssueStatuses } from '../lib/store.svelte.js';
   import { plugins, issueActions, seriesActions, issueActionsTick, issueCoverUrl, seriesViews, renderSeriesView } from '../lib/plugins.svelte.js';
+  import { contextMenu, openContextMenu } from './ContextMenu.svelte';
   import { isTrusted, can } from '../lib/auth.svelte.js';
   import { apiGet, apiPost } from '../lib/api.js';
   import { notify } from '../lib/toasts.svelte.js';
@@ -20,11 +21,25 @@
   import { openIssueInfo } from './IssueModal.svelte';
   import { openPackSearch } from './PackSearchModal.svelte';
   import { confirmDialog, choiceDialog, inputDialog } from './DialogModal.svelte';
+  import { pickList } from '../lib/lists.js';
 
   const s = $derived(detail.series);
   const det = $derived(detail.det);
   const isCv = $derived(!!det && det.source === 'cv' && Array.isArray(det.issues));
   let showAllUnlinked = $state(false);
+  // "Assign to issue" on an unmatched file: the issue picked per file path,
+  // sent with the file so the choice sticks through rescans.
+  let assignPick = $state({});
+  async function assignFile(f) {
+    const cvIssueId = Number(assignPick[f.path]);
+    if (!cvIssueId) return;
+    const r = await apiPost(`/api/collection/${s.id}/assign-file`, { path: f.path, cvIssueId }).catch((e) => ({ error: String(e) }));
+    if (r?.error) return notify(r.error, 'error');
+    notify('File assigned to the issue — it stays there through rescans.', 'ok');
+    delete assignPick[f.path];
+    reloadDetail();
+  }
+  const issueChoice = (i) => `#${i.number}${i.title && i.title !== '#' + i.number ? ' · ' + i.title : ''}${i.owned ? ' (owned)' : ''}`;
   // Unlinked files whose number is beyond anything this volume has: the
   // strongest sign the series is matched to the WRONG ComicVine volume.
   const unlinkedBeyond = $derived.by(() => {
@@ -397,6 +412,39 @@
   // Per-issue wants: pick an issue the policy doesn't want, or skip one it
   // does. The server stores only the exception and answers with each issue's
   // resulting state, which is patched straight into the open rows.
+  // Right-click menu for one issue. Built fresh on open so it reflects the
+  // row's current state, and it deliberately mirrors the buttons already on the
+  // row — the menu is a faster way to reach them, not a second set of actions.
+  // Plugin actions come first because that is where Mark as read/unread lives.
+  function issueMenuItems(i) {
+    void issueActionsTick.n;   // rebuild when a plugin flips an issue's state
+    const val = (v) => (typeof v === 'function' ? v(i) : v);
+    const items = [];
+    for (const a of issueActions) {
+      if (a.when && !a.when(i)) continue;
+      const label = val(a.title);
+      if (!label) continue;
+      items.push({ id: 'plugin:' + a.id, label, iconHtml: val(a.icon), run: () => a.run(i, detail.series) });
+    }
+    if (items.length) items.push('sep');
+    items.push({ id: 'info', label: 'Issue details…', icon: 'info', run: () => openIssueInfo(i.cv_issue_id, i.number) });
+    if (can('downloads.grab')) {
+      if (i.corrupt) {
+        items.push({ id: 'redl', label: 'Re-download (file is corrupt)', icon: 'refresh', run: () => redownloadCvIssues([i.cv_issue_id]) });
+      } else if (!i.owned) {
+        items.push({ id: 'dl', label: 'Download this issue', icon: 'download', run: () => downloadCvIssues([i.cv_issue_id]) });
+      } else {
+        items.push({ id: 'redl', label: 'Download again', icon: 'refresh', run: () => redownloadCvIssues([i.cv_issue_id]) });
+      }
+      if (!i.owned && !i.corrupt) {
+        items.push(i.wanted
+          ? { id: 'want', label: "Don't want this issue", icon: 'target', run: () => setWants([i.cv_issue_id], false) }
+          : { id: 'want', label: 'Want this issue', icon: 'target', run: () => setWants([i.cv_issue_id], true) });
+      }
+    }
+    return items;
+  }
+
   async function setWants(cvIssueIds, want) {
     if (!s || !cvIssueIds.length) return;
     let r;
@@ -557,21 +605,9 @@
     let ids = [...detailSelected];
     if (!ids.length) ids = issues.map((i) => i.cv_issue_id).filter(Boolean);
     if (!ids.length) return;
-    const r = await apiGet('/api/lists');
-    if (r.error) return notify(r.error, 'error');
-    const buttons = (r.lists || []).map((l) => ({ label: `${l.name} (${l.items})`, value: l.id }));
-    buttons.push({ label: '+ New list…', value: 'new' });
     const scope = detailSelected.size ? `${ids.length} selected issue(s)` : `all ${ids.length} issues`;
-    const choice = await choiceDialog({ title: 'Add to reading list', message: `Adding ${scope} of “${s?.title}”.`, buttons });
-    if (!choice) return;
-    let listId = choice;
-    if (choice === 'new') {
-      const name = await inputDialog({ title: 'New reading list', value: s?.title || '', confirmLabel: 'Create' });
-      if (!name) return;
-      const c = await apiPost('/api/lists', { name });
-      if (c.error) return notify(c.error, 'error');
-      listId = c.id;
-    }
+    const listId = await pickList({ message: `Adding ${scope} of “${s?.title}”.`, newName: s?.title || '' });
+    if (!listId) return;
     const res = await apiPost(`/api/lists/${listId}/items`, { cvIssueIds: ids });
     if (res.error) return notify(res.error, 'error');
     notify(res.added ? `Added ${fmt(res.added)} issue(s) to the list.` : 'Already on that list.', 'ok');
@@ -989,6 +1025,7 @@
                 <div class="icard"
                   class:is-read={i.readState === 'read'}
                   class:is-corrupt={i.corrupt} class:is-checked={detailSelected.has(i.cv_issue_id)} class:is-wanted={i.wanted && !i.owned}
+                  use:contextMenu={() => issueMenuItems(i)}
                   title={i.corrupt && corruptReason(i) ? 'Corrupt: ' + corruptReason(i) : (i.title || '')}>
                   <div class="icard__art" onclick={() => openIssueInfo(i.cv_issue_id, i.number)} role="button" tabindex="0"
                     onkeydown={(e) => { if (e.key === 'Enter') openIssueInfo(i.cv_issue_id, i.number); }}>
@@ -1001,6 +1038,8 @@
                     {#if i.wanted && !i.owned}<span class="icard__wanted" title="Wanted">★</span>{/if}
                     {#if readTracking}<span class="icard__read icard__read--{i.readState || 'unread'}"
                       title={i.readState === 'read' ? 'Read' : i.readState === 'reading' ? 'Started — not finished' : 'Unread'}>{#if i.readState === 'read'}<Icon name="check" size={11} /> READ{:else if i.readState === 'reading'}◐{:else}UNREAD{/if}</span>{/if}
+                    <button class="icard__more" title="Actions" aria-label="Actions for issue {i.number ?? ''}"
+                      onclick={(e) => { e.stopPropagation(); openContextMenu(e, issueMenuItems(i)); }}><Icon name="more-horizontal" size={15} /></button>
                     <div class="icard__actions" onclick={(e) => e.stopPropagation()}>
                       {#each issueActions as a (a.id + ':' + issueActionsTick.n)}
                         {#if !a.when || a.when(i)}
@@ -1040,6 +1079,7 @@
               {@const bf = bestFile(i)}
               <div class="issue"
                 class:is-owned={i.owned} class:is-corrupt={i.corrupt} class:is-wanted={!i.owned && i.wanted} class:is-read={i.readState === 'read'}
+                use:contextMenu={() => issueMenuItems(i)}
                 title={i.corrupt && corruptReason(i) ? 'Corrupt: ' + corruptReason(i) : undefined}
                 onclick={(e) => toggleIssue(i, range.start + vi, e.shiftKey)} role="button" tabindex="0"
                 onkeydown={(e) => { if (e.key === 'Enter') toggleIssue(i, range.start + vi, e.shiftKey); }}>
@@ -1070,6 +1110,8 @@
                     <button class="issue__dl" title={typeof a.title === 'function' ? a.title(i) : a.title} onclick={(e) => { e.stopPropagation(); a.run(i, detail.series); }}>{@html typeof a.icon === 'function' ? a.icon(i) : a.icon}</button>
                   {/if}
                 {/each}
+                <button class="issue__dl issue__more" title="Actions" aria-label="Actions for issue {i.number ?? ''}"
+                  onclick={(e) => { e.stopPropagation(); openContextMenu(e, issueMenuItems(i)); }}><Icon name="more-horizontal" /></button>
                 {#if !i.owned && !i.corrupt && can('downloads.grab')}
                   <button class="issue__dl issue__want" class:is-on={i.wanted} title={wantTitle(i)} onclick={(e) => { e.stopPropagation(); setWants([i.cv_issue_id], !i.wanted); }}><Icon name="target" /></button>
                 {/if}
@@ -1102,7 +1144,7 @@
                this, such a file is invisible and its issue simply reads "missing". -->
           <div class="unlinked">
             <div class="unlinked__head"><Icon name="alert-triangle" size={14} /> {fmt(n)} file{n === 1 ? '' : 's'} in this folder {n === 1 ? "isn't" : "aren't"} matched to an issue</div>
-            <div class="unlinked__note">They count as missing until they match. The issue number is read from the file's ComicInfo tag first, then its filename, and looked up in this ComicVine volume — if the volume is the wrong one, use <b>Fix match</b>; if the number is, retag or rename the file, then <b>Scan folder</b>.</div>
+            <div class="unlinked__note">They count as missing until they match. The issue number is read from the file's ComicInfo tag first, then its filename, and looked up in this ComicVine volume — if the volume is the wrong one, use <b>Fix match</b>; if the number is, retag or rename the file, then <b>Scan folder</b>{#if isTrusted() || can('library.manage')} — or just <b>assign</b> the file to its issue here; the assignment is remembered through rescans{/if}.</div>
             {#if unlinkedBeyond}
               <div class="unlinked__hint">{fmt(unlinkedBeyond)} of them {unlinkedBeyond === 1 ? 'has a number' : 'have numbers'} this volume never reaches (it has {fmt(det.issues.length)} issue{det.issues.length === 1 ? '' : 's'}) — this is almost certainly the wrong ComicVine volume. <b>Fix match</b> to the right one and the files link on their own.</div>
             {/if}
@@ -1113,6 +1155,13 @@
               <div class="unlinked__file" class:is-bad={!f.valid} title={f.path}>
                 <span class="unlinked__name">{f.name}</span>
                 <span class="unlinked__num">{f.number ? `read as #${f.number}${f.fromTag ? ' (from tag)' : ''}` : 'no issue number found'}</span>
+                {#if isTrusted() || can('library.manage')}
+                  <select class="unlinked__pick" aria-label="Assign {f.name} to an issue" bind:value={assignPick[f.path]}>
+                    <option value="">Assign to issue…</option>
+                    {#each det.issues as i (i.cv_issue_id)}<option value={i.cv_issue_id}>{issueChoice(i)}</option>{/each}
+                  </select>
+                  <button class="unlinked__assign" disabled={!assignPick[f.path]} onclick={() => assignFile(f)}>Assign</button>
+                {/if}
               </div>
             {/each}
             {#if !showAllUnlinked && n > 40}

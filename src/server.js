@@ -13,13 +13,15 @@ import { planSeries, refileSeries, planLibrary, canRefile } from './refile.js';
 import { seriesFolderFromPattern, fileStemFromPattern } from './naming.js';
 import { normalizeNumber } from './matcher.js';
 import { parseIssueFromFilename } from './scanner.js';
+import { linkFilesToCv } from './cvmatch.js';
+import { getLibraryFile, linkFileCvIssue, setFileIssueOverride, clearFileIssueOverride } from './db.js';
 import { testIndexer } from './newznab.js';
 import { testClient } from './nzbclients.js';
 import { testTorznabIndexer } from './torznab.js';
 import { testTorrentClient } from './torrentclients.js';
 import { pluginsDir, pluginCatalog, setPluginEnabled, markPluginPending, pendingPluginChanges, installedOnDisk, registeredRoutes, registeredPermissions, registeredAuthProviders, registeredCredentialProviders, pluginLibraryTypes, registeredLibraryScanners, registeredCollectionFilters } from './plugins.js';
 import { fetchCatalog, installPlugin, uninstallPlugin } from './plugincatalog.js';
-import { logWarn, logInfo } from './logstore.js';
+import { logInfo, logWarn } from './logstore.js';
 import * as users from './users.js';
 import * as lists from './lists.js';
 import * as franchise from './franchise.js';
@@ -42,7 +44,7 @@ if (process.env.BUILD_CHANNEL && process.env.BUILD_CHANNEL !== 'release') {
   APP_VERSION += `-${process.env.BUILD_CHANNEL}${sha ? '.' + sha : ''}`;
 }
 
-export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvSearch, cvVolumeInfo, cvIssueInfo, arcSearch, arcIssues, cblResolve, cleanupSeriesFiles, runImportScan, runImport, importState, runTool, toolsState, runLibraryRefile, refileState, stats, listSources, listSourceCards, testSource, sourceCatalog, installSource: installSourceFn, uninstallSource: uninstallSourceFn, queueProgress, packProgress, cancelGrab, testCvKeys, usenetSearch, usenetGrab, torrentSearch, torrentGrabPack, searchSources, manualGrabResult, grabSourcePack, searchPacks, grabPack, setAliases, pluginRoutes = [], pluginClientAssets = [], matchImportCandidate, confirmImportCandidate, skipImportCandidate, cvSetManual, addFromCv, scanSeriesFolder, deleteComic, refreshVolume, refreshPublisherArt, tagSeriesFiles, checkReleases, listJobs, clearJobs, listLogs, clearLogs, listSchedules, setScheduleCron, runScheduleNow, getSettings, saveSettings, requestRestart, supportPackage, supportSend, supportSendMobile, state }) {
+export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvSearch, cvVolumeInfo, cvIssueInfo, arcSearch, arcIssues, cblResolve, cleanupSeriesFiles, runImportScan, runImport, importState, runTool, toolsState, runLibraryRefile, refileState, stats, listSources, listSourceCards, testSource, sourceCatalog, installSource: installSourceFn, uninstallSource: uninstallSourceFn, queueProgress, packProgress, activeMedia, cancelGrab, testCvKeys, usenetSearch, usenetGrab, torrentSearch, torrentGrabPack, searchSources, manualGrabResult, grabSourcePack, searchPacks, grabPack, setAliases, pluginRoutes = [], pluginClientAssets = [], matchImportCandidate, confirmImportCandidate, skipImportCandidate, cvSetManual, addFromCv, scanSeriesFolder, deleteComic, refreshVolume, refreshPublisherArt, tagSeriesFiles, checkReleases, listJobs, clearJobs, listLogs, clearLogs, listSchedules, setScheduleCron, runScheduleNow, getSettings, saveSettings, requestRestart, supportPackage, supportSend, supportSendMobile, state }) {
   const startDownloads = (arg) => {
     if (!state.queue.running) {
       state.queue.running = true;
@@ -283,7 +285,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     // pinned explicitly so they can never drift off the manage permission if the
     // fall-through default ever changes. $-anchored, so GET browse of the
     // collection stays library.view and downloads still route via DOWNLOAD_RULES.
-    [/^\/api\/collection\/\d+\/(delete|scan|refile|refresh|tag|cleanup|metadata|monitor|path|restricted|aliases|cv|type|library)$/, 'library.manage'],
+    [/^\/api\/collection\/\d+\/(delete|scan|refile|refresh|tag|cleanup|metadata|monitor|path|restricted|aliases|cv|type|library|assign-file)$/, 'library.manage'],
     [/^\/api\/collection\/(bulk|add-cv)$/, 'library.manage'],
     // fork: deleting downloaded files is library management, not a download
     // action — a downloads.grab role can fetch things, not erase them.
@@ -814,6 +816,11 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     try { res.json({ added: lists.addItems(db, req.user.id, Number(req.params.id), (req.body || {}).cvIssueIds) }); }
     catch (e) { listErr(res, e); }
   });
+  // Whole series at a time, for a run assembled out of volumes.
+  app.post('/api/lists/:id/series', (req, res) => {
+    try { res.json(lists.addSeries(db, req.user.id, Number(req.params.id), (req.body || {}).seriesIds)); }
+    catch (e) { listErr(res, e); }
+  });
   app.delete('/api/lists/:id/items/:cvIssueId', (req, res) => {
     try { lists.removeItem(db, req.user.id, Number(req.params.id), req.params.cvIssueId); res.json({ ok: true }); }
     catch (e) { listErr(res, e); }
@@ -1066,7 +1073,8 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     // queue list uses, so the badge matches what this user actually sees there.
     const rset = canRestricted(req) ? null : restrictedSeriesIds(db);
     const packsActive = activePackGrabs(db).filter((p) => !rset || p.series_id == null || !rset.has(p.series_id)).length;
-    res.json({ counts: pieces.counts, packsActive, followedCount: pieces.followedCount, libraryTypes: pieces.libraryTypes, libraries: libs, version: APP_VERSION, crawl: state.crawl, queue: state.queue, follow: state.follow || { running: false } });
+    const mediaActive = activeMedia ? activeMedia().length : 0;
+    res.json({ counts: pieces.counts, packsActive, mediaActive, followedCount: pieces.followedCount, libraryTypes: pieces.libraryTypes, libraries: libs, version: APP_VERSION, crawl: state.crawl, queue: state.queue, follow: state.follow || { running: false } });
     warmChipCounts(req, pieces.libraries); // fire-and-forget: pre-warm this user's chip counts on the worker
   });
 
@@ -1082,6 +1090,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
       // an immediate-source download never ticks the drawer.
       q: listQueue(db), p: activePackGrabs(db), s: state.queue,
       live: queueProgress ? queueProgress() : null, pk: packProgress ? packProgress() : null,
+      m: activeMedia ? activeMedia() : null,
     }),
     jobs: () => (listJobs ? listJobs() : null),
     schedules: () => (listSchedules ? listSchedules() : null),
@@ -1438,11 +1447,15 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     // be invisible here while downloading.
     const packLive = (packProgress ? packProgress() : {}) || {};
     const packs = activePackGrabs(db).map((g) => ({ ...g, live: packLive[g.id] || null }));
+    // Books and audiobooks in flight — no issue rows either, so they'd be
+    // invisible here while a source searches, downloads or a client fetches.
+    const media = activeMedia ? activeMedia() : [];
     // Restricted series stay invisible to roles without the permission.
     const rset = canRestricted(req) ? null : restrictedSeriesIds(db);
     res.json({
       items: rset ? items.filter((i) => !rset.has(i.series_id)) : items,
       packs: rset ? packs.filter((p) => p.series_id == null || !rset.has(p.series_id)) : packs,
+      media,
       paused: !!state.queue.paused,
       running: !!state.queue.running,
       current: state.queue.current || null,
@@ -1560,7 +1573,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
 
   // Filter-chip keys — the badges are independent of the active filter, so
   // switching chips never changes them.
-  const COLLECTION_CHIP_KEYS = ['all', 'incomplete', 'followed', 'monitored', 'unmonitored', 'ongoing', 'ended', 'problems', 'unmatched', 'manga'];
+  const COLLECTION_CHIP_KEYS = ['all', 'incomplete', 'followed', 'monitored', 'unmonitored', 'ongoing', 'ended', 'problems', 'empty', 'unmatched', 'manga'];
   // Chip counts run OFF the main thread (worker + its own read-only WAL
   // connection) behind a short TTL cache. better-sqlite3 is synchronous, and
   // this is the app's heaviest read: inline it froze the event loop ~0.5-1s at
@@ -1880,6 +1893,34 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   });
   app.get('/api/scan-folder', (req, res) => res.json(state.scanFolder || { running: false }));
   // Set (or clear, with empty) a comic's folder on disk.
+  // Assign one of the series' files to an issue by hand — for a file the app
+  // read no number from, or the wrong one. { path, cvIssueId } links it and
+  // remembers the choice per file path, so rescans, re-matches and metadata
+  // refreshes keep it; { path, cvIssueId: null } forgets it and re-reads the
+  // number as usual.
+  app.post('/api/collection/:id/assign-file', (req, res) => {
+    const id = Number(req.params.id);
+    const row = getSeriesById(db, id);
+    if (!row) return res.status(404).json({ error: 'no such series' });
+    const p = String(req.body?.path || '');
+    const f = p ? getLibraryFile(db, p) : null;
+    if (!f || f.series_id !== id) return res.status(400).json({ error: 'that file is not in this series' });
+    const raw = req.body?.cvIssueId;
+    const cvIssueId = raw == null || raw === '' ? null : Number(raw);
+    if (cvIssueId != null) {
+      const ci = Number.isFinite(cvIssueId) ? getCvIssue(db, cvIssueId) : null;
+      if (!ci || !row.cv_id || ci.cv_series_id !== row.cv_id) return res.status(400).json({ error: 'that issue is not in this volume' });
+      setFileIssueOverride(db, p, cvIssueId);
+    } else {
+      clearFileIssueOverride(db, p);
+    }
+    if (row.cv_id) linkFilesToCv(db, id, row.cv_id);
+    else linkFileCvIssue(db, p, cvIssueId);
+    const after = getLibraryFile(db, p);
+    logInfo(cvIssueId != null ? `Assigned "${f.name}" to ComicVine issue ${cvIssueId} by hand` : `Cleared the hand assignment of "${f.name}"`, 'library');
+    res.json({ ok: true, cvIssueId: after?.cv_issue_id ?? null });
+  });
+
   app.post('/api/collection/:id/path', (req, res) => {
     setSeriesPath(db, Number(req.params.id), req.body?.path || null);
     const row = getSeriesById(db, Number(req.params.id));

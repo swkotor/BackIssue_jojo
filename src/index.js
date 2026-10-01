@@ -30,6 +30,7 @@ import { fetchWeeklyReleases, matchReleases, shiftWeek, currentWeek } from './re
 import { startJob, listJobs, clearFinishedJobs, attachJobsDb } from './jobs.js';
 import { createScheduler } from './scheduler.js';
 import { createDownloadMonitor } from './downloadmonitor.js';
+import { activeMedia as activeMediaList, emitMedia } from './mediadownload.js';
 import { tagAllUntagged, convertAllCbr, removeAllDuplicates, verifyLibrary, relinkAllCv, scanEntireLibrary, backupDatabase, renameAllFiles, removeGhostSeries } from './tools.js';
 import { collectionStats } from './stats.js';
 import { installConsoleCapture, attachLogDb, listLogs, clearLogs, logInfo, logWarn, logError, logCounts, logCategories } from './logstore.js';
@@ -271,7 +272,10 @@ async function cvIssueInfo(cvIssueId) {
     try { issue = await ensureCvIssueDetail(db, cvClient(), cvIssueId); }
     catch (e) { console.warn('cv issue detail fetch failed', cvIssueId, e?.message || e); }
   }
-  const files = db.prepare('SELECT path, name, valid, has_metadata, error FROM library_files WHERE cv_issue_id=?').all(cvIssueId);
+  // `assigned`: the file sits under this issue because someone said so, not
+  // because its number read that way — the modal offers to undo that.
+  const files = db.prepare('SELECT f.path, f.name, f.valid, f.has_metadata, f.error, f.series_id, EXISTS (SELECT 1 FROM file_issue_overrides o WHERE o.path = f.path) AS assigned FROM library_files f WHERE f.cv_issue_id=?').all(cvIssueId)
+    .map((f) => ({ ...f, assigned: !!f.assigned }));
   let credits = [];
   try { credits = issue.credits ? JSON.parse(issue.credits) : []; } catch { /* ignore */ }
   const owned = files.some((f) => f.valid);
@@ -1076,7 +1080,9 @@ async function cancelActiveGrab(grabId) {
   } catch { /* client unreachable — still cancel our side */ }
   setGrabStatus(db, grab.id, 'failed', { error: 'cancelled by user' });
   if (grab.kind !== 'pack' && grab.issue_id) setIssueStatus(db, grab.issue_id, 'pending');
-  logInfo(`Cancelled ${grab.kind === 'pack' ? 'pack ' : ''}grab: ${grab.title || grab.id}`, grab.source || 'download');
+  // A media grab has an asker (a request, a wanted book) waiting to hear.
+  if (grab.kind === 'media') { try { const { grabPayload } = await import('./db.js'); emitMedia({ event: 'failed', ...grabPayload(grab), ref: grab.ref, source: grab.source, error: 'cancelled by user' }); } catch { /* best-effort */ } }
+  logInfo(`Cancelled ${grab.kind === 'pack' ? 'pack ' : grab.kind === 'media' ? 'book ' : ''}grab: ${grab.title || grab.id}`, grab.source || 'download');
   return { cancelled: true };
 }
 
@@ -1491,6 +1497,8 @@ const app = createApp({
   },
   queueProgress: () => downloadMonitor.getProgress(),
   packProgress: () => ({ ...downloadMonitor.getPackProgress(), ...Object.fromEntries(inAppPackProgress) }),
+  // Books and audiobooks in flight (immediate downloads + deferred grabs).
+  activeMedia: () => activeMediaList(db, downloadMonitor.getMediaProgress()),
   cancelGrab: cancelActiveGrab,
   testCvKeys,
   usenetSearch,
@@ -1610,6 +1618,8 @@ const downloadMonitor = createDownloadMonitor({
     if (p.event === 'tag-result') recordProgressTagLog(p);
     if (p.event === 'done') { logInfo(`Imported from ${p.source || 'download'}: ${p.issue?.title || 'issue ' + p.issue?.id}`, p.source || 'usenet'); notifyRaw(db, { type: 'import.done', category: 'import', level: 'success', title: 'Downloaded', body: `${p.issue?.title || 'issue'}${p.source ? ' · ' + p.source : ''}`, seriesId: p.issue?.series_id ?? null }); settlePicks(p.issue?.series_id ?? null); }
     if (p.event === 'failed') { logError(`${p.source || 'download'} import failed: ${p.issue?.title || 'issue ' + p.issue?.id} — ${p.error}`, p.source || 'usenet'); notifyRaw(db, { type: 'import.failed', category: 'failure', level: 'error', title: 'Download failed', body: `${p.issue?.title || 'issue'} — ${p.error}`, seriesId: p.issue?.series_id ?? null }); }
+    if (p.event === 'media-done') notifyRaw(db, { type: 'import.done', category: 'import', level: 'success', title: 'Downloaded', body: `${p.title || p.type}${p.source ? ' · ' + p.source : ''}`, seriesId: p.seriesId ?? null });
+    if (p.event === 'media-failed') { logError(`${p.source || 'download'}: ${p.title || p.type || 'media'} — ${p.error}`, p.source || 'download'); notifyRaw(db, { type: 'import.failed', category: 'failure', level: 'error', title: 'Download failed', body: `${p.title || p.type || 'media'} — ${p.error}` }); }
     if (p.event === 'pack-start') logInfo(`Post-processing pack — ${p.title}…`, p.source || 'torrent');
     if (p.event === 'pack-import') {
       if (p.outcome === 'imported') logInfo(`[${p.done}/${p.total}] imported ${p.reason}`, p.source || 'torrent');
