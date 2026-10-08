@@ -758,7 +758,6 @@
               <span></span>
               <button class="libx-row__star" class:is-on={s.followed} title={s.followed ? 'Followed — click to unfollow' : 'Not followed — click to follow'} aria-label={s.followed ? 'Unfollow' : 'Follow'} onclick={(e) => { e.stopPropagation(); toggleMon(s); }}><Icon name="star" fill={!!s.followed} size={15} /></button>
             {:else}<span class="libx-col--wide"></span><span class="libx-col--wide"></span><span></span><span></span>{/if}
-            {:else}<span></span>{/if}
             {#if !rail.selecting}
               <button class="libx-row__more" class:is-shown={hovered === s.id}
                 title="Actions" aria-label="Actions for {s.title}"
