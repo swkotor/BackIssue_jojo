@@ -8,7 +8,57 @@ by the maintainers when changes merge, so concurrent PRs don't conflict here.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-10-09
+
 ### Added
+
+- **Right-click menus on series and issues.** A series card in the Library, and
+  an issue in either the grid or the list on a series page, now open a menu on
+  right-click (press and hold on a touch screen). A series offers open, follow,
+  download missing, its monitoring policy, and remove; an issue offers whatever
+  the installed plugins contribute first (with the reader, that is Read, Mark as
+  read/unread and Read later), then issue details, download or re-download, and
+  want or skip. The menu is built when it opens, so it always reflects that row
+  as it stands, it only lists what your role can do, and right-clicking never
+  disturbs a selection you are part-way through building.
+
+  On a touch screen the same menu opens on a **long press**, with a short
+  buzz where the device supports one. Lifting your finger afterwards does not
+  also open the row, a quick tap still opens it as before, and starting to
+  scroll cancels the press rather than opening a menu you did not ask for.
+
+- **Quick actions on Library cards** (#5). Every series card and row has an
+  actions menu, reached from the **⋯ button** that appears on hover, a
+  right-click, or a long press. Issues carry the same button, on the poster
+  card and at the end of a list row. It carries the library-management actions that
+  previously meant opening the series first: **Scan folder**, **Edit
+  metadata**, **Rename files** and **Fix match** (or **Match to ComicVine** for
+  a series that has none yet).
+
+- **Characters and credited names are links.** Click a character, team or
+  creator in the issue modal for every other issue in your collection that
+  features or credits them, owned copies first, each row carrying the role it
+  was credited for. Both sources are searched — ComicVine's arrays and
+  Metron's — so an issue found only through enrichment still turns up.
+  Restricted series stay hidden unless you can see them. Credits are good
+  coverage for anything whose metadata has been downloaded; character listings
+  are thin, because the sources record them for a minority of issues and mostly
+  recent ones, so an empty result says which of the two you are looking at
+  rather than implying your collection has none. The list is complete, not
+  capped — the busiest creator here has 843 credits — and only the rows near
+  the viewport are rendered, so a long one stays quick.
+
+  Those results group by series. Each heading sticks as you scroll and carries
+  the years it spans and how much of it you own — green when the run is
+  complete, amber when it is partial. A series with more than two dozen hits
+  stays collapsed behind a summary of its consecutive runs ("130 issues ·
+  #208-250, #400-443"), so coverage reads without opening it, and expands into
+  a grid of issue numbers — one cell each, filled where you own the issue —
+  with a switch to rows or covers that pages thirty at a time. Above the
+  groups: totals for issues, series, owned and years; a chip per credited role
+  for a creator; and a filter, an owned-only toggle, a sort (biggest series or
+  most recent) and a list/cover switch that all work on what is already
+  loaded.
 
 - **Add whole series to a reading list from the Library** (#9). Select mode's
   bulk bar gains **Add to list**, which puts every issue of every selected
@@ -19,14 +69,53 @@ by the maintainers when changes merge, so concurrent PRs don't conflict here.
   that will be before you commit, and a selected series with no ComicVine
   issues to contribute is reported rather than silently skipped.
 
-### Fixed
+- **Find and clear failed adds** (#8). A **Nothing downloaded** filter lists
+  every series with no file to its name, which is what a mass-add leaves behind
+  when the downloads fail. The bulk bar also gains **Select all**, so clearing
+  them is filter, select, Remove. On a list longer than one page the button
+  says how many are loaded rather than pretending to select the rest.
 
-- **A very long reading list no longer bogs the page down.** Lists can now be
-  built in a couple of clicks, and a single series can carry thousands of
-  issues, so the list page renders only the rows near the viewport past 200
-  items, the way a long series page already did. A 4,239-issue list went from
-  134,000 elements on the page to 3,000, first paint from 2.5s to 1s, and
-  scrolling about five times quicker.
+- **Assign a file to an issue by hand.** On a series page, each file the app
+  could not match to an issue now has an *Assign to issue* picker: choose
+  the issue and the file links to it at once. The choice is remembered per
+  file, so rescans, re-matches and metadata refreshes keep it (a re-match to
+  a different volume drops it). For files whose number the app cannot read,
+  or reads wrongly, without renaming or retagging anything. A file that
+  linked to the wrong issue can be moved from that issue's own file list
+  (open the issue, *Move to another issue…*), and a hand assignment undone
+  there too.
+
+- **Date formats for file naming.** The `{date}` token in a file pattern still
+  writes "November 2011", but it now takes a modifier for the parts on their
+  own: `{date:m}` the two-digit month, `{date:y}` the year, `{date:mon}` the
+  short month name. So `{series} V{year} #{issue} ({date:m}-{date:y})` files as
+  `Batman V2011 #001 (11-2011).cbz`. The month keeps its leading zero, so March
+  is `03` and sorts with the rest of the year. Existing patterns are unchanged,
+  an unrecognised modifier falls back to the full form, and an issue with no
+  cover date drops the whole bracket rather than leaving `(-)` behind.
+
+- **Characters, teams, locations and story arcs are written into your files.**
+  They are standard `ComicInfo.xml` elements that every other reader and
+  library server reads, and they were never written — even though the data
+  was already cached. They are there now, along with page count. ComicVine
+  supplies them where it has them, which is about 6% of issues and almost
+  nothing before 1980 because they are hand-tagged there; Metron fills the
+  rest. Existing files need a re-tag to pick them up.
+
+- **Everything Metron publishes is kept.** Alongside the prices, barcodes and
+  ratings already stored, an issue now carries its characters, teams, arcs,
+  universes, per-role credits, description, title, page count, imprint,
+  publisher and Metron and Grand Comics Database ids.
+
+- **Unwrap nested archives** (Tools). Repairs the files the check above finds:
+  the inner archive's pages are lifted to the top level, in place, with the
+  wrapper's ComicInfo carried across when the inner one has none. It refuses
+  anything it cannot prove — more than one archive inside, or an unwrapped
+  result with no pages — and never replaces a file until the replacement has
+  been read back and found to contain pages.
+
+
+### Changed
 
 - **Reading lists are runs now.** A list's page is built around where you are
   in it rather than what share of it you own. Its issues sit on one spine with
@@ -43,51 +132,68 @@ by the maintainers when changes merge, so concurrent PRs don't conflict here.
   to go. Without the reader installed a list shows ownership and order exactly
   as before, and makes no claim about what has been read.
 
-- **Find and clear failed adds** (#8). A **Nothing downloaded** filter lists
-  every series with no file to its name, which is what a mass-add leaves behind
-  when the downloads fail. The bulk bar also gains **Select all**, so clearing
-  them is filter, select, Remove. On a list longer than one page the button
-  says how many are loaded rather than pretending to select the rest.
-- **Quick actions on Library cards** (#5). Every series card and row has an
-  actions menu, reached from the **⋯ button** that appears on hover, a
-  right-click, or a long press. Issues carry the same button, on the poster
-  card and at the end of a list row. It carries the library-management actions that
-  previously meant opening the series first: **Scan folder**, **Edit
-  metadata**, **Rename files** and **Fix match** (or **Match to ComicVine** for
-  a series that has none yet).
-- **Right-click menus on series and issues.** A series card in the Library, and
-  an issue in either the grid or the list on a series page, now open a menu on
-  right-click (press and hold on a touch screen). A series offers open, follow,
-  download missing, its monitoring policy, and remove; an issue offers whatever
-  the installed plugins contribute first (with the reader, that is Read, Mark as
-  read/unread and Read later), then issue details, download or re-download, and
-  want or skip. The menu is built when it opens, so it always reflects that row
-  as it stands, it only lists what your role can do, and right-clicking never
-  disturbs a selection you are part-way through building.
+- **The issue details modal is two columns.** It was one long scroll: cover,
+  dates, two rows of buttons, then five stacked sections of dot-joined text.
+  Now the cover carries a status chip and every action stacks beneath it, so
+  the actions never scroll away, and the content is four tabs with counts —
+  Overview, Credits, Appearing, Files — where the count tells you whether a
+  tab is worth opening. The primary action follows the state: Read for an
+  owned issue, **Replace corrupt file** in red for a damaged one, Download
+  when there is nothing on disk. Credits group by role rather than listing a
+  row per person, characters and teams and arcs are chips with a working
+  "+N more" instead of a dead-end count, and each file gets a card with its
+  folder, one state flag and the move-to-issue control inside it. Previous
+  and next issue buttons in the header step through the run without going
+  back to the series page, keeping the tab you were reading. Editing keeps
+  the same layout, and every edited field now shows the amber "edited" mark,
+  not just the three that used to.
 
-  On a touch screen the same menu opens on a **long press**, with a short
-  buzz where the device supports one. Lifting your finger afterwards does not
-  also open the row, a quick tap still opens it as before, and starting to
-  scroll cancels the press rather than opening a menu you did not ask for.
-- **Date formats for file naming.** The `{date}` token in a file pattern still
-  writes "November 2011", but it now takes a modifier for the parts on their
-  own: `{date:m}` the two-digit month, `{date:y}` the year, `{date:mon}` the
-  short month name. So `{series} V{year} #{issue} ({date:m}-{date:y})` files as
-  `Batman V2011 #001 (11-2011).cbz`. The month keeps its leading zero, so March
-  is `03` and sorts with the rest of the year. Existing patterns are unchanged,
-  an unrecognised modifier falls back to the full form, and an issue with no
-  cover date drops the whole bracket rather than leaving `(-)` behind.
-- **Assign a file to an issue by hand.** On a series page, each file the app
-  could not match to an issue now has an *Assign to issue* picker: choose
-  the issue and the file links to it at once. The choice is remembered per
-  file, so rescans, re-matches and metadata refreshes keep it (a re-match to
-  a different volume drops it). For files whose number the app cannot read,
-  or reads wrongly, without renaming or retagging anything. A file that
-  linked to the wrong issue can be moved from that issue's own file list
-  (open the issue, *Move to another issue…*), and a hand assignment undone
-  there too.
+- **Enrichment is on by default.** It was an opt-in toggle, so most libraries
+  were getting no Metron data at all — and since characters and story arcs
+  now go into `ComicInfo.xml`, that meant files written without fields every
+  other reader expects. Existing installs are switched on once; turn it off
+  again and it stays off. The hosted service caches the enrichment, so it
+  costs no extra upstream call, and the official ComicVine API ignores the
+  request.
+
 
 ### Fixed
+
+- **A very long reading list no longer bogs the page down.** Lists can now be
+  built in a couple of clicks, and a single series can carry thousands of
+  issues, so the list page renders only the rows near the viewport past 200
+  items, the way a long series page already did. A 4,239-issue list went from
+  134,000 elements on the page to 3,000, first paint from 2.5s to 1s, and
+  scrolling about five times quicker.
+
+- **A comic with nothing in it to read is a problem now.** Some releases ship a
+  `.cbz` that holds a `.cbr` instead of pages. It is a perfectly good zip, its
+  ComicInfo reads, and it counted as owned, tagged and healthy — because
+  nothing ever asked whether there was anything to read. Any comic archive with
+  no pages is now flagged, naming what is inside when the cause is a nested
+  archive, so it turns up under Problems instead of sitting in the library
+  looking fine. Empty and truncated archives are caught by the same check.
+  Books are unaffected: an EPUB with no image in it is still a good EPUB.
+
+- **A download that is a wrapper is straightened out on the way in.** The import
+  step sniffed the magic bytes, saw a zip and filed it — so a release packaged
+  as a `.cbz` around a `.cbr` was written to the library exactly as the source
+  shipped it. It is now unwrapped before anything reaches disk, and a zip with
+  no pages that cannot be unwrapped is refused outright, the way an
+  unrecognisable container already was.
+
+- **AVIF pages count as pages.** The reader renders them; core's page test did
+  not list them, so an AVIF comic would have been called pageless by the check
+  above. The two tests now agree. macOS resource forks (`__MACOSX`, `._*`) no
+  longer count as pages either, so an archive of nothing but junk reads as
+  empty rather than full.
+
+- Files named "Series (Year) Volume 01 Issue 002" read the volume number as
+  the issue number, so every file in the folder landed as issue 1 and the
+  rest showed as missing. An explicit issue marker ("Issue 002", "No. 12",
+  "Issue #3") now names the issue outright, and a volume marker ("Volume
+  01", "Vol. 3", "v2") is never mistaken for one — unless it is the only
+  number in the name, as on a trade.
 
 - **Adding a series now takes you to it** (#4). After a successful add the
   button showed the outcome ("Added — 12 queued") but was dead, leaving no way
@@ -96,30 +202,35 @@ by the maintainers when changes merge, so concurrent PRs don't conflict here.
   library" button was broken too**, in a worse way: it pointed at a path that
   has never been a route, so the one button meant to work landed on Page not
   found. Both now go to the same place.
+
 - The Library's **sort is remembered** (#6). It was carried in the URL, so it
   survived Back, a reload and the series page's Library button, but any trip
   through the sidebar built a fresh URL and dropped it, putting you back at
   A–Z. The choice is now kept as a preference and reapplied whenever you arrive
   without one, including from a sidebar library and in a new session. A sort
   named in the URL still wins, so a shared or bookmarked link is unchanged.
+
 - **Add to reading list was unusable with more than a few lists.** The choices
   were laid out as one unwrapping row of footer buttons inside a 440px dialog,
   so with a dozen lists most of them sat off the side of the screen, with
   nothing to scroll and no way to reach them. A long set of choices now stacks
   into a scrollable list. Dialogs are also capped at the height of the screen
   and scroll their body, so no dialog can run off the edge again.
-- A matched series' row carried no file count internally, unlike every other
-  kind of row. Nothing user-visible depended on it until now, but any check for
-  "does this series have files" read it as none.
+
+- **A metadata server without enrichment is no longer asked on every access.**
+  Enrichment was re-requested whenever an issue had detail but no recorded
+  answer — and a server that does not support it (the official ComicVine API
+  ignores the parameter) never sends one, so the issue's detail was re-fetched
+  on every single access, forever, against the user's own rate limit. Asking
+  and getting nothing is now recorded as the miss it is.
+
 - An issue poster card with several plugin actions pushed the last of its hover
   buttons outside the card, where they could not be clicked. The row of buttons
   now wraps.
-- Files named "Series (Year) Volume 01 Issue 002" read the volume number as
-  the issue number, so every file in the folder landed as issue 1 and the
-  rest showed as missing. An explicit issue marker ("Issue 002", "No. 12",
-  "Issue #3") now names the issue outright, and a volume marker ("Volume
-  01", "Vol. 3", "v2") is never mistaken for one — unless it is the only
-  number in the name, as on a trade.
+
+- A matched series' row carried no file count internally, unlike every other
+  kind of row. Nothing user-visible depended on it until now, but any check for
+  "does this series have files" read it as none.
 
 ## [0.8.4] - 2026-09-14
 

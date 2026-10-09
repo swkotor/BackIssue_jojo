@@ -262,8 +262,14 @@ function migrate(db) {
   // Per-issue: full CV credit arrays + every Metron extra. metron_checked
   // marks "enrichment answered" (hit or miss) so detail rows cached before
   // enrichment existed re-fetch exactly once, not forever.
+  // metron_characters/_teams/_arcs matter most: ComicVine carries characters
+  // for ~6% of issues and almost none before 1980 (they are hand-tagged
+  // there), so for most of a library Metron is the only source of them.
   for (const col of ['metron_price', 'metron_upc', 'metron_story_titles', 'metron_reprints', 'metron_checked',
                      'metron_isbn', 'metron_sku', 'metron_foc_date', 'metron_variants', 'metron_cover_hash', 'metron_rating',
+                     'metron_characters', 'metron_teams', 'metron_arcs', 'metron_universes', 'metron_credits',
+                     'metron_description', 'metron_title', 'metron_alt_number', 'metron_page_count',
+                     'metron_imprint', 'metron_publisher', 'metron_resource_url', 'metron_image', 'metron_gcd_id',
                      'character_credits', 'team_credits', 'location_credits', 'story_arc_credits', 'associated_images']) {
     if (cvi.length && !cvi.includes(col)) db.exec(`ALTER TABLE cv_issues ADD COLUMN ${col} TEXT`);
   }
@@ -554,6 +560,50 @@ export function isCvIssueRestricted(db, cvIssueId) {
     'SELECT 1 x FROM cv_issues ci JOIN series s ON s.cv_id = ci.cv_series_id WHERE ci.comicvine_id=? AND s.restricted=1',
   ).get(cvIssueId);
   return !!r;
+}
+
+/** Issues in the collection that credit a person, or that a character or team
+ *  appears in. Both ComicVine's arrays and Metron's are searched: ComicVine
+ *  carries characters for about 6% of issues, so on an older library Metron is
+ *  often the only one that has them.
+ *
+ *  `kind` is 'creator' | 'character' | 'team'. Matching is exact on the name —
+ *  these come from chips the user clicked, not free text, so a LIKE would only
+ *  add false positives. Restricted series are filtered the same way every other
+ *  surface filters them.
+ */
+export function issuesFeaturing(db, { kind, name, includeRestricted = false } = {}) {
+  const COLS = {
+    creator: [['credits', '$.name'], ['metron_credits', '$.creator']],
+    character: [['character_credits', '$.name'], ['metron_characters', '$.name']],
+    team: [['team_credits', '$.name'], ['metron_teams', '$.name']],
+  }[kind];
+  if (!COLS || !name) return [];
+  // One scan per column, unioned: json_each cannot span two arrays in one pass,
+  // and over ~42k rows each side answers in tens of milliseconds.
+  const sql = COLS.map(([col, path]) => `
+      SELECT ci.comicvine_id AS cv_issue_id, ci.issue_number, ci.name AS title,
+             ci.cover_date, ci.image_url, ci.cv_series_id,
+             ${col === 'credits' ? "json_extract(j.value,'$.role')" : col === 'metron_credits' ? "(SELECT group_concat(json_extract(r.value,'$.name'), ', ') FROM json_each(json_extract(j.value,'$.role')) r)" : 'NULL'} AS role
+        FROM cv_issues ci, json_each(ci.${col}) j
+       WHERE ci.${col} IS NOT NULL AND json_extract(j.value, '${path}') = @name`).join(' UNION ');
+  const rows = db.prepare(`
+    WITH hit AS (${sql})
+    SELECT h.cv_issue_id, h.issue_number, h.title, h.cover_date, h.image_url, h.role,
+           s.id AS series_id, COALESCE(cs.name, s.title) AS series, s.year AS series_year,
+           EXISTS (SELECT 1 FROM library_files lf WHERE lf.cv_issue_id = h.cv_issue_id AND lf.valid = 1) AS owned
+      FROM hit h
+      LEFT JOIN series s ON s.cv_id = h.cv_series_id
+      LEFT JOIN cv_series cs ON cs.comicvine_id = h.cv_series_id
+     WHERE (@includeRestricted OR COALESCE(s.restricted, 0) = 0)
+     GROUP BY h.cv_issue_id
+     ORDER BY owned DESC, h.cover_date, h.cv_issue_id`)
+    // No cap: a prolific creator legitimately has hundreds of issues here
+    // (843 is the busiest in a 42k-row library, and that grows as metadata is
+    // filled in). Truncating silently would quietly lie about the collection;
+    // the caller windows the list instead so the DOM stays small.
+    .all({ name: String(name), includeRestricted: includeRestricted ? 1 : 0 });
+  return rows.map((r) => ({ ...r, owned: !!r.owned }));
 }
 
 export function listIssues(db, { seriesId, status } = {}) {
@@ -1853,6 +1903,7 @@ export function setCvIssueDetail(db, comicvineId, {
   ).run(...baseCols.map((c) => base[c]), comicvineId).changes;
   // Enrichment answered (object = data, null = checked miss). Absent key =
   // enrichment off/unsupported — leave whatever a prior fetch stored.
+  const json = (a) => (Array.isArray(a) && a.length ? JSON.stringify(a) : null);
   if (metron !== undefined) {
     const mbase = {
       metron_price: metron?.price ?? null,
@@ -1865,6 +1916,20 @@ export function setCvIssueDetail(db, comicvineId, {
       metron_variants: metron?.variants?.length ? JSON.stringify(metron.variants) : null,
       metron_cover_hash: metron?.cover_hash ?? null,
       metron_rating: metron?.rating ?? null,
+      metron_characters: json(metron?.characters),
+      metron_teams: json(metron?.teams),
+      metron_arcs: json(metron?.arcs),
+      metron_universes: json(metron?.universes),
+      metron_credits: json(metron?.credits),
+      metron_description: metron?.description ?? null,
+      metron_title: metron?.title || null,
+      metron_alt_number: metron?.alt_number || null,
+      metron_page_count: metron?.page_count != null ? String(metron.page_count) : null,
+      metron_imprint: metron?.imprint || null,
+      metron_publisher: metron?.publisher ? JSON.stringify(metron.publisher) : null,
+      metron_resource_url: metron?.resource_url || null,
+      metron_image: metron?.image || null,
+      metron_gcd_id: metron?.gcd_id != null ? String(metron.gcd_id) : null,
     };
     const mcols = Object.keys(mbase).filter((c) => !locked.has(c));
     db.prepare(

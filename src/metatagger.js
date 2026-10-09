@@ -41,6 +41,17 @@ const ROLE_MAP = [
   [/editor/i, 'Editor'],
 ];
 
+/** Names out of a credits/characters array, whichever shape it arrived in.
+ *  ComicVine sends `[{name}]`; Metron sends `[{name}]` for characters and
+ *  `[{creator, role:[{name}]}]` for credits. Stored as JSON text, so a string
+ *  needs parsing first. */
+export function namesOf(v) {
+  let a = v;
+  if (typeof a === 'string') { try { a = JSON.parse(a); } catch { return []; } }
+  if (!Array.isArray(a)) return [];
+  return [...new Set(a.map((x) => (typeof x === 'string' ? x : x?.name || x?.creator)).filter(Boolean))];
+}
+
 export function mapCredits(credits) {
   const out = {};
   for (const c of credits || []) {
@@ -77,6 +88,19 @@ export function buildComicInfoXml({ series, issue }) {
   if (typeof credits === 'string') { try { credits = JSON.parse(credits); } catch { credits = []; } }
   for (const [el, names] of Object.entries(mapCredits(credits))) add(el, names);
 
+  // Characters, teams, locations and story arcs are standard ComicInfo and
+  // every other reader reads them — they were simply never written. ComicVine
+  // first where it has them; Metron fills the rest, which for anything before
+  // about 1980 is nearly all of it.
+  add('Characters', namesOf(issue.character_credits).join(', ')
+    || namesOf(issue.metron_characters).join(', '));
+  add('Teams', namesOf(issue.team_credits).join(', ')
+    || namesOf(issue.metron_teams).join(', '));
+  add('Locations', namesOf(issue.location_credits).join(', '));
+  add('StoryArc', namesOf(issue.story_arc_credits).join(', ')
+    || namesOf(issue.metron_arcs).join(', '));
+  add('PageCount', issue.metron_page_count);
+
   add('Publisher', series.publisher);
   add('Web', issue.site_detail_url || series.site_detail_url);
   add('Notes', `Tagged by BackIssue from ComicVine issue ${issue.comicvine_id ?? issue.id}.`);
@@ -99,7 +123,13 @@ export async function ensureCvIssueDetail(db, client, cvIssueId) {
     character_credits: d.character_credits, team_credits: d.team_credits,
     location_credits: d.location_credits, story_arc_credits: d.story_arc_credits,
     associated_images: d.associated_images,
-    ...(d.metron !== undefined ? { metron: d.metron } : {}),
+    // Record the ASK, not just an answer. A metadata server that doesn't do
+    // enrichment (the official ComicVine API ignores the parameter) returns no
+    // `metron` key at all — and without a stamp, `wantsEnrich` stayed true and
+    // re-fetched this issue's detail on every single access, forever, against
+    // the user's own rate limit. Treat "asked and got nothing" as the miss it
+    // is, so the speculative re-fetch happens exactly once.
+    ...(config.cvEnrich || d.metron !== undefined ? { metron: d.metron ?? null } : {}),
   });
   return getCvIssue(db, cvIssueId);
 }
