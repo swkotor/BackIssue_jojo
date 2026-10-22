@@ -210,5 +210,11 @@
   "srvZipError": "błąd ZIP",
   "srvMetadataServiceRateLimitReachedHttp": "Osiągnięto limit zapytań usługi metadanych (HTTP {detail}",
   "srvSeriesNotInThatMetadataSource": "Tej serii nie ma w tym źródle metadanych, więc nie można jej stamtąd odświeżyć",
-  "srvIssueNotInThatMetadataSource": "Tego zeszytu nie ma w tym źródle metadanych"
+  "srvIssueNotInThatMetadataSource": "Tego zeszytu nie ma w tym źródle metadanych",
+  "forkInvalidWatchState": "invalid watch state: {detail}",
+  "forkNoSeriesFromPublisher": "no series from that publisher",
+  "forkNoVolumesInGroup": "no volumes in that group",
+  "forkNoSeriesIds": "no series ids",
+  "forkWatchStateMustBe": "state must be one of {detail}",
+  "forkNoIssueIds": "no issue ids"
 }

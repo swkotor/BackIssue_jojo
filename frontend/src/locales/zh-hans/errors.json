@@ -210,5 +210,11 @@
   "srvZipError": "zip 错误",
   "srvMetadataServiceRateLimitReachedHttp": "已达到元数据服务的请求上限 (HTTP {detail}",
   "srvSeriesNotInThatMetadataSource": "该系列不在那个元数据来源中，因此无法从那里刷新",
-  "srvIssueNotInThatMetadataSource": "该期刊不在那个元数据来源中"
+  "srvIssueNotInThatMetadataSource": "该期刊不在那个元数据来源中",
+  "forkInvalidWatchState": "invalid watch state: {detail}",
+  "forkNoSeriesFromPublisher": "no series from that publisher",
+  "forkNoVolumesInGroup": "no volumes in that group",
+  "forkNoSeriesIds": "no series ids",
+  "forkWatchStateMustBe": "state must be one of {detail}",
+  "forkNoIssueIds": "no issue ids"
 }

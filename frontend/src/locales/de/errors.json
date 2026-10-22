@@ -210,5 +210,11 @@
   "srvZipError": "ZIP-Fehler",
   "srvMetadataServiceRateLimitReachedHttp": "Abfragelimit des Metadatendienstes erreicht (HTTP {detail}",
   "srvSeriesNotInThatMetadataSource": "Diese Reihe ist nicht in dieser Metadatenquelle und kann daher nicht von dort aktualisiert werden",
-  "srvIssueNotInThatMetadataSource": "Dieses Heft ist nicht in dieser Metadatenquelle"
+  "srvIssueNotInThatMetadataSource": "Dieses Heft ist nicht in dieser Metadatenquelle",
+  "forkInvalidWatchState": "invalid watch state: {detail}",
+  "forkNoSeriesFromPublisher": "no series from that publisher",
+  "forkNoVolumesInGroup": "no volumes in that group",
+  "forkNoSeriesIds": "no series ids",
+  "forkWatchStateMustBe": "state must be one of {detail}",
+  "forkNoIssueIds": "no issue ids"
 }

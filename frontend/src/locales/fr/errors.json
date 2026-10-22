@@ -210,5 +210,11 @@
   "srvZipError": "erreur zip",
   "srvMetadataServiceRateLimitReachedHttp": "Limite de requêtes du service de métadonnées atteinte (HTTP {detail}",
   "srvSeriesNotInThatMetadataSource": "Cette série n’est pas dans cette source de métadonnées, elle ne peut donc pas en être actualisée",
-  "srvIssueNotInThatMetadataSource": "Ce numéro n’est pas dans cette source de métadonnées"
+  "srvIssueNotInThatMetadataSource": "Ce numéro n’est pas dans cette source de métadonnées",
+  "forkInvalidWatchState": "invalid watch state: {detail}",
+  "forkNoSeriesFromPublisher": "no series from that publisher",
+  "forkNoVolumesInGroup": "no volumes in that group",
+  "forkNoSeriesIds": "no series ids",
+  "forkWatchStateMustBe": "state must be one of {detail}",
+  "forkNoIssueIds": "no issue ids"
 }

@@ -210,5 +210,11 @@
   "srvZipError": "zip のエラー",
   "srvMetadataServiceRateLimitReachedHttp": "メタデータサービスのリクエスト上限に達しました (HTTP {detail}",
   "srvSeriesNotInThatMetadataSource": "このシリーズはそのメタデータソースにないため、そこから更新できません",
-  "srvIssueNotInThatMetadataSource": "この号はそのメタデータソースにありません"
+  "srvIssueNotInThatMetadataSource": "この号はそのメタデータソースにありません",
+  "forkInvalidWatchState": "invalid watch state: {detail}",
+  "forkNoSeriesFromPublisher": "no series from that publisher",
+  "forkNoVolumesInGroup": "no volumes in that group",
+  "forkNoSeriesIds": "no series ids",
+  "forkWatchStateMustBe": "state must be one of {detail}",
+  "forkNoIssueIds": "no issue ids"
 }
