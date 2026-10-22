@@ -1158,8 +1158,8 @@
         <!-- fork: artwork-only ComicVine key. Shown for BOTH sources, because
              the hosted service doesn't mirror /publishers or /characters — the
              Publishers browser needs ComicVine directly regardless. -->
-        <label class="field"><span>Publisher artwork key</span><input id="set-publisherCvKey" class="mono" type="text" spellcheck="false" autocomplete="off" placeholder="ComicVine API key for publisher logos…" /></label>
-        <p class="modal__note">Used only by the <b>Publishers</b> browser, for publisher logos and franchise character art. Your volume and issue metadata keeps using the source selected above — this key is never used for it. Free at comicvine.gamespot.com.</p>
+        <label class="field"><span>{t('settingsPage.publisherArtworkKey')}</span><input id="set-publisherCvKey" class="mono" type="text" spellcheck="false" autocomplete="off" placeholder={t('settingsPage.publisherArtworkKeyPlaceholder')} /></label>
+        <p class="modal__note">{t('settingsPage.publisherArtworkKeyNote')}</p>
         <!-- Service URL (self-hosted metadata instance) is an advanced escape
              hatch: kept mounted so a saved value persists, but not shown. It
              remains settable via the API / a previously saved value. -->

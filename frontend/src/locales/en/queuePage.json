@@ -60,5 +60,9 @@
   "untitled": "Untitled",
   "cancelRemovesFromClient": "Cancel — removes the download from the client",
   "removeFromQueue": "Remove from queue",
-  "retryThisDownload": "Retry this download"
+  "retryThisDownload": "Retry this download",
+  "unwant": "▬ Unwant",
+  "bulkSelectHint": "Tick rows to retry, remove or unwant them in bulk · shift-click selects a range",
+  "selectAllShown": "Select all shown",
+  "nSelected": "{count} selected"
 }

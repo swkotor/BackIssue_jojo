@@ -363,7 +363,7 @@
     try { r = await apiPost('/api/issues/wanted', { cvIssueIds: ids, wanted: false }); } catch { r = { error: 'Could not reach the app.' }; }
     unwanting = false;
     if (r?.error) return notify(r.error, 'error');
-    notify(`Un-wanted ${fmt(ids.length)} issue${ids.length === 1 ? '' : 's'}${r.dequeued ? ` · removed ${fmt(r.dequeued)} from the queue` : ''}.`, 'ok');
+    notify(r.dequeued ? t('listsPage.unwantedAndDequeued', { count: ids.length, removed: fmt(r.dequeued) }) : t('listsPage.unwantedN', { count: ids.length }), 'ok');
     refresh();
   }
 
@@ -801,7 +801,7 @@
           {/if}
           {#if wantable.length && can('library.manage')}
             <button class="listx__want" disabled={wanting} title={t('listsPage.wantAllTitle')} onclick={wantList}><Icon name="target" size={15} /> {wanting ? t('listsPage.wanting') : t('listsPage.wantAll', { count: fmt(wantable.length) })}</button>
-            <button class="listx__unwant" disabled={unwanting} title="Mark every issue on this list as not wanted (also removes them from the download queue)"
+            <button class="listx__unwant" disabled={unwanting} title={t('listsPage.unwantAllTitle')}
               onclick={unwantList}><Icon name="star" size={15} /> {unwanting ? 'Working…' : 'Unwant all'}</button>
           {/if}
           {#if missing.length && can('downloads.grab')}

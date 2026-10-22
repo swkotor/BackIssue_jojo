@@ -293,15 +293,15 @@
 
     {#if visibleItems.length && can('downloads.grab')}
       <div class="qx__band qx__bulk">
-        <label class="qx__selall"><input type="checkbox" checked={allShown} onchange={toggleAll} /> Select all shown</label>
+        <label class="qx__selall"><input type="checkbox" checked={allShown} onchange={toggleAll} /> {t('queuePage.selectAllShown')}</label>
         {#if pickedCount}
-          <span class="qx__bulkcount">{pickedCount} selected</span>
-          <button class="qx__bulkbtn" disabled={bulkBusy} onclick={retrySelected}><Icon name="refresh" size={14} /> Retry</button>
-          <button class="qx__bulkbtn" disabled={bulkBusy} onclick={removeSelected}><Icon name="close" size={14} /> Remove from queue</button>
-          <button class="qx__bulkbtn qx__bulkbtn--unwant" disabled={bulkBusy} onclick={unwantSelected}>▬ Unwant</button>
-          <button class="qx__bulkbtn qx__bulkbtn--plain" onclick={() => { picked = new Set(); }}>Clear</button>
+          <span class="qx__bulkcount">{t('queuePage.nSelected', { count: pickedCount })}</span>
+          <button class="qx__bulkbtn" disabled={bulkBusy} onclick={retrySelected}><Icon name="refresh" size={14} /> {t('common.retry')}</button>
+          <button class="qx__bulkbtn" disabled={bulkBusy} onclick={removeSelected}><Icon name="close" size={14} /> {t('queuePage.removeFromQueue')}</button>
+          <button class="qx__bulkbtn qx__bulkbtn--unwant" disabled={bulkBusy} onclick={unwantSelected}>{t('queuePage.unwant')}</button>
+          <button class="qx__bulkbtn qx__bulkbtn--plain" onclick={() => { picked = new Set(); }}>{t('common.clear')}</button>
         {:else}
-          <span class="qx__bulkhint">Tick rows to retry, remove or unwant them in bulk · shift-click selects a range</span>
+          <span class="qx__bulkhint">{t('queuePage.bulkSelectHint')}</span>
         {/if}
       </div>
     {/if}

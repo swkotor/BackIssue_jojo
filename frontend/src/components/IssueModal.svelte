@@ -166,9 +166,9 @@
   let deleting = $state(false);
   async function deleteDownload() {
     const ok = await confirmDialog({
-      title: 'Delete the downloaded file?',
-      message: `This permanently deletes the file for #${m.number ?? '?'} from disk. The issue goes back to “missing”, so it can be downloaded again.`,
-      confirmLabel: 'Delete file',
+      title: t('issueModal.deleteFileTitle'),
+      message: t('issueModal.deleteFileMessage', { number: m.number ?? '?' }),
+      confirmLabel: t('issueModal.deleteFileConfirm'),
       danger: true,
     });
     if (!ok) return;
@@ -313,7 +313,7 @@
               {/if}
               {#if info.owned && can('library.manage')}
                 <button class="btn btn--ghost ii-del" disabled={deleting}
-                  title="Delete the downloaded file from disk — for a bad rip you want gone"
+                  title={t('issueModal.deleteDownloadedFile')}
                   onclick={deleteDownload}><Icon name="trash" /> {deleting ? 'Deleting…' : 'Delete file'}</button>
               {/if}
             </div>

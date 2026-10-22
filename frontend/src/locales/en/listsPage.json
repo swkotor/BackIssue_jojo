@@ -147,5 +147,8 @@
   "importedArc": "Imported “{name}” — {issues} in cover-date order.",
   "importedCbl": "Imported “{name}” — {imported} of {total} issues{skipped}.",
   "skippedSuffix": " ({count} couldn't be matched)",
-  "fileTooBig": "That file is over the 4 MB limit."
+  "fileTooBig": "That file is over the 4 MB limit.",
+  "unwantAllTitle": "Mark every issue on this list as not wanted (also removes them from the download queue)",
+  "unwantedN": { "one": "Un-wanted {count} issue.", "other": "Un-wanted {count} issues." },
+  "unwantedAndDequeued": { "one": "Un-wanted {count} issue · removed {removed} from the queue.", "other": "Un-wanted {count} issues · removed {removed} from the queue." }
 }

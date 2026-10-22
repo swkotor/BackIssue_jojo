@@ -176,13 +176,13 @@
   async function unwantSeries(g) {
     let r;
     try { r = await apiPost('/api/series/watch-state', { ids: [g.id], state: 'unwatched' }); }
-    catch { return notify('Could not update — is the app reachable?', 'error'); }
+    catch { return notify(t('wantedPage.couldNotUpdate'), 'error'); }
     if (r?.error) return notify(r.error, 'error');
     const drop = new Set(g.issues.map((x) => x.cv_issue_id));
     for (const id of drop) selected.delete(id);
     if (!gaps) { items = items.filter((x) => x.series_id !== g.id); total = Math.max(0, total - drop.size); }
     else for (const it of g.issues) { it.wanted = 0; it.why = null; it.pick = null; }
-    notify(`${g.title || 'Series'} is no longer watched.`, 'ok');
+    notify(t('wantedPage.seriesNoLongerWatched', { series: g.title || t('common.series') }), 'ok');
   }
 
   /* ---- Selection (checkbox per row, shift-click for ranges) ---- */
@@ -378,8 +378,8 @@
             </div>
             <span class="wx__misspill">{gaps ? t('wantedPage.nMissing', { count: fmt(g.count) }) : t('wantedPage.nWanted', { count: fmt(g.count) })}</span>
             {#if g.monitor !== 'none' || g.issues.some((i) => i.wanted)}
-              <button class="wx__unwant wx__unwant--series" title="Unwant this series — stops monitoring, drops its picks and clears its queue rows"
-                onclick={(e) => { e.stopPropagation(); unwantSeries(g); }}>▬ Unwant series</button>
+              <button class="wx__unwant wx__unwant--series" title={t('wantedPage.unwantSeriesTitle')}
+                onclick={(e) => { e.stopPropagation(); unwantSeries(g); }}>{t('wantedPage.unwantSeries')}</button>
             {/if}
             <span class="wx__chev" class:is-open={open}><Icon name="chevron-right" size={16} /></span>
           </div>

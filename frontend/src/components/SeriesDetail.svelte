@@ -491,7 +491,7 @@
     try {
       const r = await apiPost('/api/series/watch-state', { ids: [s.id], state });
       if (r?.error) return notify(r.error, 'error');
-    } catch { return notify('Could not update — is the app reachable?', 'error'); }
+    } catch { return notify(t('seriesDetail.updateUnreachable'), 'error'); }
     detail.series.watchState = state;
     detail.series.monitored = state === 'watched' ? 1 : 0;
     reloadDetail(); // policy + picks changed server-side; rows carry why/pick
@@ -763,7 +763,7 @@
                    and having read it are different questions, so they don't
                    share a bar. -->
               <div class="sx-comp__top sx-comp__top--read">
-                <span class="sx-comp__owned">{fmt(hero.read)} of {fmt(hero.total)} read{#if hero.reading} · {fmt(hero.reading)} in progress{/if}</span>
+                <span class="sx-comp__owned">{#if hero.reading}{t('seriesDetail.readOfInProgress', { read: fmt(hero.read), total: fmt(hero.total), reading: fmt(hero.reading) })}{:else}{t('seriesDetail.readOf', { read: fmt(hero.read), total: fmt(hero.total) })}{/if}</span>
                 <span class="sx-comp__pct sx-comp__pct--read" class:is-done={hero.read >= hero.total && hero.total > 0}>{hero.readPct}%</span>
               </div>
               <div class="sx-comp__bar sx-comp__bar--read">
@@ -796,10 +796,10 @@
               {/if}
             {/if}
             {#if isCv && detailSelected.size}
-              <button class="btn btn--ghost" title="Mark the selected issues wanted — they'll be searched for"
-                onclick={() => markSelectedWanted(true)}><Icon name="star" fill /> Want ({fmt(detailSelected.size)})</button>
-              <button class="btn btn--ghost" title="Mark the selected issues not wanted"
-                onclick={() => markSelectedWanted(false)}><Icon name="star" /> Unwant</button>
+              <button class="btn btn--ghost" title={t('seriesDetail.markSelectedWantedTitle')}
+                onclick={() => markSelectedWanted(true)}><Icon name="star" fill /> {t('seriesDetail.wantN', { count: fmt(detailSelected.size) })}</button>
+              <button class="btn btn--ghost" title={t('seriesDetail.markSelectedNotWantedTitle')}
+                onclick={() => markSelectedWanted(false)}><Icon name="star" /> {t('seriesDetail.unwant')}</button>
             {/if}
             {#if !isLocal && can('downloads.grab')}
               <!-- Selection now includes owned issues (read status, lists) — the
@@ -822,16 +822,16 @@
             {#if isTrusted()}
               {@const ws = s.watchState || (s.monitored ? 'watched' : 'unwatched')}
               {#if can('library.manage')}
-                <div class="wsbtns" role="group" aria-label="Series status">
+                <div class="wsbtns" role="group" aria-label={t('seriesDetail.seriesStatus')}>
                   <button class="wsbtn wsbtn--watched" class:is-on={ws === 'watched'}
-                    title="Watched — new issues are wanted automatically and searched for"
-                    onclick={() => setWatchState('watched')}><span class="wsbtn__sym">▶</span> Watched</button>
+                    title={t('seriesDetail.watchedTitle')}
+                    onclick={() => setWatchState('watched')}><span class="wsbtn__sym">▶</span> {t('seriesDetail.watched')}</button>
                   <button class="wsbtn wsbtn--paused" class:is-on={ws === 'paused'}
-                    title="Paused — issues already wanted stay wanted, new ones are not added"
-                    onclick={() => setWatchState('paused')}><span class="wsbtn__sym wsbtn__sym--pause">❚❚</span> Paused</button>
+                    title={t('seriesDetail.watchStatePaused')}
+                    onclick={() => setWatchState('paused')}><span class="wsbtn__sym wsbtn__sym--pause">❚❚</span> {t('seriesDetail.paused')}</button>
                   <button class="wsbtn wsbtn--unwatched" class:is-on={ws === 'unwatched'}
-                    title="Unwatched — nothing in this series is wanted"
-                    onclick={() => setWatchState('unwatched')}><span class="wsbtn__sym">▬</span> Unwatched</button>
+                    title={t('seriesDetail.unwatchedTitle')}
+                    onclick={() => setWatchState('unwatched')}><span class="wsbtn__sym">▬</span> {t('seriesDetail.unwatched')}</button>
                 </div>
               {:else}
                 <span class="wstate-chip wstate-chip--{ws}">
@@ -849,11 +849,11 @@
                 {#if moreOpen}
                   <div class="series-more__menu" role="menu">
                     {#if isCv && detailSelected.size}
-                      <div class="menu__label">{fmt(detailSelected.size)} selected</div>
-                      <button class="menu__item" role="menuitem" title="Mark the selected issues as wanted"
-                        onclick={() => { moreOpen = false; markSelectedWanted(true); }}><Icon name="star" fill /> Mark wanted ({fmt(detailSelected.size)})</button>
-                      <button class="menu__item" role="menuitem" title="Mark the selected issues as not wanted (also removes them from the download queue)"
-                        onclick={() => { moreOpen = false; markSelectedWanted(false); }}><Icon name="star" /> Mark not wanted ({fmt(detailSelected.size)})</button>
+                      <div class="menu__label">{t('seriesDetail.nSelected', { count: fmt(detailSelected.size) })}</div>
+                      <button class="menu__item" role="menuitem" title={t('seriesDetail.markAsWantedTitle')}
+                        onclick={() => { moreOpen = false; markSelectedWanted(true); }}><Icon name="star" fill /> {t('seriesDetail.markWantedN', { count: fmt(detailSelected.size) })}</button>
+                      <button class="menu__item" role="menuitem" title={t('seriesDetail.markNotWantedTitle')}
+                        onclick={() => { moreOpen = false; markSelectedWanted(false); }}><Icon name="star" /> {t('seriesDetail.markNotWantedN', { count: fmt(detailSelected.size) })}</button>
                       <div class="menu__sep"></div>
                     {/if}
                     {#if !isLocal && can('library.manage')}
@@ -1010,9 +1010,9 @@
                       aria-label={t('seriesDetail.selectIssue', { number: i.number ?? '' })}
                       onclick={(e) => { e.stopPropagation(); toggleIssue(i, range.start + vi, e.shiftKey); }} />
                     <span class="icard__state icard__state--{state}" title={state}></span>
-                    {#if i.wanted && !i.owned}<span class="icard__wanted" title="Wanted">★</span>{/if}
+                    {#if i.wanted && !i.owned}<span class="icard__wanted" title={t('seriesDetail.filterWanted')}>★</span>{/if}
                     {#if readTracking}<span class="icard__read icard__read--{i.readState || 'unread'}"
-                      title={i.readState === 'read' ? 'Read' : i.readState === 'reading' ? 'Started — not finished' : 'Unread'}>{#if i.readState === 'read'}<Icon name="check" size={11} /> READ{:else if i.readState === 'reading'}◐{:else}UNREAD{/if}</span>{/if}
+                      title={i.readState === 'read' ? t('seriesDetail.readTitle') : i.readState === 'reading' ? t('seriesDetail.startedNotFinished') : t('seriesDetail.unreadTitle')}>{#if i.readState === 'read'}<Icon name="check" size={11} /> {t('seriesDetail.badgeRead')}{:else if i.readState === 'reading'}◐{:else}{t('seriesDetail.badgeUnread')}{/if}</span>{/if}
                     <button class="icard__more" title={t('seriesDetail.actions')} aria-label={t('seriesDetail.actionsForIssue', { number: i.number ?? '' })}
                       onclick={(e) => { e.stopPropagation(); openContextMenu(e, issueMenuItems(i)); }}><Icon name="more-horizontal" size={15} /></button>
                     <div class="icard__actions" onclick={(e) => e.stopPropagation()}>
@@ -1065,13 +1065,13 @@
                 <span class="issue__num">{i.number || '—'}</span>
                 {#if readTracking}
                   <button class="issue__read issue__read--{i.readState || 'unread'}"
-                    title={i.readState === 'read' ? 'Read — click to mark unread'
-                      : i.readState === 'reading' ? 'Started, not finished — click to mark read'
-                      : 'Unread — click to mark read'}
+                    title={i.readState === 'read' ? t('seriesDetail.readClickUnread')
+                      : i.readState === 'reading' ? t('seriesDetail.startedClickRead')
+                      : t('seriesDetail.unreadClickRead')}
                     onclick={(e) => { e.stopPropagation(); toggleRead(i); }}>
-                    {#if i.readState === 'read'}<Icon name="check" size={12} /> READ
-                    {:else if i.readState === 'reading'}◐ READING
-                    {:else}UNREAD{/if}
+                    {#if i.readState === 'read'}<Icon name="check" size={12} /> {t('seriesDetail.badgeRead')}
+                    {:else if i.readState === 'reading'}◐ {t('seriesDetail.badgeReading')}
+                    {:else}{t('seriesDetail.badgeUnread')}{/if}
                   </button>
                 {/if}
                 <button class="issue__title" title={t('seriesDetail.issueDetailsTitle')} onclick={(e) => { e.stopPropagation(); openIssueInfo(i.cv_issue_id, i.number); }}>{i.title}</button>

@@ -67,5 +67,9 @@
   "moveTo": "Move to another issue…",
   "move": "Move",
   "undoAssignment": "Undo assignment",
-  "notDownloadedYet": "Not downloaded yet."
+  "notDownloadedYet": "Not downloaded yet.",
+  "deleteDownloadedFile": "Delete the downloaded file from disk — for a bad rip you want gone",
+  "deleteFileTitle": "Delete the downloaded file?",
+  "deleteFileMessage": "This permanently deletes the file for #{number} from disk. The issue goes back to “missing”, so it can be downloaded again.",
+  "deleteFileConfirm": "Delete file"
 }

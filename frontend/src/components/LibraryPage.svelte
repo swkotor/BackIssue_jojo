@@ -163,7 +163,7 @@
       if (railSelect.has(row.id)) { row.watch_state = state; row.followed = state === 'watched' ? 1 : row.followed; }
     }
     rail.rows = [...(rail.rows || [])];
-    notify(`${ids.length} series set to ${state}.`, 'ok');
+    notify(t('libraryPage.seriesSetTo', { count: ids.length, state: ({ watched: t('libraryPage.watched'), paused: t('libraryPage.paused'), unwatched: t('libraryPage.unwatched') })[state] ?? state }), 'ok');
     railSelect.clear();
     loadCollection(); // policy/picks changed server-side — chip counts and badges too
   }
@@ -550,22 +550,22 @@
     <!-- fork: watch-state narrowing — independent of the chips, so
          "Incomplete + Watched" is expressible. Derived from the monitoring
          policy + picks on the server (see WATCH_STATE_WHERE in db.js). -->
-    <select id="coll-ws" class="libx__ws" class:is-on={!!rail.ws} title="Filter by series status" aria-label="Series status"
+    <select id="coll-ws" class="libx__ws" class:is-on={!!rail.ws} title={t('libraryPage.filterBySeriesStatus')} aria-label={t('libraryPage.seriesStatus')}
       value={rail.ws || ''} onchange={(e) => setQuery({ ws: e.currentTarget.value || null })}>
-      <option value="">All statuses</option>
-      <option value="watched">▶ Watched</option>
-      <option value="paused">❚❚ Paused</option>
-      <option value="unwatched">▬ Unwatched</option>
+      <option value="">{t('libraryPage.allStatuses')}</option>
+      <option value="watched">{t('libraryPage.optWatched')}</option>
+      <option value="paused">{t('libraryPage.optPaused')}</option>
+      <option value="unwatched">{t('libraryPage.optUnwatched')}</option>
     </select>
     <select id="coll-sort" class="libx__sort" title={t('libraryPage.sortTitle')} value={rail.sort}
       onchange={(e) => { const v = e.currentTarget.value; setLibrarySort(v); setQuery({ sort: v === 'title' ? null : v }); }}>
       <option value="title">{t('libraryPage.sortAz')}</option>
       <option value="added">{t('libraryPage.sortAdded')}</option>
       <option value="missing">{t('libraryPage.sortMissing')}</option>
-      <option value="latest">Latest issue (newest)</option>
-      <option value="latest-asc">Latest issue (oldest)</option>
-      <option value="next">Next issue (soonest)</option>
-      <option value="next-desc">Next issue (latest)</option>
+      <option value="latest">{t('libraryPage.latestNewest')}</option>
+      <option value="latest-asc">{t('libraryPage.latestOldest')}</option>
+      <option value="next">{t('libraryPage.nextIssueSoonest')}</option>
+      <option value="next-desc">{t('libraryPage.nextIssueLatest')}</option>
     </select>
     <div class="libx__view" role="group" aria-label={t('libraryPage.viewGroup')}>
       <button class="libx__viewbtn" class:is-active={view === 'grid'} title={t('libraryPage.posterGrid')} onclick={() => setView('grid')}><Icon name="grid" size={15} /></button>
@@ -594,12 +594,12 @@
       <button class="libx__link" onclick={() => bulk('follow')}><Icon name="star" fill size={14} /> {t('libraryPage.follow')}</button>
       <button class="libx__link" onclick={() => bulk('unfollow')}><Icon name="star" size={14} /> {t('libraryPage.unfollow')}</button>
       <button class="libx__link" onclick={() => bulk('download-missing')}><Icon name="download" size={14} /> {t('libraryPage.downloadMissing')}</button>
-      <select class="libx__movesel" title="Watched: new issues are wanted automatically. Paused: keep current wants, don't add new ones. Unwatched: want nothing."
+      <select class="libx__movesel" title={t('libraryPage.watchStateTitle')}
         onchange={(e) => { const v = e.currentTarget.value; e.currentTarget.value = ''; if (v) setWatchState(v); }}>
-        <option value="">Status…</option>
-        <option value="watched">Watched</option>
-        <option value="paused">Paused</option>
-        <option value="unwatched">Unwatched</option>
+        <option value="">{t('libraryPage.watchState')}</option>
+        <option value="watched">{t('libraryPage.watched')}</option>
+        <option value="paused">{t('libraryPage.paused')}</option>
+        <option value="unwatched">{t('libraryPage.unwatched')}</option>
       </select>
       <button class="libx__link" title={t('libraryPage.addToListTitle')}
         onclick={addSelectedToList}><Icon name="menu" size={14} /> {t('libraryPage.addToList')}</button>
@@ -674,7 +674,7 @@
               <Cover coverUrl={s.matched ? s.cover_url : null} title={s.matched ? s.title : (s.folder || '?')} />
               {#if rail.selecting}
                 <input type="checkbox" class="libx-card__cb" checked={railSelect.has(s.id)}
-                  title="Select (shift-click to select a range)"
+                  title={t('libraryPage.selectRange')}
                   onclick={(e) => { e.stopPropagation(); pickSeries(s, e); }} />
               {/if}
               {#if s.watch_state}
@@ -702,7 +702,7 @@
                 <span class="libx-card__count">{s.owned}/{s.total}</span>
                 {#if s.matched && s.total}
                   <span class="readchip" class:is-done={(s.read || 0) >= s.total} class:is-none={!s.read}
-                    title="{fmt(s.read || 0)} of {fmt(s.total)} issues read">{fmt(s.read || 0)}/{fmt(s.total)} read</span>
+                    title={t('libraryPage.readOfIssues', { read: fmt(s.read || 0), total: fmt(s.total) })}>{t('libraryPage.readFraction', { read: fmt(s.read || 0), total: fmt(s.total) })}</span>
                 {/if}
                 {#if s.pub_status && s.pub_status !== 'unknown'}
                   <span class="pubchip pubchip--{s.pub_status}"
@@ -722,9 +722,9 @@
     {:else}
       <div class="libx-list">
         <div class="libx-list__head">
-          <span></span><span>{t('common.title')}</span><span>{t('libraryPage.progress')}</span><span>Read</span>
+          <span></span><span>{t('common.title')}</span><span>{t('libraryPage.progress')}</span><span>{t('libraryPage.read')}</span>
           <span class="libx-col--wide">{t('libraryPage.latest')}</span><span class="libx-col--wide libx-col--right">{t('common.size')}</span>
-          <span class="libx-col--wide">Status</span><span class="libx-col--wide">Dates</span><span></span><span></span>
+          <span class="libx-col--wide">{t('common.status')}</span><span class="libx-col--wide">{t('libraryPage.dates')}</span><span></span><span></span>
         </div>
         {#if range.padTop > 0}<div style="height:{range.padTop}px"></div>{/if}
         {#each rail.rows.slice(range.start, range.end) as s (s.id)}
@@ -734,7 +734,7 @@
             onclick={(e) => open(s, e)} role="button" tabindex="0" onkeydown={(e) => { if (e.key === 'Enter') open(s, e); }}>
             {#if rail.selecting}
               <input type="checkbox" class="libx-row__cb" checked={railSelect.has(s.id)}
-                title="Select (shift-click to select a range)"
+                title={t('libraryPage.selectRange')}
                 onclick={(e) => { e.stopPropagation(); pickSeries(s, e); }} />
             {/if}
             <Cover coverUrl={s.matched ? s.cover_url : null} title={s.matched ? s.title : (s.folder || t('libraryPage.unidentified'))} />
@@ -782,12 +782,12 @@
               {#if s.last_issue_date || s.next_issue_date}
                 <span class="libx-row__dates libx-col--wide">
                   {#if s.last_issue_date}
-                    <span class="libx-row__date" title="Most recent released issue: {s.last_issue_date}">
+                    <span class="libx-row__date" title={t('libraryPage.lastIssueDate', { date: s.last_issue_date })}>
                       <Icon name="clock" size={11} /> {shortDate(s.last_issue_date)}
                     </span>
                   {/if}
                   {#if s.next_issue_date}
-                    <span class="libx-row__date is-next" title="Next issue due: {s.next_issue_date} ({inDays(s.next_issue_date)})">
+                    <span class="libx-row__date is-next" title={t('libraryPage.nextIssueDue', { date: s.next_issue_date, days: inDays(s.next_issue_date) })}>
                       → {shortDate(s.next_issue_date)}
                     </span>
                   {/if}

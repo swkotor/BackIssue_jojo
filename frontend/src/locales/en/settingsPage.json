@@ -255,5 +255,8 @@
   "libMetaCustom": "Choose for this library",
   "libMetaNote": "This library's series are looked up through the sources ticked here, in this order. Turn them all off to go back to the default list.",
   "metaDefaultForLibraries": "This list is the default; a library can choose its own under Settings → Library.",
-  "saveNeedsLoad": "Settings didn’t load — retry before saving."
+  "saveNeedsLoad": "Settings didn’t load — retry before saving.",
+  "publisherArtworkKey": "Publisher artwork key",
+  "publisherArtworkKeyPlaceholder": "ComicVine API key for publisher logos…",
+  "publisherArtworkKeyNote": "Used only by the Publishers browser, for publisher logos and franchise character art. Your volume and issue metadata keeps using the source selected above — this key is never used for it. Free at comicvine.gamespot.com."
 }

@@ -1,4 +1,5 @@
 <script>
+  import { t } from '../lib/i18n.svelte.js';
   // fork: browse the library the way a shelf is arranged — publisher, then the
   // franchise, then that franchise's volumes. Three tiers driven off ?pub= and
   // ?fr= so every level is linkable and Back works.
@@ -106,14 +107,14 @@
     artBusy = false;
     if (r?.error) return notify(r.error, 'error');
     if (!r.started) {
-      if (r.reason === 'nothing to fetch') return notify('Artwork is already up to date.', 'ok');
+      if (r.reason === 'nothing to fetch') return notify(t('publishersPage.artworkUpToDate'), 'ok');
       // No key = no logos, which is a config gap rather than a failure — say so
       // once, plainly, instead of leaving the button looking broken.
       artNote = r.reason;
       return notify(r.reason, 'error');
     }
     artNote = '';
-    notify(`Fetching artwork for ${fmt(r.publishers)} publisher(s) and ${fmt(r.franchises)} franchise(s) — check Jobs for progress.`, 'ok');
+    notify(t('publishersPage.fetchingArtwork', { publishers: fmt(r.publishers), franchises: fmt(r.franchises) }), 'ok');
   }
 
   function toggle(id, e) {
@@ -156,7 +157,7 @@
 <section class="page pubx publishers-page">
   <div class="pubx__bar">
     <button class="pubx__crumb" class:is-cur={!pub} onclick={() => setQuery({ pub: null, fr: null })}>
-      <Icon name="layers" size={15} /> Publishers
+      <Icon name="layers" size={15} /> {t('publishersPage.publishers')}
     </button>
     {#if pub}
       <span class="pubx__sep">/</span>
@@ -166,12 +167,12 @@
       <span class="pubx__sep">/</span>
       <button class="pubx__crumb is-cur">{detail?.name || fr}</button>
       {#if isTrusted()}
-        <button class="pubx__mini" title="Rename this franchise" onclick={renameGroup}><Icon name="edit" size={13} /></button>
+        <button class="pubx__mini" title={t('publishersPage.renameThisFranchise')} onclick={renameGroup}><Icon name="edit" size={13} /></button>
       {/if}
     {/if}
     <span class="pubx__spacer"></span>
     {#if pub && fr}
-      <select class="pubx__sort" title="Sort volumes" aria-label="Sort volumes"
+      <select class="pubx__sort" title={t('publishersPage.sortVolumes')} aria-label={t('publishersPage.sortVolumes')}
         value={vsort} onchange={(e) => setVsort(e.currentTarget.value)}>
         {#each VSORTS as [k, label] (k)}<option value={k}>{label}</option>{/each}
       </select>
@@ -179,15 +180,15 @@
     {#if pub}
       {@const cur = fr ? vview : fview}
       {@const set = fr ? setVview : setFview}
-      <div class="pubx__view" role="group" aria-label="View">
-        <button class="pubx__viewbtn" class:is-active={cur === 'grid'} title="Poster grid" aria-label="Poster grid"
+      <div class="pubx__view" role="group" aria-label={t('publishersPage.view')}>
+        <button class="pubx__viewbtn" class:is-active={cur === 'grid'} title={t('publishersPage.posterGrid')} aria-label={t('publishersPage.posterGrid')}
           onclick={() => set('grid')}><Icon name="grid" size={15} /></button>
-        <button class="pubx__viewbtn" class:is-active={cur === 'list'} title="List" aria-label="List"
+        <button class="pubx__viewbtn" class:is-active={cur === 'list'} title={t('publishersPage.list')} aria-label={t('publishersPage.list')}
           onclick={() => set('list')}><Icon name="list" size={15} /></button>
       </div>
     {/if}
     {#if !pub && can('library.manage')}
-      <button class="pubx__act" disabled={artBusy} title="Look up publisher logos and franchise character art on ComicVine"
+      <button class="pubx__act" disabled={artBusy} title={t('publishersPage.fetchPublisherArt')}
         onclick={fetchArt}><Icon name="refresh" size={14} /> {artBusy ? 'Starting…' : 'Fetch artwork'}</button>
     {/if}
   </div>
@@ -197,16 +198,16 @@
       <div class="pubx__warn">
         <Icon name="alert-triangle" size={15} />
         <span>{artNote}</span>
-        <button class="pubx__link" onclick={() => (artNote = '')}>Dismiss</button>
+        <button class="pubx__link" onclick={() => (artNote = '')}>{t('publishersPage.dismiss')}</button>
       </div>
     {/if}
     {#if loading}
-      <div class="pubx__note">Loading…</div>
+      <div class="pubx__note">{t('common.loading')}</div>
 
     <!-- tier 1: publishers -->
     {:else if !pub}
       {#if !publishers.length}
-        <div class="pubx__note">Nothing in the library yet.</div>
+        <div class="pubx__note">{t('publishersPage.nothingInLibraryYet')}</div>
       {/if}
       <div class="pubx__grid">
         {#each publishers as p (p.name)}
@@ -219,8 +220,8 @@
               {/if}
             </div>
             <div class="pcard__name">{p.name}</div>
-            <div class="pcard__meta">{fmt(p.franchises)} series · {fmt(p.series)} volumes</div>
-            {#if p.total}<div class="pcard__meta pcard__meta--read">{fmt(p.read || 0)}/{fmt(p.total)} read · {rpct(p)}%</div>{/if}
+            <div class="pcard__meta">{t('publishersPage.seriesVolumes', { series: fmt(p.franchises), volumes: fmt(p.series) })}</div>
+            {#if p.total}<div class="pcard__meta pcard__meta--read">{fmt(p.read || 0)}/{fmt(p.total)} {t('publishersPage.read')} {rpct(p)}%</div>{/if}
           </button>
         {/each}
       </div>
@@ -228,13 +229,13 @@
     <!-- tier 2: franchises within a publisher -->
     {:else if !fr}
       {#if !franchises.length}
-        <div class="pubx__note">Nothing from {pub}.</div>
+        <div class="pubx__note">{t('publishersPage.nothingFrom', { publisher: pub })}</div>
       {/if}
       {#if fview === 'list'}
         <div class="frlist">
           <div class="frlist__head">
-            <span></span><span>Series</span><span class="frlist__num">Volumes</span>
-            <span class="frlist__num">Issues</span><span class="frlist__num">Read</span><span>Progress</span>
+            <span></span><span>{t('common.series')}</span><span class="frlist__num">{t('publishersPage.volumes')}</span>
+            <span class="frlist__num">{t('common.issues')}</span><span class="frlist__num">{t('publishersPage.readHeader')}</span><span>{t('publishersPage.progress')}</span>
           </div>
           {#each franchises as f (f.key)}
             <button class="frrow" onclick={() => setQuery({ fr: f.key })}>
@@ -269,7 +270,7 @@
               {#if f.volumes > 1}<span class="fcard__count">{fmt(f.volumes)}</span>{/if}
             </div>
             <div class="fcard__name">{f.name}</div>
-            <div class="fcard__meta">{fmt(f.owned)}/{fmt(f.total)} issues</div>
+            <div class="fcard__meta">{fmt(f.owned)}/{fmt(f.total)} {t('publishersPage.issues')}</div>
             {#if f.total}
               <div class="fcard__read">
                 <span class="fcard__readbar"><span class="fcard__readfill" class:is-done={(f.read || 0) >= f.total} style="width:{rpct(f)}%"></span></span>
@@ -285,11 +286,11 @@
     {:else if detail}
       {#if picked.size && isTrusted()}
         <div class="pubx__bulk">
-          <span class="pubx__bulk-n">{fmt(picked.size)} selected</span>
-          <button class="pubx__link" onclick={mergeInto}><Icon name="layers" size={14} /> Move to franchise…</button>
-          <button class="pubx__link" onclick={splitOut}><Icon name="plus" size={14} /> Split into new…</button>
-          <button class="pubx__link" onclick={() => moveTo(null)}><Icon name="refresh" size={14} /> Reset to automatic</button>
-          <button class="pubx__link" onclick={() => (picked = new Set())}>Clear</button>
+          <span class="pubx__bulk-n">{fmt(picked.size)} {t('publishersPage.selected')}</span>
+          <button class="pubx__link" onclick={mergeInto}><Icon name="layers" size={14} /> {t('publishersPage.moveToFranchise')}</button>
+          <button class="pubx__link" onclick={splitOut}><Icon name="plus" size={14} /> {t('publishersPage.splitIntoNew')}</button>
+          <button class="pubx__link" onclick={() => moveTo(null)}><Icon name="refresh" size={14} /> {t('publishersPage.resetToAutomatic')}</button>
+          <button class="pubx__link" onclick={() => (picked = new Set())}>{t('common.clear')}</button>
         </div>
       {/if}
       {#if vview === 'grid'}
@@ -303,7 +304,7 @@
                 <span class="vcard__art"><Cover coverUrl={v.cover} title={v.title} /></span>
                 <span class="vcard__title">{v.title}</span>
                 <span class="vcard__meta">{v.year || '—'} · {fmt(v.owned)}/{fmt(v.total)}</span>
-                {#if v.total}<span class="vcard__meta vcard__meta--read" class:is-done={(v.read || 0) >= v.total}>{fmt(v.read || 0)}/{fmt(v.total)} read · {rpct(v)}%</span>{/if}
+                {#if v.total}<span class="vcard__meta vcard__meta--read" class:is-done={(v.read || 0) >= v.total}>{fmt(v.read || 0)}/{fmt(v.total)} {t('publishersPage.read')} {rpct(v)}%</span>{/if}
               </button>
             </div>
           {/each}
@@ -319,7 +320,7 @@
                 <Cover coverUrl={v.cover} title={v.title} />
                 <span class="vrow__main">
                   <span class="vrow__title">{v.title}{#if v.year}<span class="vrow__year"> ({v.year})</span>{/if}</span>
-                  <span class="vrow__meta">{fmt(v.owned)}/{fmt(v.total)} issues{#if v.total} · <span class="vrow__read" class:is-done={(v.read || 0) >= v.total}>{fmt(v.read || 0)}/{fmt(v.total)} read ({rpct(v)}%)</span>{/if}</span>
+                  <span class="vrow__meta">{t('publishersPage.ownedOfTotalIssues', { owned: fmt(v.owned), total: fmt(v.total) })}{#if v.total} · <span class="vrow__read" class:is-done={(v.read || 0) >= v.total}>{t('publishersPage.readOfTotalPct', { read: fmt(v.read || 0), total: fmt(v.total), pct: rpct(v) })}</span>{/if}</span>
                 </span>
               </button>
             </div>

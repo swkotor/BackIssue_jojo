@@ -67,5 +67,8 @@
   "stopWantingIssue": "Stop wanting this issue",
   "skipIssue": "Skip this issue — the policy leaves it alone from now on",
   "wantJustThis": "Want just this issue",
-  "loadMore": "Load more"
+  "loadMore": "Load more",
+  "unwantSeriesTitle": "Unwant this series — stops monitoring, drops its picks and clears its queue rows",
+  "unwantSeries": "▬ Unwant series",
+  "seriesNoLongerWatched": "{series} is no longer watched."
 }
