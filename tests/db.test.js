@@ -1,13 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { setSeriesAliases, seriesSearchNames, createCvSeries, mergeSeriesRows, issuesFeaturing } from '../src/db.js';
+import { setSeriesAliases, seriesSearchNames, createCvSeries, mergeSeriesRows, issuesFeaturing, backfillPeopleIndex } from '../src/db.js';
 import {
   openDb, upsertSeries, upsertIssue, listSeries, listIssues,
   setIssueStatus, queueIssues, getNextQueued, countByStatus, getSeriesTitleById,
   resetDownloading, claimNextQueued, setSeriesComplete, getSeriesById, requeueFailed,
   clearIssuesForRedownload, listQueue, queuedCount,
   setSeriesMeta, getSeriesByUrl, clearFailed,
-  setScanOverride, getScanOverride, clearScanOverride,
   upsertLibraryFile, getLibraryFile, listLibraryFiles, libraryStats, pruneLibraryFiles,
   setSeriesRestricted, isSeriesRestricted,
   linkLibraryFile, collectionSeries, seriesCollectionDetail, setFollowed,
@@ -198,17 +197,6 @@ test('library_files: upsert/get/list/stats/prune', () => {
   assert.equal(s.total, 3); assert.equal(s.tagged, 1); assert.equal(s.untagged, 1); assert.equal(s.corrupt, 1); assert.equal(s.cbr, 1);
   assert.equal(pruneLibraryFiles(db, new Set(['/a.cbz'])), 2);
   assert.equal(libraryStats(db).total, 1);
-});
-
-test('scan overrides set/get/upsert/clear', () => {
-  const db = openDb(':memory:');
-  assert.equal(getScanOverride(db, '/lib/X'), undefined);
-  setScanOverride(db, '/lib/X', 42);
-  assert.equal(getScanOverride(db, '/lib/X'), 42);
-  setScanOverride(db, '/lib/X', 99); // upsert same dir
-  assert.equal(getScanOverride(db, '/lib/X'), 99);
-  assert.equal(clearScanOverride(db, '/lib/X'), 1);
-  assert.equal(getScanOverride(db, '/lib/X'), undefined);
 });
 
 test('clearFailed resets failed issues to pending and drops the error', () => {
@@ -974,4 +962,79 @@ test('issuesFeaturing: a restricted series stays hidden unless the caller may se
 
   assert.equal(issuesFeaturing(db, { kind: 'character', name: 'Someone' }).length, 0, 'hidden by default');
   assert.equal(issuesFeaturing(db, { kind: 'character', name: 'Someone', includeRestricted: true }).length, 1);
+});
+
+test('issuesFeaturing: a database cached before the people index gets backfilled, and edits keep it current', async () => {
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const file = join(mkdtempSync(join(tmpdir(), 'bi-people-')), 'c.db');
+  let db = openDb(file);
+  upsertCvSeries(db, { id: 1, name: 'Detective Comics' });
+  upsertCvIssue(db, { id: 101, cv_series_id: 1, number: '1' });
+  upsertCvIssue(db, { id: 102, cv_series_id: 1, number: '2' });
+  setCvIssueDetail(db, 101, { credits: [{ name: 'Chuck Dixon', role: 'writer' }] });
+  setCvIssueDetail(db, 102, { metron: { id: 5, credits: [{ creator: 'Chuck Dixon', role: [{ name: 'Writer' }, { name: 'Cover' }] }] } });
+  // Simulate an install from before the index existed.
+  db.exec('DROP TABLE cv_issue_people; DROP TABLE cv_issue_people_fill; DROP TRIGGER trg_people_ins; DROP TRIGGER trg_people_upd; DROP TRIGGER trg_people_del;');
+  db.close();
+  db = openDb(file);
+  // Before the background fill finishes, the scan fallback answers.
+  assert.deepEqual(issuesFeaturing(db, { kind: 'creator', name: 'Chuck Dixon' }).map((i) => i.cv_issue_id).sort(), [101, 102]);
+  await backfillPeopleIndex(db, { chunk: 1 });
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM cv_issue_people_fill').get().n, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM cv_issue_people WHERE name='Chuck Dixon'").get().n, 2);
+  const dixon = issuesFeaturing(db, { kind: 'creator', name: 'Chuck Dixon' });
+  assert.deepEqual(dixon.map((i) => i.cv_issue_id).sort(), [101, 102]);
+  assert.equal(dixon.find((i) => i.cv_issue_id === 102).role, 'Writer, Cover');
+  // A refresh that drops the credit removes the issue from the chip.
+  setCvIssueDetail(db, 101, { credits: [{ name: 'Someone Else', role: 'writer' }] });
+  assert.deepEqual(issuesFeaturing(db, { kind: 'creator', name: 'Chuck Dixon' }).map((i) => i.cv_issue_id), [102]);
+  // Malformed JSON in a credit column never blocks the write.
+  db.prepare("UPDATE cv_issues SET credits='not json' WHERE comicvine_id=101").run();
+  db.close();
+});
+
+test('listSeries pages through title order with issue counts', () => {
+  const db = openDb(':memory:');
+  for (const t of ['Cerebus', 'Akira', 'Bone']) upsertSeries(db, { title: t, url: '/c/' + t });
+  const bone = db.prepare("SELECT id FROM series WHERE title='Bone'").get().id;
+  upsertIssue(db, { seriesId: bone, title: 'Bone #1', url: '/i/b1' });
+  assert.deepEqual(listSeries(db, { limit: 2 }).map((s) => s.title), ['Akira', 'Bone']);
+  const page2 = listSeries(db, { limit: 2, offset: 2 });
+  assert.deepEqual(page2.map((s) => s.title), ['Cerebus']);
+  assert.equal(listSeries(db, { search: 'bon', limit: 10 })[0].issue_count, 1);
+});
+
+test('collectionPage excludeSelfDescribed: the paged comics list the mobile apps use', async () => {
+  const m = await seedEbookType();
+  const db = openDb(':memory:');
+  const comic = (title) => {
+    const sid = upsertSeries(db, { title, url: 'cv:' + title.toLowerCase() });
+    db.prepare('UPDATE series SET followed=1 WHERE id=?').run(sid);
+    return sid;
+  };
+  const a = comic('Alpha'), b = comic('Beta'), c = comic('Gamma');
+  addRemoteBook(db, { title: 'Dune' });
+  addRemoteBook(db, { title: 'Emma' });
+
+  const all = m.collectionPage(db, { keys: ['all'], limit: 10, offset: 0 });
+  assert.ok(all.rows.some((r) => r.title === 'Dune'), 'without it, books are part of the page');
+  for (const sort of ['title', 'added']) {
+    const p1 = m.collectionPage(db, { keys: ['all'], limit: 2, offset: 0, sort, excludeSelfDescribed: true });
+    const p2 = m.collectionPage(db, { keys: [], limit: 2, offset: 2, sort, excludeSelfDescribed: true });
+    assert.equal(p1.total, 3, `${sort}: the total counts comics only`);
+    assert.deepEqual([...p1.rows, ...p2.rows].map((r) => r.id).sort(), [a, b, c].sort(), `${sort}: pages hold exactly the comics`);
+  }
+  // CTE path (a filter needing rollups) honours it too.
+  const missing = m.collectionPage(db, { keys: ['all'], filter: 'problems', limit: 10, offset: 0, excludeSelfDescribed: true });
+  assert.ok(missing.rows.every((r) => ![ 'Dune', 'Emma' ].includes(r.title)));
+
+  // Every field the apps read from the unpaged list is on a paged row.
+  const legacy = m.collectionSeries(db, { excludeSelfDescribed: true })[0];
+  const paged = m.collectionPage(db, { keys: [], limit: 1, offset: 0, excludeSelfDescribed: true }).rows[0];
+  for (const f of ['id', 'title', 'publisher', 'year', 'cover_url', 'followed', 'monitored', 'matched', 'total', 'owned', 'missing', 'untagged', 'corrupt', 'active', 'size']) {
+    assert.ok(f in paged, `paged row has ${f}`);
+    assert.equal(f in legacy, true, `legacy row has ${f}`);
+  }
 });

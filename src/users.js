@@ -12,9 +12,9 @@
 // an HttpOnly cookie. HTTP Basic is still accepted and verified against the
 // users table so scripts and tools keep working.
 import crypto from 'node:crypto';
+import { promisify } from 'node:util';
 
 export const ROLES = ['viewer', 'trusted', 'admin'];
-export const roleAtLeast = (have, need) => ROLES.indexOf(have) >= ROLES.indexOf(need);
 
 // ---- permissions ------------------------------------------------------------
 // Every gated action maps to a named permission. The three built-in roles grant
@@ -64,6 +64,27 @@ export function verifyPassword(password, stored) {
   }
 }
 
+// The async form runs scrypt on the libuv pool, so a login (or a spray of them)
+// never holds the event loop for the ~50–100 ms each hash costs.
+const scryptAsync = promisify(crypto.scrypt);
+export async function verifyPasswordAsync(password, stored) {
+  try {
+    const [algo, N, r, p, saltHex, hashHex] = String(stored).split('$');
+    if (algo !== 'scrypt') return false;
+    const hash = await scryptAsync(String(password), Buffer.from(saltHex, 'hex'), hashHex.length / 2, {
+      N: Number(N), r: Number(r), p: Number(p), maxmem: SCRYPT.maxmem,
+    });
+    return crypto.timingSafeEqual(hash, Buffer.from(hashHex, 'hex'));
+  } catch {
+    return false;
+  }
+}
+
+// A real hash to verify against when the username doesn't exist, so a miss
+// costs the same as a wrong password. Made once, not per attempt.
+let padHash = null;
+const timingPad = () => (padHash ||= hashPassword('timing-pad'));
+
 const tokenHash = (token) => crypto.createHash('sha256').update(String(token)).digest('hex');
 
 export function initUserTables(db) {
@@ -107,6 +128,9 @@ export function initUserTables(db) {
   // for this user EVEN IF their role could see them (library.restricted). A
   // personal preference on top of the role gate — see canRestricted in server.js.
   if (!userCols.includes('hide_mature')) db.exec('ALTER TABLE users ADD COLUMN hide_mature INTEGER NOT NULL DEFAULT 0');
+  // Per-user UI language (a BCP 47 tag such as 'fr' or 'pt-BR'); NULL means
+  // follow the browser. Read by the web shell, the API and the mobile apps.
+  if (!userCols.includes('lang')) db.exec('ALTER TABLE users ADD COLUMN lang TEXT');
   db.exec(`
     CREATE TABLE IF NOT EXISTS external_identities (
       provider TEXT NOT NULL,
@@ -301,7 +325,7 @@ export function createUser(db, { username, password, role = 'viewer' }) {
 }
 
 export function getUser(db, id) {
-  return db.prepare('SELECT id, username, email, role, disabled, created_at FROM users WHERE id=?').get(id) || null;
+  return db.prepare('SELECT id, username, email, role, disabled, created_at, hide_mature, lang FROM users WHERE id=?').get(id) || null;
 }
 
 export function listUsers(db) {
@@ -319,7 +343,7 @@ export function listUsers(db) {
  *  last activity, and any external-login providers. */
 export function userProfile(db, id) {
   const u = db.prepare(`
-    SELECT u.id, u.username, u.email, u.role, u.created_at, u.hide_mature,
+    SELECT u.id, u.username, u.email, u.role, u.created_at, u.hide_mature, u.lang,
            (SELECT MAX(last_seen) FROM sessions s WHERE s.user_id = u.id) AS last_seen,
            (SELECT GROUP_CONCAT(DISTINCT provider) FROM external_identities e WHERE e.user_id = u.id) AS providers
       FROM users u WHERE u.id = ?`).get(id);
@@ -331,6 +355,18 @@ export function userProfile(db, id) {
 export function setHideMature(db, id, on) {
   db.prepare('UPDATE users SET hide_mature=? WHERE id=?').run(on ? 1 : 0, id);
   return !!on;
+}
+
+// A language tag: 'fr', 'pt-BR', 'zh-Hant'. Kept strict because the value is
+// echoed into the HTML shell.
+export const LANG_RE = /^[a-z]{2,3}(-[a-z0-9]{2,8}){0,2}$/i;
+
+/** Set (or clear, with null/'') a user's UI language. Returns the stored value. */
+export function setLang(db, id, lang) {
+  const v = lang == null || lang === '' ? null : String(lang).trim();
+  if (v !== null && !LANG_RE.test(v)) throw new Error('unsupported language');
+  db.prepare('UPDATE users SET lang=? WHERE id=?').run(v, id);
+  return v;
 }
 
 /** Set a user's email (self-service). Blank clears it. Validates format and
@@ -356,10 +392,19 @@ export function destroyOtherSessions(db, userId, keepToken) {
 /** Credentials → user row (with hash timing regardless of user existence). */
 export function verifyCredentials(db, username, password) {
   const row = db.prepare('SELECT * FROM users WHERE username=?').get(String(username || ''));
-  const stored = row?.password_hash || hashPassword('timing-pad');
-  const ok = verifyPassword(password, stored);
+  const ok = verifyPassword(password, row?.password_hash || timingPad());
+  return credentialUser(row, ok);
+}
+export async function verifyCredentialsAsync(db, username, password) {
+  const row = db.prepare('SELECT * FROM users WHERE username=?').get(String(username || ''));
+  const ok = await verifyPasswordAsync(password, row?.password_hash || timingPad());
+  return credentialUser(row, ok);
+}
+function credentialUser(row, ok) {
   if (!ok || !row || row.disabled) return null;
-  return { id: row.id, username: row.username, role: row.role, disabled: row.disabled };
+  // Same shape as sessionUser: hide_mature and lang ride every request's user,
+  // so password Basic (OPDS apps) honors the account's mature-content switch.
+  return { id: row.id, username: row.username, role: row.role, disabled: row.disabled, hide_mature: row.hide_mature, lang: row.lang };
 }
 
 export function setPassword(db, id, password) {
@@ -417,12 +462,25 @@ export function createApiKey(db, userId) {
 export function apiKeyUser(db, key) {
   if (!key || !String(key).startsWith('bi_')) return null;
   const row = db.prepare(`
-    SELECT u.id, u.username, u.role, u.disabled, u.hide_mature FROM api_keys k
+    SELECT u.id, u.username, u.role, u.disabled, u.hide_mature, u.lang FROM api_keys k
       JOIN users u ON u.id = k.user_id
      WHERE k.key_hash = ?`).get(tokenHash(key));
   if (!row || row.disabled) return null;
-  db.prepare("UPDATE api_keys SET last_used=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE user_id=?").run(row.id);
+  if (dueStamp(`k:${tokenHash(key)}`)) db.prepare("UPDATE api_keys SET last_used=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE user_id=?").run(row.id);
   return row;
+}
+
+// last_seen / last_used are "about when", shown to people: stamping them on
+// every request (each cover and page image) cost a write transaction apiece.
+// Once a minute per token is plenty.
+const STAMP_EVERY_MS = 60_000;
+const lastStamped = new Map(); // token key → ms
+function dueStamp(key) {
+  const now = Date.now();
+  if (now - (lastStamped.get(key) || 0) < STAMP_EVERY_MS) return false;
+  if (lastStamped.size > 10_000) lastStamped.clear();
+  lastStamped.set(key, now);
+  return true;
 }
 
 /** What the profile UI shows: the key's prefix + timestamps, never the key. */
@@ -451,13 +509,13 @@ export function createSession(db, userId) {
 export function sessionUser(db, token) {
   if (!token) return null;
   const row = db.prepare(`
-    SELECT u.id, u.username, u.role, u.disabled, u.hide_mature FROM sessions s
+    SELECT u.id, u.username, u.role, u.disabled, u.hide_mature, u.lang FROM sessions s
       JOIN users u ON u.id = s.user_id
      WHERE s.token_hash=? AND s.expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now')`)
     .get(tokenHash(token));
   if (!row || row.disabled) return null;
-  db.prepare("UPDATE sessions SET last_seen=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE token_hash=?")
-    .run(tokenHash(token));
+  const h = tokenHash(token);
+  if (dueStamp(`s:${h}`)) db.prepare("UPDATE sessions SET last_seen=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE token_hash=?").run(h);
   return row;
 }
 
@@ -488,11 +546,16 @@ export function authBlockedFor(key) {
   const left = Math.ceil((e.until - Date.now()) / 1000);
   return left > 0 ? left : 0;
 }
-export function authFailed(key) {
-  const e = AUTH_FAILS.get(key) || { n: 0, until: 0 };
+// `after`: failures before the lock starts. `forgetAfterMs`: a bucket that has
+// been quiet this long starts over (used for the per-address bucket, which a
+// success never clears).
+export function authFailed(key, { after = LOCK_AFTER, forgetAfterMs = null } = {}) {
+  let e = AUTH_FAILS.get(key) || { n: 0, until: 0, last: 0 };
+  if (forgetAfterMs && Date.now() - (e.last || 0) > forgetAfterMs) e = { n: 0, until: 0, last: 0 };
   e.n++;
-  if (e.n >= LOCK_AFTER) {
-    e.until = Date.now() + Math.min(LOCK_MAX_MS, LOCK_BASE_MS * 2 ** (e.n - LOCK_AFTER));
+  e.last = Date.now();
+  if (e.n >= after) {
+    e.until = Date.now() + Math.min(LOCK_MAX_MS, LOCK_BASE_MS * 2 ** (e.n - after));
   }
   AUTH_FAILS.set(key, e);
   if (AUTH_FAILS.size > 10_000) AUTH_FAILS.clear(); // memory backstop under a spray

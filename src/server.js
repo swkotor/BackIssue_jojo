@@ -2,19 +2,18 @@ import express from 'express';
 import compression from 'compression';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import fsp from 'node:fs/promises';
 import fssync from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import config from './config.js';
 import { initCountWorker, workerGetRow } from './countWorker.js';
-import { listSeries, listIssues, queueIssues, countByStatus, requeueFailed, clearFailed, setFollowed, listQueue, cancelQueued, cancelIssue, collectionSeries, collectionCounts, collectionPage, buildCollCountSql, collCountRowToResult, seriesCollectionDetail, setSeriesPath, getSeriesById, getSeriesByCvId, getCvIssue, ensureCvIssueRow, clearIssuesForRedownload, listImportHistory, listFailedGrabs, listBlacklist, deleteBlacklistEntry, clearBlacklist, listWantedIssues, activePackGrabs, listCvIssues, setSeriesRestricted, isSeriesRestricted, setSeriesType, restrictedSeriesIds, isCvIssueRestricted, createLibrary, listLibraries, libraryFolders, updateLibrary, deleteLibrary, assignSeriesLibrary, setUserFollow, updateCvSeriesUser, updateCvIssueUser, resetCvSeriesUser, resetCvIssueUser, setMonitor, setIssueWants, clearIssuePicks, wantStates, MONITOR_STATES, setSeriesWatchState, setIssuesWanted, clearIssueWants, seriesWantedCounts, dequeueUnwantedIssues, cvIssueIdsForIssueRows, WATCH_STATES } from './db.js';
+import { listSeries, listIssues, queueIssues, countByStatus, requeueFailed, clearFailed, listQueue, cancelQueued, cancelIssue, collectionSeries, collectionCounts, collectionPage, collectionJumpQuery, jumpOffsetFromRow, collectionBucketsQuery, bucketsFromRow, buildCollCountSql, collCountRowToResult, seriesCollectionDetail, setSeriesPath, getSeriesById, defaultLibrary, setDefaultLibrary, reorderLibraries, getSeriesByCvId, getCvIssue, ensureCvIssueRow, clearIssuesForRedownload, listImportHistory, listFailedGrabs, listBlacklist, deleteBlacklistEntry, clearBlacklist, listWantedIssues, activePackGrabs, listCvIssues, setSeriesRestricted, isSeriesRestricted, setSeriesType, restrictedSeriesIds, isCvIssueRestricted, createLibrary, listLibraries, libraryFolders, updateLibrary, deleteLibrary, assignSeriesLibrary, setUserFollow, updateCvSeriesUser, updateCvIssueUser, resetCvSeriesUser, resetCvIssueUser, setMonitor, setIssueWants, clearIssuePicks, wantStates, MONITOR_STATES, setSeriesWatchState, setIssuesWanted, clearIssueWants, seriesWantedCounts, dequeueUnwantedIssues, cvIssueIdsForIssueRows, WATCH_STATES } from './db.js';
 import { resolveSeriesDir, defaultRootedDir } from './paths.js';
 import { planSeries, refileSeries, planLibrary, canRefile } from './refile.js';
 import { seriesFolderFromPattern, fileStemFromPattern } from './naming.js';
 import { normalizeNumber } from './matcher.js';
 import { parseIssueFromFilename } from './scanner.js';
 import { linkFilesToCv } from './cvmatch.js';
-import { getLibraryFile, linkFileCvIssue, setFileIssueOverride, clearFileIssueOverride, issuesFeaturing } from './db.js';
+import { getLibraryFile, linkFileCvIssue, setFileIssueOverride, clearFileIssueOverride, issuesFeaturing, dbVersion } from './db.js';
 import { testIndexer } from './newznab.js';
 import { testClient } from './nzbclients.js';
 import { testTorznabIndexer } from './torznab.js';
@@ -28,7 +27,6 @@ import * as franchise from './franchise.js';
 import * as cbl from './cbl.js';
 import * as notifications from './notifications.js';
 import { createEventHub } from './events.js';
-import { sidecarPath } from './archive.js';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // The UI is a built Svelte app — `npm run build` writes it to frontend/dist.
@@ -44,7 +42,7 @@ if (process.env.BUILD_CHANNEL && process.env.BUILD_CHANNEL !== 'release') {
   APP_VERSION += `-${process.env.BUILD_CHANNEL}${sha ? '.' + sha : ''}`;
 }
 
-export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvSearch, cvVolumeInfo, cvIssueInfo, arcSearch, arcIssues, cblResolve, cleanupSeriesFiles, runImportScan, runImport, importState, runTool, toolsState, runLibraryRefile, refileState, stats, listSources, listSourceCards, testSource, sourceCatalog, installSource: installSourceFn, uninstallSource: uninstallSourceFn, queueProgress, packProgress, activeMedia, cancelGrab, testCvKeys, usenetSearch, usenetGrab, torrentSearch, torrentGrabPack, searchSources, manualGrabResult, grabSourcePack, searchPacks, grabPack, setAliases, pluginRoutes = [], pluginClientAssets = [], matchImportCandidate, confirmImportCandidate, skipImportCandidate, cvSetManual, addFromCv, scanSeriesFolder, deleteComic, refreshVolume, refreshPublisherArt, tagSeriesFiles, checkReleases, listJobs, clearJobs, listLogs, clearLogs, listSchedules, setScheduleCron, runScheduleNow, getSettings, saveSettings, requestRestart, supportPackage, supportSend, supportSendMobile, state }) {
+export function createApp({ db, openApiBeforeSetup = false, runDownloads, prepareRedownload, runCvMatch, cvSearch, cvVolumeInfo, cvIssueInfo, arcSearch, arcIssues, cblResolve, cleanupSeriesFiles, runImportScan, runImport, importState, runTool, toolsState, runLibraryRefile, refileState, stats, listSources, listSourceCards, testSource, sourceCatalog, installSource: installSourceFn, uninstallSource: uninstallSourceFn, queueProgress, packProgress, activeMedia, cancelGrab, metadataProviders, testMetadataProvider, searchSources, manualGrabResult, grabSourcePack, searchPacks, grabPack, setAliases, pluginRoutes = [], pluginClientAssets = [], pluginMessages = {}, matchImportCandidate, confirmImportCandidate, skipImportCandidate, cvSetManual, addFromCv, scanSeriesFolder, deleteComic, refreshVolume, refreshPublisherArt, tagSeriesFiles, checkReleases, listJobs, clearJobs, listLogs, clearLogs, listSchedules, setScheduleCron, runScheduleNow, getSettings, saveSettings, requestRestart, supportPackage, supportSend, supportSendMobile, state }) {
   const startDownloads = (arg) => {
     if (!state.queue.running) {
       state.queue.running = true;
@@ -150,6 +148,9 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   // Brute-force throttle key: source ip + claimed username. Applied to login,
   // register, AND failed Basic attempts — Basic hits the same password check.
   const authKey = (req, username) => `${req.ip || '?'}|${String(username || '').toLowerCase()}`;
+  // Failed logins from one address, across all usernames, before it is locked.
+  // Generous: behind a proxy without trustProxy every client shares one address.
+  const IP_LOCK_AFTER = 30;
 
   const resolveUser = (req) => {
     const token = readCookie(req);
@@ -169,8 +170,20 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
       const [name, ...rest] = Buffer.from(hdr.slice(6), 'base64').toString().split(':');
       const key = authKey(req, name);
       if (users.authBlockedFor(key)) return null; // locked out → plain 401, no scrypt spend
-      const u = users.verifyBasicCached(db, name, rest.join(':'));
+      // A personal API key as the Basic password: for clients that only speak
+      // Basic (OPDS readers), and the way in when password login is off. The
+      // username must be the key owner's (or blank). Anything else falls
+      // through to the password check (a password may start with bi_ too).
+      const secret = rest.join(':');
+      if (secret.startsWith('bi_')) {
+        const ku = users.apiKeyUser(db, secret);
+        if (ku && (!name || name.toLowerCase() === String(ku.username).toLowerCase())) { users.authSucceeded(key); return ku; }
+      }
+      const u = users.verifyBasicCached(db, name, secret);
       if (u) users.authSucceeded(key); else users.authFailed(key);
+      // Same rule as the sign-in form: with password login off (SSO-only),
+      // only admins may still use a password. Others use an API key.
+      if (u && config.passwordLoginDisabled && u.role !== 'admin') return null;
       return u;
     }
     return null;
@@ -248,6 +261,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   // without being able to reshape the library).
   const PERM_RULES = [
     [/^\/api\/settings/, 'settings.manage'], [/^\/api\/indexers/, 'settings.manage'],
+    [/^\/api\/metadata\/providers/, 'settings.manage'],
     // A mobile app's diagnostics may come from any signed-in user (the
     // handler sends a lite package unless they are an admin); the full
     // support package carries settings (redacted) and logs — admin only.
@@ -325,6 +339,11 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   // Plugin routes declare access as a tier name or a registered permission
   // key; tiers map onto the core permission of the same weight.
   const TIER_PERMS = { viewer: 'library.view', trusted: 'library.manage', admin: 'plugins.manage' };
+  // Express routes ignore case and a trailing slash (/API/users/ reaches the
+  // /api/users handler), so every access decision reads the path the same
+  // way: lowercased, trailing slashes dropped. Matching the raw path let
+  // /API/... skip sign-in and /x/ skip a /x$ permission rule.
+  const accessPath = (req) => req.path.toLowerCase().replace(/\/+$/, '') || '/';
   const pluginAccess = (() => {
     let table = null;
     return (req) => {
@@ -332,18 +351,25 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
         table = registeredRoutes().map((r) => ({
           method: r.method,
           access: r.access || (r.method === 'get' ? 'viewer' : 'trusted'),
-          re: new RegExp('^' + r.path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+          re: new RegExp('^' + r.path.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
             .replace(/\\\{[^}]+\\\}/g, '[^/]+').replace(/:[A-Za-z_]+/g, '[^/]+') + '/?$'),
         }));
       }
       const m = req.method.toLowerCase();
-      const hit = table.find((r) => r.method === m && r.re.test(req.path));
+      const p = accessPath(req);
+      const hit = table.find((r) => r.method === m && r.re.test(p));
       return hit ? hit.access : null;
     };
   })();
   const requiredPermission = (req) => {
-    const p = req.path;
+    const p = accessPath(req);
     if (p.startsWith('/api/auth/')) return 'authed'; // self-service: logout, password — any signed-in user
+    // Creating, editing or deleting a library decides which folders on disk
+    // the app scans and files into, so it sits with settings (admin), not
+    // with library management. Viewing the list stays library.view.
+    // Every library write (create, edit, delete, reorder, default) is admin
+    // configuration, whatever the path below /api/libraries.
+    if (/^\/api\/libraries(\/|$)/.test(p) && req.method !== 'GET') return 'settings.manage';
     for (const [re, perm] of PERM_RULES) if (re.test(p)) return perm;
     const plug = pluginAccess(req);
     if (plug) return plug === 'public' ? 'public' : (TIER_PERMS[plug] || plug);
@@ -376,7 +402,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     .filter((r) => r.basicAuth)
     .map((r) => String(r.path).split('/:')[0].replace(/\/+$/, ''));
   const wantsBasicChallenge = (req) => basicChallengePrefixes.some(
-    (p) => p && (req.path === p || req.path.startsWith(p + '/')),
+    (p) => p && (accessPath(req) === p.toLowerCase() || accessPath(req).startsWith(p.toLowerCase() + '/')),
   );
 
   // Unauthenticated liveness probe (Docker/Unraid HEALTHCHECK, uptime monitors).
@@ -398,23 +424,30 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
       const t0 = Date.now();
       res.on('finish', () => logInfo(`${req.method} ${req.originalUrl} → ${res.statusCode} ${res.get('Content-Type') || ''} auth=${req.headers.authorization ? req.headers.authorization.split(' ')[0] : 'none'} ${Date.now() - t0}ms`, 'debug-ua'));
     }
+    const path = accessPath(req);
     // fork: /opds is the Komga-shaped catalog mirror (plugin-opds), which has to
     // sit at the site root because Komga clients key on host/opds/v1.2/… — it is
     // guarded exactly like /api.
-    if (!req.path.startsWith('/api') && !req.path.startsWith('/plugins') && !req.path.startsWith('/opds')) return next();
-    if (/^\/api\/auth\/(login|register|me|providers)$/.test(req.path)) return next();
+    if (!/^\/(api|plugins|opds)(\/|$)/.test(path)) return next();
+    if (/^\/api\/auth\/(login|register|me|providers)$/.test(path)) return next();
     if (basicCsrfBlocked(req)) return res.status(403).json({ error: 'cross-origin request refused' });
     // Resolve the route's required access BEFORE authenticating: a route
     // explicitly marked public (e.g. an SSO plugin's login/callback) needs no
     // session — the browser reaches it while signed out.
     const need = requiredPermission(req);
     if (need === 'public') return next();
-    // Zero accounts = open single-user mode (the appliance default, same as
-    // the old unset-basic-auth state). Creating the first account — which
-    // becomes the admin — activates authentication for everything.
+    // No accounts yet: the server is waiting for its admin. The web app shows
+    // the create-account screen (only /api/auth/* above is reachable); every
+    // other API and plugin request is refused, so a server exposed before
+    // setup can't be driven through the API. openApiBeforeSetup restores the
+    // old run-as-admin behaviour for test harnesses only; the server entry
+    // point never sets it.
     if (!anyUsers.get().e) {
-      req.user = { id: 0, username: 'local', role: 'admin' };
-      return next();
+      if (openApiBeforeSetup) {
+        req.user = { id: 0, username: 'local', role: 'admin' };
+        return next();
+      }
+      return res.status(401).json({ error: 'create the first account to finish setting up BackIssue', setupRequired: true });
     }
     // Session cookie / API key / local-password Basic first (synchronous); an
     // unmatched Basic request then falls through to external credential
@@ -450,7 +483,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   // returned here ('*' = everything). UI hiding is courtesy; the middleware
   // above is the enforcement.
   const publicUser = (u) => u
-    ? { id: u.id, username: u.username, role: u.role, permissions: users.rolePermissions(db, u.role, permCatalog), hideMature: !!u.hide_mature }
+    ? { id: u.id, username: u.username, role: u.role, permissions: users.rolePermissions(db, u.role, permCatalog), hideMature: !!u.hide_mature, lang: u.lang || null }
     : null;
   app.get('/api/auth/me', (req, res) => {
     if (!anyUsers.get().e) {
@@ -467,10 +500,19 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   // auth-provider plugins) and whether the password form is enabled.
   app.get('/api/auth/providers', (req, res) => {
     res.json({
-      providers: registeredAuthProviders().map((p) => ({ id: p.id, label: p.label, loginPath: p.loginPath })),
+      providers: registeredAuthProviders()
+        .filter((p) => { try { return p.isEnabled ? !!p.isEnabled() : true; } catch { return false; } })
+        .map((p) => {
+          let label = p.label;
+          try { if (p.getLabel) label = String(p.getLabel() || '') || p.label; } catch { /* keep the static one */ }
+          return { id: p.id, label, loginPath: p.loginPath };
+        }),
       // The password form is also needed by credential backends (e.g. WHMCS),
       // so keep it visible whenever one is registered.
       passwordLogin: !config.passwordLoginDisabled || registeredCredentialProviders().length > 0,
+      // A personal API key works as the HTTP Basic password (OPDS readers),
+      // so clients can say so when passwords are off. Absent before 0.9.2.
+      apiKeyBasic: true,
     });
   });
   // Sign in a user from an ALREADY-VERIFIED external identity. SSO/OIDC plugins
@@ -507,9 +549,12 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body || {};
     const key = authKey(req, username);
-    const wait = users.authBlockedFor(key);
+    // A second, per-address bucket: the (address, username) one alone let one
+    // address try any number of usernames a few times each.
+    const ipKey = `${req.ip || '?'}|*`;
+    const wait = Math.max(users.authBlockedFor(key), users.authBlockedFor(ipKey));
     if (wait) return res.status(429).json({ error: `too many attempts — try again in ${wait}s` });
-    const u = users.verifyCredentials(db, username, password);
+    const u = await users.verifyCredentialsAsync(db, username, password);
     if (u) {
       // Password login can be disabled (SSO-only), but admins keep a password
       // escape hatch so a broken IdP can't lock everyone out.
@@ -539,6 +584,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
       }
     }
     users.authFailed(key);
+    users.authFailed(ipKey, { after: IP_LOCK_AFTER, forgetAfterMs: 15 * 60_000 });
     return res.status(401).json({ error: 'Wrong username or password.' });
   });
   app.post('/api/auth/logout', (req, res) => {
@@ -546,7 +592,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     clearSessionCookie(res);
     res.json({ ok: true });
   });
-  app.post('/api/auth/password', (req, res) => {
+  app.post('/api/auth/password', async (req, res) => {
     if (!req.user || req.user.id === 0) return res.status(403).json({ error: 'sign in with a real account first' });
     // External-login accounts have no local password to change, and setting one
     // would defeat the provider's access control — say so plainly.
@@ -554,7 +600,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
       return res.status(403).json({ error: 'this account signs in through an external service — its password is managed there' });
     }
     const { current, next: nextPw } = req.body || {};
-    if (!users.verifyCredentials(db, req.user.username, current)) {
+    if (!await users.verifyCredentialsAsync(db, req.user.username, current)) {
       return res.status(400).json({ error: 'current password is wrong' });
     }
     try {
@@ -584,7 +630,19 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     if (!req.user || req.user.id === 0) return res.status(403).json({ error: 'sign in with a real account first' });
     const on = users.setHideMature(db, req.user.id, !!(req.body || {}).hide);
     users.clearBasicCache();
+    providerBasicCache.clear(); // external-provider Basic users cache their row too
     res.json({ hideMature: on });
+  });
+  // Personal UI language (self-service). null/'' = follow the browser. The
+  // web shell inlines it so the first paint is already translated; the mobile
+  // apps read it from /api/auth/me.
+  app.post('/api/auth/lang', (req, res) => {
+    if (!req.user || req.user.id === 0) return res.status(403).json({ error: 'sign in with a real account first' });
+    try {
+      const lang = users.setLang(db, req.user.id, (req.body || {}).lang);
+      users.clearBasicCache();
+      res.json({ lang });
+    } catch (e) { res.status(400).json({ error: String(e?.message || e) }); }
   });
   app.post('/api/auth/logout-others', (req, res) => {
     if (!req.user || req.user.id === 0) return res.status(403).json({ error: 'sign in with a real account first' });
@@ -833,7 +891,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   app.post('/api/lists/import-arc', async (req, res) => {
     try {
       const { arc, issues } = await arcIssues(Number((req.body || {}).arcId));
-      if (!issues.length) return res.status(400).json({ error: 'that arc has no issues on ComicVine' });
+      if (!issues.length) return res.status(400).json({ error: 'that arc has no issues at the metadata source' });
       res.json({ id: lists.importArcAsList(db, req.user.id, arc, issues), issues: issues.length });
     } catch (e) { listErr(res, e); }
   });
@@ -846,7 +904,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     const parsed = cbl.parseCbl(xml);
     if (!parsed.books.length) return res.status(400).json({ error: 'that list has no books in it' });
     const { issues, unmatched, truncated } = await cblResolve(parsed.books);
-    if (!issues.length) return res.status(400).json({ error: 'none of the books could be matched on ComicVine' });
+    if (!issues.length) return res.status(400).json({ error: 'none of the books could be matched at the metadata source' });
     const name = cbl.prettyCblName(parsed.name || source || 'Reading list');
     const id = lists.importCblAsList(db, req.user.id, name, issues, source);
     res.json({
@@ -903,6 +961,17 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   });
   app.get('/api/plugins/client', (req, res) => res.json(stampedAssets()));
 
+  // Plugin UI strings: English (the fallback) plus one requested language.
+  // The shell inlines the same for the account's saved language; this route
+  // covers a browser-detected language and sign-in without a reload.
+  const messagesFor = (lang) => {
+    const out = {};
+    if (pluginMessages.en) out.en = pluginMessages.en;
+    if (lang && lang !== 'en' && users.LANG_RE.test(lang) && pluginMessages[lang]) out[lang] = pluginMessages[lang];
+    return out;
+  };
+  app.get('/api/i18n/plugins', (req, res) => res.json(messagesFor(String(req.query.lang || ''))));
+
   // The served shell embeds each plugin's <script>/<link> tags directly, so
   // plugin assets load in parallel with the app bundle — the sidebar's plugin
   // entries render with the rest of the menu, with no list fetch and no
@@ -911,13 +980,33 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   // gated: the login page's shell stays plugin-free (the asset files under
   // /plugins are authenticated anyway); a session that signs in without a
   // full reload falls back to the client-side loader.
+  // index.html is re-read only when a rebuild changed it (one stat per load).
+  let shellFile = null;
   function shellHtml(req) {
     const file = path.join(publicDir, 'index.html');
-    if (!fssync.existsSync(file)) return null;
-    let html = fssync.readFileSync(file, 'utf8');
-    const authed = !anyUsers.get().e || !!resolveUser(req);
+    let st;
+    try { st = fssync.statSync(file); } catch { return null; }
+    if (!shellFile || shellFile.mtimeMs !== st.mtimeMs || shellFile.size !== st.size) {
+      shellFile = { mtimeMs: st.mtimeMs, size: st.size, html: fssync.readFileSync(file, 'utf8') };
+    }
+    let html = shellFile.html;
+    // Before the first account exists the page is the create-account screen:
+    // no plugin assets (they would be refused anyway).
+    const u = anyUsers.get().e ? resolveUser(req) : null;
+    const authed = !!u || (openApiBeforeSetup && !anyUsers.get().e);
     if (authed) {
       const tags = ['<script>window.BackIssue={_q:[],registerClient(fn){this._q.push(fn)}};window.__BI_PLUGINS_INLINE__=1;</script>'];
+      // The account's saved UI language, so the bundle picks it before the
+      // first render (validated against LANG_RE on write; safe to inline).
+      if (u?.lang && users.LANG_RE.test(u.lang)) {
+        tags.unshift(`<script>window.__BI_LANG__=${JSON.stringify(u.lang)};</script>`);
+        html = html.replace('<html lang="en">', `<html lang="${u.lang}">`);
+      }
+      // Plugin UI strings for English and the saved language, so plugin
+      // screens are translated on first paint too. JSON inside a script tag:
+      // escape the one sequence that could close it early.
+      const msgs = messagesFor(u?.lang || '');
+      if (Object.keys(msgs).length) tags.unshift(`<script>window.__BI_PLUGIN_MESSAGES__=${JSON.stringify(msgs).replace(/</g, '\\u003c')};</script>`);
       for (const a of stampedAssets()) {
         const v = a.v ? `?v=${a.v}` : '';
         if (a.css) tags.push(`<link rel="stylesheet" href="/plugins/${a.name}/${a.css}${v}">`);
@@ -1031,8 +1120,12 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     }
   });
 
+  // Paged: the catalog can hold hundreds of thousands of rows (?limit, max 500;
+  // ?offset). An unbounded list froze the server and built a ~300 MB response.
   app.get('/api/series', (req, res) => {
-    res.json(listSeries(db, { search: req.query.search, includeRestricted: canRestricted(req) }));
+    const limit = Math.min(500, Math.max(1, Number.parseInt(req.query.limit, 10) || 100));
+    const offset = Math.max(0, Number.parseInt(req.query.offset, 10) || 0);
+    res.json(listSeries(db, { search: req.query.search, includeRestricted: canRestricted(req), limit, offset }));
   });
 
   app.get('/api/series/:id/issues', (req, res) => {
@@ -1081,6 +1174,21 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   // Live updates: one SSE stream tells the UI which domains changed so it can
   // re-fetch just those endpoints — replaces its fixed polling loops. Each
   // signature mirrors what the matching GET endpoint serves.
+  // A probe whose answer comes only from the database is re-run only when the
+  // database has changed since its last run; otherwise the tick reuses it.
+  const onDbChange = (fn) => {
+    let seen = null, value;
+    return () => {
+      const v = dbVersion(db);
+      if (v !== seen) { value = fn(); seen = v; }
+      return value;
+    };
+  };
+  const queueRows = onDbChange(() => ({ q: listQueue(db), p: activePackGrabs(db) }));
+  const logsSig = onDbChange(() => {
+    const l = listLogs({ level: 'all', category: 'all', limit: 1 });
+    return { counts: l.counts, last: l.logs[0]?.ts };
+  });
   const hub = createEventHub({
     // Cached pieces (≤10s stale): the signature ticks often, and an uncached
     // 400k-row GROUP BY per tick is real load at this catalog size.
@@ -1088,17 +1196,13 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     queue: () => ({
       // state.queue carries the in-flight download's page/pages — without it,
       // an immediate-source download never ticks the drawer.
-      q: listQueue(db), p: activePackGrabs(db), s: state.queue,
+      ...queueRows(), s: state.queue,
       live: queueProgress ? queueProgress() : null, pk: packProgress ? packProgress() : null,
       m: activeMedia ? activeMedia() : null,
     }),
     jobs: () => (listJobs ? listJobs() : null),
     schedules: () => (listSchedules ? listSchedules() : null),
-    logs: () => {
-      if (!listLogs) return null;
-      const l = listLogs({ level: 'all', category: 'all' });
-      return { counts: l.counts, n: l.logs.length, last: l.logs[0]?.ts };
-    },
+    logs: () => (listLogs ? logsSig() : null),
     tools: () => (toolsState ? toolsState() : null),
     import: () => (importState ? importState() : null),
     cv: () => state.cv,
@@ -1109,32 +1213,30 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   });
   app.get('/api/events', hub.handler);
 
-  app.post('/api/download', (req, res) => {
-    const ids = Array.isArray(req.body.issueIds) ? req.body.issueIds.map(Number) : [];
-    queueIssues(db, ids);
-    startDownloads(ids);
-    res.json({ queued: ids.length });
-  });
-
   // Download ComicVine issues of a collection series. We create a synthetic queue
   // row per CV issue and queue it; the worker resolves a download source on demand.
-  app.post('/api/collection/:id/download', (req, res) => {
+  app.post('/api/collection/:id/download', async (req, res) => {
     const seriesId = Number(req.params.id);
     const cvIssueIds = Array.isArray(req.body.cvIssueIds) ? req.body.cvIssueIds.map(Number) : [];
     const ids = [];
-    for (const cvid of cvIssueIds) {
-      const ci = getCvIssue(db, cvid);
-      if (!ci) continue;
-      ids.push(ensureCvIssueRow(db, { seriesId, cvIssueId: cvid, number: ci.issue_number, title: ci.name }));
-    }
+    db.transaction(() => { // "download all missing" can be hundreds of rows: one commit
+      for (const cvid of cvIssueIds) {
+        const ci = getCvIssue(db, cvid);
+        if (!ci) continue;
+        ids.push(ensureCvIssueRow(db, { seriesId, cvIssueId: cvid, number: ci.issue_number, title: ci.name }));
+      }
+    })();
     // A row can claim 'done' while its file is gone (deleted on disk, or an
     // earlier redownload that removed the file but failed to queue). The
     // queueIssues guard would silently skip those, stranding the issue as
     // undownloadable. Trust the disk: done + no file at file_path = stale.
-    const staleDone = ids.filter((id) => {
-      const row = db.prepare('SELECT status, file_path FROM issues WHERE id=?').get(id);
-      return row && row.status === 'done' && (!row.file_path || !fssync.existsSync(row.file_path));
-    });
+    // (Checked concurrently and off the event loop: the library is often a
+    // network mount.)
+    const doneRows = ids.map((id) => ({ id, row: db.prepare('SELECT status, file_path FROM issues WHERE id=?').get(id) }))
+      .filter(({ row }) => row && row.status === 'done');
+    const present = await Promise.all(doneRows.map(({ row }) => (row.file_path
+      ? fssync.promises.access(row.file_path).then(() => true, () => false) : false)));
+    const staleDone = doneRows.filter((_, i) => !present[i]).map(({ id }) => id);
     if (staleDone.length) clearIssuesForRedownload(db, staleDone);
     // Asking for an issue by hand is a want: automation keeps after it if this
     // grab fails, and the Wanted page can say why it's there. (No-op where the
@@ -1145,32 +1247,23 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     res.json({ queued: ids.length });
   });
 
-  // Re-download CV issues: delete their current file(s) on disk (e.g. a corrupt
-  // copy) so the fresh grab isn't dedupe-suffixed, then queue them.
+  // Re-download CV issues (e.g. a possibly corrupt copy). The current file(s)
+  // stay put until a replacement exists: once the fresh grab is indexed as a
+  // VALID file for the same issue, the import's supersede step removes the old
+  // copy and the new one takes its name. A grab that never arrives (no source
+  // had it, a client stalled) costs nothing.
   app.post('/api/collection/:id/redownload', async (req, res) => {
     const seriesId = Number(req.params.id);
     const cvIssueIds = Array.isArray(req.body.cvIssueIds) ? req.body.cvIssueIds.map(Number) : [];
     const ids = [];
     for (const cvid of cvIssueIds) {
-      for (const f of db.prepare('SELECT path FROM library_files WHERE cv_issue_id=?').all(cvid)) {
-        try { await fsp.unlink(f.path); } catch { /* already gone */ }
-        const side = sidecarPath(f.path);
-        if (side !== f.path) await fsp.unlink(side).catch(() => {});
-      }
-      db.prepare('DELETE FROM library_files WHERE cv_issue_id=?').run(cvid);
       const ci = getCvIssue(db, cvid);
       if (!ci) continue;
       ids.push(ensureCvIssueRow(db, { seriesId, cvIssueId: cvid, number: ci.issue_number, title: ci.name }));
     }
     // A previously downloaded row is 'done' — and queueIssues refuses to queue
-    // done rows, which would strand the issue with its files already deleted.
-    // Reset status/file_path first (and delete that file too: a downloader-
-    // written file may not have a library_files row yet).
-    for (const p of clearIssuesForRedownload(db, ids)) {
-      try { await fsp.unlink(p); } catch { /* already gone */ }
-      const side = sidecarPath(p);
-      if (side !== p) await fsp.unlink(side).catch(() => {});
-    }
+    // done rows. Reset status/file_path first (in-flight rows are left alone).
+    clearIssuesForRedownload(db, ids);
     queueIssues(db, ids);
     startDownloads(ids);
     res.json({ queued: ids.length });
@@ -1212,9 +1305,6 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   // Alternative search names for a volume (indexers that name it differently).
   app.post('/api/collection/:id/aliases', (req, res) => res.json(setAliases(Number(req.params.id), req.body?.aliases ?? '')));
 
-  // Try ComicVine keys without saving them (the Settings Test button).
-  app.post('/api/cv/test', async (req, res) => res.json(await testCvKeys(req.body?.keys)));
-
   // Built-in metadata service: registration status + live round-trip test.
   // Provisions the instance key if this install doesn't have one yet (that IS
   // the registration), then proves it with a real authenticated search.
@@ -1224,7 +1314,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
       // Live config when already in hosted mode so a provisioned key PERSISTS
       // (the persistence guard ignores clones); a clone only when the user is
       // on ComicVine-direct and just probing the built-in service.
-      const cv = makeCvClient(config.metadataSource === 'comicvine' ? { ...config, metadataSource: 'hosted' } : config);
+      const cv = makeCvClient(config.metadataSource !== 'hosted' ? { ...config, metadataSource: 'hosted' } : config);
       await cv.search('batman');
       const tail = String(config.metadataInstanceKey || '').slice(-6);
       res.json({ ok: true, registered: true, message: `Registered and responding — instance key …${tail}` });
@@ -1236,6 +1326,11 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
       });
     }
   });
+
+  // Metadata providers (built-in + plugin-registered) for Settings → Metadata,
+  // and a Test button that proves one with the unsaved form values.
+  app.get('/api/metadata/providers', (req, res) => res.json(metadataProviders()));
+  app.post('/api/metadata/providers/test', async (req, res) => res.json(await testMetadataProvider(req.body || {})));
 
   // ---- Manual multi-source search + grab (per issue) ----
   // Queries every enabled source that supports it; a pick is pinned to the issue
@@ -1252,22 +1347,6 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     res.json(r);
   });
 
-  // ---- Manual usenet search + grab (per issue) — legacy, superseded by /api/search ----
-  app.post('/api/usenet/search', async (req, res) => res.json(await usenetSearch(req.body || {})));
-  app.post('/api/usenet/grab', async (req, res) => {
-    const b = req.body || {};
-    if (!b.nzbUrl || !b.seriesId || !b.cvIssueId) return res.status(400).json({ error: 'seriesId, cvIssueId and nzbUrl required' });
-    res.json(await usenetGrab(b));
-  });
-
-  // ---- Manual torrent PACK search + grab (per series) ----
-  app.post('/api/torrent/search', async (req, res) => res.json(await torrentSearch(req.body || {})));
-  app.post('/api/torrent/grab-pack', async (req, res) => {
-    const b = req.body || {};
-    if (!b.downloadUrl || !b.seriesId) return res.status(400).json({ error: 'seriesId and downloadUrl required' });
-    res.json(await torrentGrabPack(b));
-  });
-
   // ---- Multi-source PACK search + grab (per series) ----
   app.post('/api/packs/search', async (req, res) => res.json(await searchPacks(req.body || {})));
   app.post('/api/packs/grab', async (req, res) => {
@@ -1281,10 +1360,22 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   // at 320k series) — cache per visibility for a minute; it's a dashboard, not
   // a live feed, and recomputing it per visit blocked the event loop.
   const statsCache = new Map(); // includeRestricted → { at, data }
+  // Stale-while-revalidate: an expired entry is still served at once, and the
+  // recompute runs after the response has gone out.
   app.get('/api/stats', (req, res) => {
     const inclR = canRestricted(req);
     const hit = statsCache.get(inclR);
-    if (hit && Date.now() - hit.at < 60_000) return res.json(hit.data);
+    if (hit) {
+      res.json(hit.data);
+      if (Date.now() - hit.at >= 60_000 && !hit.refreshing) {
+        hit.refreshing = true;
+        setImmediate(() => {
+          try { statsCache.set(inclR, { at: Date.now(), data: stats({ includeRestricted: inclR }) }); }
+          catch { hit.refreshing = false; }
+        });
+      }
+      return;
+    }
     const data = stats({ includeRestricted: inclR });
     statsCache.set(inclR, { at: Date.now(), data });
     res.json(data);
@@ -1536,7 +1627,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     const seriesId = Number(req.body?.seriesId);
     const number = String(req.body?.number ?? '');
     const s = getSeriesById(db, seriesId);
-    if (!s?.cv_id) return res.status(400).json({ error: 'series not matched to ComicVine' });
+    if (!s?.cv_id) return res.status(400).json({ error: 'series not matched to a metadata record' });
     const want = normalizeNumber(number);
     const find = () => listCvIssues(db, s.cv_id).find((x) => normalizeNumber(x.issue_number) === want);
     let ci = find();
@@ -1546,7 +1637,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
       try { await refreshVolume(seriesId); } catch { /* the message below explains */ }
       ci = find();
     }
-    if (!ci) return res.status(404).json({ error: `issue #${number} isn't listed on ComicVine yet — try again in a day or two` });
+    if (!ci) return res.status(404).json({ error: `this issue isn't listed at the metadata source yet — try again in a day or two (#${number})` });
     const id = ensureCvIssueRow(db, { seriesId, cvIssueId: ci.comicvine_id, number: ci.issue_number, title: ci.name });
     setIssueWants(db, seriesId, [ci.comicvine_id], true, { reason: 'release', userId: req.user?.id ?? null });
     queueIssues(db, [id]);
@@ -1563,6 +1654,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
       userFollowedOnly: !!b.followed, hideUnreleased: !!b.hideUnreleased,
       search: String(b.q || '').trim(),
       userId: req.user?.id ?? 0, // "download all my Following" respects the caller's stars
+      includeRestricted: canRestricted(req), // only what the caller's Wanted list shows
     });
     const ids = [];
     const bySeries = new Map();
@@ -1606,24 +1698,54 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   // age — staleness only triggers a background refresh on the worker. Combined
   // with the boot-time pre-warm below, an interactive request never waits on a
   // count recompute; the TTL is just the refresh cadence for the badges.
-  const countsFor = (opts) => {
-    const key = JSON.stringify([opts.userId, opts.includeRestricted, opts.library ?? null, opts.search || '',
-      opts.filter || 'all', opts.restrictIds || null, opts.collectionsOnly || false, opts.ws || null]);
-    const hit = countsCache.get(key);
+  const swrGet = (cache, key, compute) => {
+    const hit = cache.get(key);
     if (hit) {
       if (Date.now() - hit.at >= COUNTS_TTL_MS && !hit.refreshing) {
         hit.refreshing = true;
-        computeCounts(opts)
-          .then((v) => countsCache.set(key, { at: Date.now(), promise: Promise.resolve(v) }))
+        compute()
+          .then((v) => cache.set(key, { at: Date.now(), promise: Promise.resolve(v) }))
           .catch(() => { hit.refreshing = false; }); // keep serving stale; retry next hit
       }
       return hit.promise;
     }
-    const promise = computeCounts(opts);
-    promise.catch(() => countsCache.delete(key)); // never cache a failure
-    if (countsCache.size > 200) countsCache.clear(); // search/facet keys are unbounded — cap crudely
-    countsCache.set(key, { at: Date.now(), promise });
+    const promise = compute();
+    promise.catch(() => cache.delete(key)); // never cache a failure
+    if (cache.size > 200) cache.clear(); // search/facet keys are unbounded — cap crudely
+    cache.set(key, { at: Date.now(), promise });
     return promise;
+  };
+  const countsFor = (opts) => {
+    const key = JSON.stringify([opts.userId, opts.includeRestricted, opts.library ?? null, opts.search || '',
+      opts.filter || 'all', opts.restrictIds || null, opts.excludeIds || null, opts.collectionsOnly || false, opts.excludeSelfDescribed || false, opts.ws || null]);
+    return swrGet(countsCache, key, () => computeCounts(opts));
+  };
+  // A facet selection's answer, from the first collection filter that claims
+  // it; later resolvers aren't run. A resolver returns the matching series ids
+  // (an array), or { excludeIds } = "the whole scope except these" — far
+  // smaller for "unread" in a big library than listing every match.
+  const facetIds = (selection, ctx) => {
+    for (const f of registeredCollectionFilters()) {
+      let r = null;
+      try { r = f.resolve(selection, { ...ctx, canExclude: true }); } catch { /* resolver failed: not ours */ }
+      if (Array.isArray(r)) return { restrictIds: r };
+      if (r && Array.isArray(r.excludeIds)) return { excludeIds: r.excludeIds };
+    }
+    return null;
+  };
+  // The A-Z rail's offsets come from the same count pass as the chips, so they
+  // run on the worker behind the same stale-while-revalidate cache.
+  const jumpCache = new Map();
+  const jumpFor = (opts) => {
+    const key = JSON.stringify([opts.letter ? String(opts.letter).toUpperCase().slice(0, 1) : '*', opts.userId, opts.includeRestricted,
+      opts.library ?? null, opts.search || '', opts.filter || 'all', opts.restrictIds || null, opts.excludeIds || null, opts.collectionsOnly || false, opts.ws || null]);
+    const compute = async () => {
+      const { sql, params } = opts.letter ? collectionJumpQuery(opts) : collectionBucketsQuery(opts);
+      const off = workerGetRow(sql, params);
+      const row = off ? await off : db.prepare(sql).get(params);
+      return opts.letter ? { offset: jumpOffsetFromRow(row) } : bucketsFromRow(row);
+    };
+    return swrGet(jumpCache, key, compute);
   };
   // Pre-warm a user's per-library counts the moment they ping /api/status (the
   // first thing every client does), so by the time they click into a library
@@ -1652,12 +1774,8 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     // null (no restriction); a selection matching nothing → [] (no rows).
     if (req.query.facet) {
       try {
-        const selection = JSON.parse(req.query.facet);
-        const ctx = { db, userId: req.user.id, includeRestricted: opts.includeRestricted, library: opts.library };
-        const ids = registeredCollectionFilters()
-          .map((f) => { try { return f.resolve(selection, ctx); } catch { return null; } })
-          .find((r) => Array.isArray(r));
-        if (ids) opts.restrictIds = ids;
+        const ids = facetIds(JSON.parse(req.query.facet), { db, userId: req.user.id, includeRestricted: opts.includeRestricted, library: opts.library });
+        if (ids) Object.assign(opts, ids);
       } catch { /* malformed facet param → ignore */ }
     }
     // Paginated shape ({ rows, total, counts }): filter/sort/search are pushed
@@ -1669,16 +1787,22 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
       const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 200));
       const offset = Math.max(0, Number(req.query.offset) || 0);
       const keys = req.query.counts === '0' ? [] : COLLECTION_CHIP_KEYS;
-      if (!keys.length) return res.json(collectionPage(db, { ...opts, keys: [], limit, offset }));
+      // native=1: comics and manga only, as the unpaged list gives the mobile
+      // apps. The reply says `native: true` so an app can tell this server
+      // honoured it (an older one would silently mix in books and audiobooks).
+      const native = req.query.native === '1';
+      if (native) opts.excludeSelfDescribed = true;
+      const mark = (body) => (native ? { ...body, native: true } : body);
+      if (!keys.length) return res.json(mark(collectionPage(db, { ...opts, keys: [], limit, offset })));
       try {
         // Rows synchronously (fast-path, ~10ms) while the heavy counts run on
         // the worker (or come from cache) — same fused response shape.
         const countsP = countsFor({ ...opts, keys });
         const page = collectionPage(db, { ...opts, keys: [], limit, offset });
         const { counts, total } = await countsP;
-        return res.json({ rows: page.rows, counts, total });
+        return res.json(mark({ rows: page.rows, counts, total }));
       } catch {
-        return res.json(collectionPage(db, { ...opts, keys, limit, offset })); // sync fallback
+        return res.json(mark(collectionPage(db, { ...opts, keys, limit, offset }))); // sync fallback
       }
     }
     // Legacy fused shape: the whole set + counts in one scan ({ rows, counts }),
@@ -1689,8 +1813,19 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     // ebook catalog (150k self-described entries) and OOM on the full set, so
     // restrict it to the native comic/manga libraries until the mobile clients
     // add pagination + ebook support. The web SPA always passes limit (above).
-    res.json(collectionSeries(db, { ...opts, excludeSelfDescribed: true }));
+    // The whole list is rebuilt only when the database has changed since the
+    // last build for this user and scope; repeat loads reuse the JSON.
+    const key = JSON.stringify([opts.userId, opts.includeRestricted, opts.library, opts.filter || '', opts.search || '', opts.sort || '', opts.restrictIds || null, opts.excludeIds || null, opts.collectionsOnly]);
+    const version = dbVersion(db);
+    let hit = mobileListCache.get(key);
+    if (!hit || hit.version !== version) {
+      hit = { version, body: JSON.stringify(collectionSeries(db, { ...opts, excludeSelfDescribed: true })) };
+      if (mobileListCache.size > 50) mobileListCache.clear();
+      mobileListCache.set(key, hit);
+    }
+    res.type('application/json').send(hit.body);
   });
+  const mobileListCache = new Map();
   // Per-filter counts for the library filter chips (independent of the active
   // filter, so switching chips doesn't change the badges). Accepts the same
   // facet/collections scope as /api/collection so the SPA can fetch counts in
@@ -1706,12 +1841,8 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     };
     if (req.query.facet) {
       try {
-        const selection = JSON.parse(req.query.facet);
-        const ctx = { db, userId: req.user.id, includeRestricted: opts.includeRestricted, library: opts.library };
-        const ids = registeredCollectionFilters()
-          .map((f) => { try { return f.resolve(selection, ctx); } catch { return null; } })
-          .find((r) => Array.isArray(r));
-        if (ids) opts.restrictIds = ids;
+        const ids = facetIds(JSON.parse(req.query.facet), { db, userId: req.user.id, includeRestricted: opts.includeRestricted, library: opts.library });
+        if (ids) Object.assign(opts, ids);
       } catch { /* malformed facet param → ignore */ }
     }
     try {
@@ -1721,19 +1852,52 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     }
   });
 
+  // Row offset of the first series in a letter's bucket, for the A-Z quick-jump
+  // rail. Same filter/search/library/facet scope as /api/collection, so the
+  // offset lands in the exact list the grid is showing. Only meaningful under
+  // the default title (A-Z) sort — the rail is hidden for other sorts.
+  app.get('/api/collection/jump', async (req, res) => {
+    const opts = {
+      letter: req.query.letter, filter: req.query.filter, search: req.query.search,
+      includeRestricted: canRestricted(req), userId: req.user.id,
+      library: req.query.library ? Number(req.query.library) : null,
+      collectionsOnly: req.query.collections === '1' || req.query.collections === 'true',
+      // fork: the A-Z rail's offsets must be computed inside the watch-state
+      // narrowing, or a letter jumps to the wrong row while ?ws= is on.
+      ws: WATCH_STATES.includes(String(req.query.ws || '')) ? String(req.query.ws) : null,
+    };
+    if (req.query.facet) {
+      try {
+        const ids = facetIds(JSON.parse(req.query.facet), { db, userId: req.user.id, includeRestricted: opts.includeRestricted, library: opts.library });
+        if (ids) Object.assign(opts, ids);
+      } catch { /* malformed facet param → ignore */ }
+    }
+    try {
+      res.json(await jumpFor(opts)); // one letter's offset, or all 26 at once (rail preload)
+    } catch {
+      res.json(req.query.letter ? { offset: 0 } : { '#': 0 });
+    }
+  });
+
   // ---- Explicit libraries (named containers with a behavior type) ----
-  // Viewing the list only needs library.view; mutations need library.manage
-  // (pinned in PERM_RULES). Deleting a library unassigns its series — files
+  // Viewing the list only needs library.view; creating, editing or deleting
+  // one needs settings.manage (see requiredPermission). Deleting a library unassigns its series — files
   // and series are never deleted here.
   // Libraries OWN the storage locations: the legacy rootFolders setting is
   // derived from their folders (first library = default filing target), so
   // every scan/filing code path keeps working unchanged.
+  // The default library's folders lead, so the legacy first-root fallback
+  // follows the chosen default rather than whichever library is listed first.
   const syncRootsFromLibraries = () => {
-    const folders = listLibraries(db).flatMap((l) => libraryFolders(l.root_folder));
+    const home = defaultLibrary(db)?.id;
+    const libs = listLibraries(db).sort((a, b) => (b.id === home) - (a.id === home));
+    const folders = libs.flatMap((l) => libraryFolders(l.root_folder));
     if (typeof saveSettings === 'function') saveSettings({ rootFolders: folders.join('\n') });
   };
   app.get('/api/libraries', (req, res) => res.json({
     libraries: listLibraries(db).filter((l) => !l.restricted || canRestricted(req)),
+    // Where new comic series land when nothing names a library.
+    defaultId: defaultLibrary(db)?.id ?? null,
     // Assignable types: the core pair + anything a plugin registered — the
     // Settings type selector is built from this, so a type only appears when
     // something actually implements its behavior.
@@ -1754,8 +1918,20 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
     try { const id = createLibrary(db, { name: req.body?.name, type: req.body?.type || 'comic', rootFolder: req.body?.rootFolder }); syncRootsFromLibraries(); kickLibraryScanners(id, req.body?.type); res.json({ id, libraries: listLibraries(db) }); }
     catch (e) { res.status(400).json({ error: String(e?.message || e) }); }
   });
+  // Registered before /:id, which would otherwise take 'order' as an id.
+  // Reorder: the sidebar, the Library page and every library list follow it.
+  app.post('/api/libraries/order', (req, res) => {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : null;
+    if (!ids) return res.status(400).json({ error: 'ids must be a list of library ids' });
+    reorderLibraries(db, ids);
+    res.json({ libraries: listLibraries(db), defaultId: defaultLibrary(db)?.id ?? null });
+  });
   app.post('/api/libraries/:id', (req, res) => {
-    try { updateLibrary(db, Number(req.params.id), { name: req.body?.name, type: req.body?.type, rootFolder: req.body?.rootFolder, folderPattern: req.body?.folderPattern, restricted: req.body?.restricted, sortOrder: req.body?.sortOrder, tagPlacement: req.body?.tagPlacement }); syncRootsFromLibraries(); const lib = listLibraries(db).find((l) => l.id === Number(req.params.id)); kickLibraryScanners(lib?.id, lib?.type); res.json({ libraries: listLibraries(db) }); }
+    try { updateLibrary(db, Number(req.params.id), { name: req.body?.name, type: req.body?.type, rootFolder: req.body?.rootFolder, folderPattern: req.body?.folderPattern, restricted: req.body?.restricted, sortOrder: req.body?.sortOrder, tagPlacement: req.body?.tagPlacement, metadataSources: req.body?.metadataSources }); syncRootsFromLibraries(); const lib = listLibraries(db).find((l) => l.id === Number(req.params.id)); kickLibraryScanners(lib?.id, lib?.type); res.json({ libraries: listLibraries(db) }); }
+    catch (e) { res.status(400).json({ error: String(e?.message || e) }); }
+  });
+  app.post('/api/libraries/:id/default', (req, res) => {
+    try { setDefaultLibrary(db, Number(req.params.id)); syncRootsFromLibraries(); res.json({ libraries: listLibraries(db), defaultId: defaultLibrary(db)?.id ?? null }); }
     catch (e) { res.status(400).json({ error: String(e?.message || e) }); }
   });
   app.delete('/api/libraries/:id', (req, res) => { const removed = deleteLibrary(db, Number(req.params.id)); syncRootsFromLibraries(); res.json({ removed, libraries: listLibraries(db) }); });
@@ -1807,7 +1983,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   // drops the locks so the next refresh restores source values.
   app.post('/api/collection/:id/metadata', (req, res) => {
     const series = getSeriesById(db, Number(req.params.id));
-    if (!series?.cv_id) return res.status(400).json({ error: 'not matched to ComicVine' });
+    if (!series?.cv_id) return res.status(400).json({ error: 'not matched to a metadata record' });
     if (req.body?.reset) { resetCvSeriesUser(db, series.cv_id); return res.json({ reset: true }); }
     res.json(updateCvSeriesUser(db, series.cv_id, req.body?.fields || {}));
   });
@@ -1872,20 +2048,20 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   });
   // Rename/move THIS series' files to the configured folder/file patterns.
   // { dryRun:true } returns the planned moves; otherwise it performs them.
-  app.post('/api/collection/:id/refile', (req, res) => {
+  app.post('/api/collection/:id/refile', async (req, res) => {
     const row = getSeriesById(db, Number(req.params.id));
     if (!row) return res.status(404).json({ error: 'no such series' });
-    if (!canRefile(row)) return res.status(400).json({ error: 'match this series to ComicVine first — its files can’t be organized without publisher/title/year' });
+    if (!canRefile(row)) return res.status(400).json({ error: 'match this series to a metadata record first — its files can’t be organized without publisher/title/year' });
     try {
-      if ((req.body || {}).dryRun) return res.json({ plan: planSeries(db, row) });
-      res.json(refileSeries(db, row));
+      if ((req.body || {}).dryRun) return res.json({ plan: await planSeries(db, row) });
+      res.json(await refileSeries(db, row));
     } catch (e) { res.status(500).json({ error: String(e?.message || e) }); }
   });
   // Library-wide reorganize (a manual maintenance tool — never automatic).
   // Execution is a background job: the POST starts it, the status endpoint
   // reports progress, and it also appears on the Jobs page.
-  app.get('/api/library/refile-plan', (req, res) => {
-    try { res.json(planLibrary(db)); } catch (e) { res.status(500).json({ error: String(e?.message || e) }); }
+  app.get('/api/library/refile-plan', async (req, res) => {
+    try { res.json(await planLibrary(db)); } catch (e) { res.status(500).json({ error: String(e?.message || e) }); }
   });
   app.post('/api/library/refile', (req, res) => {
     const r = runLibraryRefile();
@@ -2033,7 +2209,14 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   app.get('/api/cv', (req, res) => res.json(state.cv || { running: false }));
   app.get('/api/cv/search', async (req, res) => {
     try {
-      const results = await cvSearch(String(req.query.q || ''), { manga: req.query.manga === '1' });
+      // Search with the destination library's metadata sources: the one
+      // asked for, else the library of the series being matched, else the
+      // manga library for the manga lane, else the default library new
+      // series land in.
+      const manga = req.query.manga === '1';
+      const seriesLib = Number(req.query.seriesId) ? getSeriesById(db, Number(req.query.seriesId))?.library_id : null;
+      const libraryId = Number(req.query.libraryId) || seriesLib || (manga ? listLibraries(db).find((l) => l.type === 'manga')?.id : null) || defaultLibrary(db)?.id || null;
+      const results = await cvSearch(String(req.query.q || ''), { manga, libraryId });
       // Flag results already in the collection so the picker can gray them out
       // and link straight to the existing series (not just say so after an add).
       if (Array.isArray(results)) for (const v of results) {
@@ -2058,7 +2241,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   });
   app.post('/api/collection/add-cv', async (req, res) => {
     const comicvineId = Number(req.body?.comicvineId);
-    if (!comicvineId) return res.status(400).json({ error: 'comicvineId required' });
+    if (!comicvineId) return res.status(400).json({ error: 'a metadata record id is required' });
     // The issues that prompted this add, when the caller knows them (a list
     // row, a release, a CBL entry) — with the "only requested" setting on,
     // download-on-add is scoped to these instead of the whole volume.
@@ -2069,7 +2252,9 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
       // issues picked, so automation keeps after exactly what was asked for.
       // Otherwise it gets the "Monitor added series" default. An existing
       // series keeps whatever policy it has; the picks still land.
-      const r = await addFromCv(comicvineId, onlyRequested ? { monitor: 'none' } : {});
+      // Fetch through the destination library's metadata sources.
+      const destLibrary = Number(req.body?.libraryId) || (req.body?.manga ? listLibraries(db).find((l) => l.type === 'manga')?.id : null) || defaultLibrary(db)?.id || null;
+      const r = await addFromCv(comicvineId, { ...(onlyRequested ? { monitor: 'none' } : {}), libraryId: destLibrary });
       if (onlyRequested && r?.seriesId != null) {
         setIssueWants(db, r.seriesId, wanted, true, { reason: String(req.body?.reason || 'requested').slice(0, 64), userId: req.user.id });
         r.picked = wanted.length;
@@ -2124,7 +2309,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
   });
   app.post('/api/collection/:id/cv', async (req, res) => {
     const comicvineId = Number(req.body?.comicvineId);
-    if (!comicvineId) return res.status(400).json({ error: 'comicvineId required' });
+    if (!comicvineId) return res.status(400).json({ error: 'a metadata record id is required' });
     try { res.json(await cvSetManual(Number(req.params.id), comicvineId)); }
     catch (e) { res.status(502).json({ error: String(e?.message || e) }); }
   });
@@ -2133,7 +2318,7 @@ export function createApp({ db, runDownloads, prepareRedownload, runCvMatch, cvS
 
   app.post('/api/redownload', async (req, res) => {
     const ids = Array.isArray(req.body.issueIds) ? req.body.issueIds.map(Number) : [];
-    await prepareRedownload(ids); // delete old files + reset status to pending
+    await prepareRedownload(ids); // reset status to pending (old files stay until replaced)
     queueIssues(db, ids);
     startDownloads(ids);
     res.json({ queued: ids.length });

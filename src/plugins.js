@@ -15,6 +15,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import config from './config.js';
 import { SERIES_TYPES, SELF_DESCRIBED_TYPES } from './db.js';
+import { registerMetadataProvider } from './metadata.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PLUGINS_DIR = process.env.PLUGINS_DIR || path.join(root, 'plugins');
@@ -52,18 +53,35 @@ function linkCoreModules(dir) {
 // install them into the plugin folder once. Prebuilt-binary deps (sharp,
 // better-sqlite3) install without a compiler, so this works on the slim image.
 // Best-effort: a failure is logged and the plugin still loads (a dep it needs
-// will surface its own clear error).
-function ensurePluginDeps(dir, name) {
+// will surface its own clear error). A marker file written only after npm
+// succeeds tells a complete install from one an interrupted or failed npm left
+// half-written, which is retried on the next boot; the install is time-boxed
+// so an unreachable registry cannot hold boot forever.
+const DEPS_MARKER = '.backissue-deps-ok';
+const DEPS_TIMEOUT_MS = 5 * 60 * 1000;
+export function markDepsComplete(pluginDir) {
+  try { fs.writeFileSync(path.join(pluginDir, 'node_modules', DEPS_MARKER), new Date().toISOString()); }
+  catch { /* no node_modules: nothing was installed */ }
+}
+// Installed before the marker existed: every declared dependency resolves.
+function depsPresent(pluginDir, deps) {
+  return Object.keys(deps).every((d) => fs.existsSync(path.join(pluginDir, 'node_modules', d, 'package.json')));
+}
+export function ensurePluginDeps(dir, name, spawn = spawnSync) {
   try {
-    const pkgPath = path.join(dir, name, 'package.json');
+    const pdir = path.join(dir, name);
+    const pkgPath = path.join(pdir, 'package.json');
     if (!fs.existsSync(pkgPath)) return;
     const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
     if (!pkg.dependencies || !Object.keys(pkg.dependencies).length) return;
-    if (fs.existsSync(path.join(dir, name, 'node_modules'))) return; // already installed
+    if (fs.existsSync(path.join(pdir, 'node_modules', DEPS_MARKER))) return; // already installed
+    if (depsPresent(pdir, pkg.dependencies)) { markDepsComplete(pdir); return; }
     console.log(`Installing dependencies for plugin "${name}"…`);
-    const r = spawnSync('npm', ['install', '--omit=dev', '--no-audit', '--no-fund'],
-      { cwd: path.join(dir, name), stdio: 'inherit', shell: process.platform === 'win32' });
-    if (r.status !== 0) console.warn(`plugin "${name}": dependency install exited ${r.status}`);
+    const r = spawn('npm', ['install', '--omit=dev', '--no-audit', '--no-fund'],
+      { cwd: pdir, stdio: 'inherit', shell: process.platform === 'win32', timeout: DEPS_TIMEOUT_MS, killSignal: 'SIGKILL' });
+    if (r.status === 0) markDepsComplete(pdir);
+    else if (r.error?.code === 'ETIMEDOUT' || r.signal) console.warn(`plugin "${name}": dependency install did not finish within ${DEPS_TIMEOUT_MS / 60000} min (registry unreachable?), retrying next start`);
+    else console.warn(`plugin "${name}": dependency install exited ${r.status}${r.error ? ` (${r.error.message})` : ''}, retrying next start`);
   } catch (e) { console.warn(`plugin "${name}" dependency install failed:`, e?.message || e); }
 }
 
@@ -86,6 +104,42 @@ const remoteMediaSources = []; // { id, mediaType, label, listPage, materialize?
 const collectionFilters = []; // { id, resolve(selection, ctx) -> number[] } — resolve a Library facet selection to matching series ids (narrows /api/collection)
 const mediaHandlers = []; // { type, exts, file({ path, files, libraryId, hint, source, log }) -> { issueId, seriesId } } — files a downloaded book/audiobook into a plugin library
 const mediaListeners = []; // (event) => void — told when a media download lands or fails ({ event:'imported'|'failed', type, ref, … })
+// UI translations plugins contribute: lang → namespace → { key: message }.
+// Filled by api.registerMessages() and by plugins/<name>/locales/<lang>.json
+// (keys land under the plugin's own name). Core inlines English plus the
+// account's language into the served shell; see /api/i18n/plugins.
+const messageCatalogs = {};
+function mergeMessages(catalogs) {
+  if (!catalogs || typeof catalogs !== 'object') return;
+  for (const [lang, byNs] of Object.entries(catalogs)) {
+    if (!byNs || typeof byNs !== 'object' || !/^[a-z]{2,3}(-[a-z0-9]{2,8}){0,2}$/i.test(lang)) continue;
+    for (const [ns, messages] of Object.entries(byNs)) {
+      if (ns === '_shared') { // namespaces shared with core (permissions, jobs, notifications, …)
+        if (messages && typeof messages === 'object') mergeMessages({ [lang]: messages });
+        continue;
+      }
+      if (!messages || typeof messages !== 'object' || Array.isArray(messages)) continue;
+      const target = (messageCatalogs[lang] ??= {});
+      target[ns] = { ...(target[ns] || {}), ...messages };
+    }
+  }
+}
+// plugins/<name>/locales/<lang>.json → { lang: { <name>: messages } }.
+function loadPluginLocales(dir, name) {
+  const ldir = path.join(dir, name, 'locales');
+  let files = [];
+  try { files = fs.readdirSync(ldir).filter((f) => f.endsWith('.json')); } catch { return; }
+  for (const f of files) {
+    const lang = f.replace(/\.json$/, '');
+    try {
+      const { _shared, ...own } = JSON.parse(fs.readFileSync(path.join(ldir, f), 'utf8'));
+      // The plugin's own strings live under its name; _shared holds entries
+      // for namespaces the core UI reads by key or by English text
+      // (permissions, jobs, libraryTypes, notifications, plugins).
+      mergeMessages({ [lang]: { [name]: own, ...(_shared && typeof _shared === 'object' ? _shared : {}) } });
+    } catch (e) { console.warn(`plugin "${name}": could not read locales/${f}:`, e?.message || e); }
+  }
+}
 
 // Per-plugin catalog for the management page: everything discovered on disk,
 // loaded or not. name → { name, version, description, enabled, loaded, error, counts }.
@@ -172,6 +226,11 @@ export const pluginApi = {
   registerJob(job) {
     if (job?.id && typeof job.run === 'function') { jobs.push(job); bump('jobs'); }
   },
+  // UI strings for the plugin's own screens: { lang: { namespace: { key:
+  // message } } }, read on the client with api.t('namespace.key'). The simpler
+  // route is a locales/<lang>.json file per language next to index.js, which
+  // core picks up by itself under the plugin's name as namespace.
+  registerMessages(catalogs) { mergeMessages(catalogs); },
   // Front-end assets: js/css paths relative to the plugin's own directory. Core
   // serves them at /plugins/<name>/<path> and injects them into the page, where
   // the script wires its UI via window.BackIssue.
@@ -185,7 +244,9 @@ export const pluginApi = {
   // <label>" button that sends the browser to loginPath (a public plugin route
   // that starts the provider's flow). After the provider verifies the user, the
   // plugin's callback route calls req.app.locals.issueSession(...) to sign them
-  // in. { id, label, loginPath }.
+  // in. { id, label, loginPath, isEnabled?, getLabel? }. isEnabled() hides the
+  // button until the provider is set up; getLabel() reads the label live, so
+  // a renamed button needs no restart. Both are optional.
   registerAuthProvider(provider) {
     if (!provider?.id || !provider?.loginPath) return;
     if (authProviders.some((p) => p.id === provider.id)) return;
@@ -193,6 +254,8 @@ export const pluginApi = {
       id: String(provider.id),
       label: provider.label || String(provider.id),
       loginPath: String(provider.loginPath),
+      isEnabled: typeof provider.isEnabled === 'function' ? provider.isEnabled : null,
+      getLabel: typeof provider.getLabel === 'function' ? provider.getLabel : null,
       plugin: currentLoadingPlugin,
     });
   },
@@ -267,6 +330,11 @@ export const pluginApi = {
   // published_date,isbn_10,isbn_13,page_count,categories[],language,thumbnail}).
   // The ebooks plugin tries registered sources (by ascending `priority`, default
   // 100) BEFORE its built-in hosted fallback, so a lower number = preferred.
+  // A comic metadata provider (where series and issue data comes from) that
+  // the user can pick on Settings → Metadata. Contract in src/metadata.js.
+  registerMetadataProvider(provider) {
+    return registerMetadataProvider(provider, currentLoadingPlugin);
+  },
   registerBookMetadataSource(source) {
     if (!source?.id || typeof source.makeClient !== 'function') return;
     if (bookMetadataSources.some((s) => s.id === source.id)) return; // idempotent
@@ -275,8 +343,11 @@ export const pluginApi = {
   // A Library faceted-filter resolver. `resolve(selection, ctx)` turns the opaque
   // facet selection the Filters modal produced into an array of matching series
   // ids; core ANDs those into /api/collection so the real grid is narrowed.
-  // ctx = { db, userId, includeRestricted, library, type }. Return null/[] to
-  // apply no restriction (e.g. the selection is empty or not for this plugin).
+  // ctx = { db, userId, includeRestricted, library, type }. Return null to
+  // apply no restriction (e.g. the selection is empty or not for this plugin);
+  // [] matches nothing. When ctx.canExclude is set (cores that support it), a
+  // resolver may instead return { excludeIds: [...] }: everything in scope
+  // except those series — e.g. "unread" as the few books someone has started.
   registerCollectionFilter(filter) {
     if (!filter?.id || typeof filter.resolve !== 'function') return;
     if (collectionFilters.some((f) => f.id === filter.id)) return; // idempotent
@@ -364,12 +435,13 @@ export function registeredIndexerProviders() { return indexerProviders; }
 export function registeredRoutes() { return routes; }
 export function registeredJobs() { return jobs; }
 export function registeredClientAssets() { return clientAssets; }
+export function registeredMessages() { return messageCatalogs; }
+export function _resetMessagesForTests() { for (const k of Object.keys(messageCatalogs)) delete messageCatalogs[k]; }
 export function registeredPermissions() { return permissions; }
 export function registeredImportHandlers() { return importHandlers; }
 export function registeredLibraryScanners() { return libraryScanners; }
 export function registeredBookMetadataSources() { return [...bookMetadataSources].sort((a, b) => a.priority - b.priority); }
 export function registeredCollectionFilters() { return [...collectionFilters]; }
-export function registeredMediaHandlers() { return [...mediaHandlers]; }
 export function mediaHandlerFor(type) { return mediaHandlers.find((h) => h.type === String(type || '').toLowerCase()) || null; }
 export function registeredMediaListeners() { return [...mediaListeners]; }
 export function registeredRemoteMediaSources(mediaType) {
@@ -452,6 +524,7 @@ export async function loadPluginsFromDir(dir, api = pluginApi, disabled = [], ki
       }
       currentLoadingPlugin = name;
       try { await register(api); } finally { currentLoadingPlugin = null; }
+      loadPluginLocales(dir, name);
       info.loaded = true;
       loaded.push(name);
       console.log(`Loaded ${kind}: ${name}`);

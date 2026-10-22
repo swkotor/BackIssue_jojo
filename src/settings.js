@@ -3,12 +3,21 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import config from './config.js';
-import { registeredSettings } from './plugins.js';
+import { registeredSettings, registeredJobs } from './plugins.js';
+import { metadataSourceIds } from './metadata.js';
 import { hoursToCron } from './cron.js';
 
 // settings.json lives alongside the database in the writable data dir (config
 // resolves DATA_DIR), so a relocated/mounted data volume keeps settings too.
 const FILE = path.join(config.dataDir, 'settings.json');
+
+// Write settings.json whole or not at all: a crash mid-write must never leave
+// a torn file (which the next boot could not read).
+function writeSettingsFile(obj) {
+  const tmp = `${FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
+  fs.renameSync(tmp, FILE);
+}
 
 export const SETTING_FIELDS = {
   crawlConcurrency:    { type: 'int', min: 1, max: 16 },
@@ -37,10 +46,16 @@ export const SETTING_FIELDS = {
   cvBaseUrl:           { type: 'string', allowEmpty: true },
   // Where metadata comes from: the hosted BackIssue metadata service (zero
   // setup, cached + enriched) or ComicVine directly with the user's own key.
-  metadataSource:      { type: 'enum', values: ['hosted', 'comicvine'] },
+  metadataSource:      { type: 'enum', values: metadataSourceIds }, // built-ins + plugin providers
+  // The providers in use, best first ("hosted,bnf"); see metadata.js. Kept
+  // as typed so a plugin's id survives a boot where that plugin is absent;
+  // `metadataSource` mirrors its first entry for older readers.
+  metadataSources:     { type: 'string', allowEmpty: true },
   // Self-provisioned key for the hosted metadata service (issued on first
   // use; not user-facing).
   metadataInstanceKey: { type: 'string', allowEmpty: true },
+  metronUser:          { type: 'string', allowEmpty: true },
+  metronPass:          { type: 'string', allowEmpty: true },
   cvEnrich:            { type: 'bool' },
   cvEnrichDefaultApplied: { type: 'bool' },   // one-time: the default flipped on
   // One FlareSolverr for every source that needs to get past Cloudflare —
@@ -152,10 +167,25 @@ export const SETTING_FIELDS = {
   zeroDayAddNew:           { type: 'bool' },
 };
 
+// A plugin job's schedule lives in <base>Cron + <base>Enabled, named from its
+// scheduleKey ('shelvesRebuildHours' → shelvesRebuildCron/Enabled), the same
+// way the scheduler reads it. Declared here so a Jobs page edit persists
+// without each plugin registering the pair itself.
+export function jobScheduleFields() {
+  const out = {};
+  for (const job of registeredJobs()) {
+    if (!job?.scheduleKey) continue;
+    const base = String(job.scheduleKey).replace(/Hours$/, '');
+    out[base + 'Cron'] = { type: 'string', allowEmpty: true };
+    out[base + 'Enabled'] = { type: 'bool' };
+  }
+  return out;
+}
+
 // All settable fields: the core set plus any a plugin registered (e.g. a private
 // source's credentials). Recomputed each call so plugins loaded after import count.
 function allFields() {
-  return { ...SETTING_FIELDS, ...registeredSettings() };
+  return { ...SETTING_FIELDS, ...jobScheduleFields(), ...registeredSettings() };
 }
 
 export function currentSettings() {
@@ -178,12 +208,27 @@ export function validateSettings(input = {}) {
     } else if (spec.type === 'bool') {
       v = v === true || v === 'true' || v === 'on' || v === 1 || v === '1';
     } else if (spec.type === 'enum') {
-      if (!spec.values.includes(v)) continue;
+      const allowed = typeof spec.values === 'function' ? spec.values() : spec.values;
+      if (!allowed.includes(v)) continue;
     } else {
       v = String(v).trim();
       if (!v && !spec.allowEmpty) continue; // allowEmpty fields can be cleared
     }
     out[k] = v;
+  }
+  // The ordered list and the legacy single value describe the same choice:
+  // whichever arrives, keep the other in step (the list wins when both do).
+  if (out.metadataSources !== undefined) {
+    const ids = [];
+    for (const raw of out.metadataSources.split(',')) {
+      const id = raw.trim().toLowerCase();
+      if (/^[a-z0-9][a-z0-9_-]{0,31}$/.test(id) && !ids.includes(id)) ids.push(id);
+    }
+    out.metadataSources = ids.join(',');
+    const known = metadataSourceIds();
+    out.metadataSource = ids.find((id) => known.includes(id)) || 'hosted';
+  } else if (out.metadataSource !== undefined) {
+    out.metadataSources = out.metadataSource;
   }
   return out;
 }
@@ -194,7 +239,18 @@ export function applySettings(input) {
 }
 
 export function loadSettings() {
-  try { applySettings(JSON.parse(fs.readFileSync(FILE, 'utf8'))); } catch { /* first run */ }
+  let raw = null;
+  try { raw = fs.readFileSync(FILE, 'utf8'); } catch { /* first run: no file yet */ }
+  if (raw != null) {
+    try { applySettings(JSON.parse(raw)); } catch (e) {
+      // Unreadable (a hand-edit typo, a torn write from an older version).
+      // Starting on defaults is the only way to boot, and the next save will
+      // replace the file — so keep the original beside it first and say so.
+      const keep = `${FILE}.unreadable-${Date.now()}`;
+      try { fs.copyFileSync(FILE, keep); } catch { /* read-only data dir */ }
+      console.error(`settings.json could not be read (${e?.message || e}); starting on defaults. The original is saved as ${keep}.`);
+    }
+  }
   // The 'Library folder' setting was folded into 'Root folders'. Seed it from
   // the old value so existing libraries keep organizing correctly.
   if (!config.rootFolders && config.libraryDir) config.rootFolders = config.libraryDir;
@@ -237,7 +293,7 @@ export function loadSettings() {
       // instead of looking unset. Everything else on disk is left alone.
       try {
         const onDisk = JSON.parse(fs.readFileSync(FILE, 'utf8'));
-        if (!onDisk.flaresolverrUrl) fs.writeFileSync(FILE, JSON.stringify({ ...onDisk, flaresolverrUrl: config.flaresolverrUrl }, null, 2));
+        if (!onDisk.flaresolverrUrl) writeSettingsFile({ ...onDisk, flaresolverrUrl: config.flaresolverrUrl });
       } catch { /* first run, or a read-only data dir: memory is enough */ }
     }
   }
@@ -264,6 +320,6 @@ export function saveSettings(input) {
   // is already on disk so an unloaded plugin's settings survive until it's back.
   let onDisk = {};
   try { onDisk = JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch { /* first run: nothing to preserve */ }
-  fs.writeFileSync(FILE, JSON.stringify({ ...onDisk, ...currentSettings() }, null, 2));
+  writeSettingsFile({ ...onDisk, ...currentSettings() });
   return currentSettings();
 }

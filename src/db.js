@@ -11,6 +11,10 @@ export function initSchema(db) {
   //    server) retries for 5s instead of erroring SQLITE_BUSY immediately.
   db.pragma('synchronous = NORMAL');
   db.pragma('busy_timeout = 5000');
+  //  • journal_size_limit — after a big batch (a remote sync, a relink) the WAL
+  //    is truncated back to 64 MB at the next checkpoint instead of keeping
+  //    its peak size on disk for good.
+  db.pragma('journal_size_limit = 67108864');
   db.exec(`
     CREATE TABLE IF NOT EXISTS series (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -34,11 +38,9 @@ export function initSchema(db) {
     );
     CREATE INDEX IF NOT EXISTS idx_issues_series ON issues(series_id);
     CREATE INDEX IF NOT EXISTS idx_issues_status ON issues(status);
-    CREATE TABLE IF NOT EXISTS scan_overrides (
-      dir TEXT PRIMARY KEY,
-      series_id INTEGER NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
+    -- scan_overrides held folder → series picks for a scan report that no
+    -- released version ever wrote to; nothing reads it any more.
+    DROP TABLE IF EXISTS scan_overrides;
     -- A file assigned to a ComicVine issue by hand (its number could not be
     -- read, or was read wrongly). Keyed by path; every relink honours it.
     CREATE TABLE IF NOT EXISTS file_issue_overrides (
@@ -171,6 +173,13 @@ function migrate(db) {
     db.exec('ALTER TABLE series ADD COLUMN year TEXT');
   }
   const lf = db.prepare('PRAGMA table_info(library_files)').all().map((c) => c.name);
+  // Comic archives indexed as valid with no pages, from before page-less
+  // archives were flagged (2026-10-08): give them the verdict a scan now
+  // gives, so the issue counts as missing instead of owned-but-unreadable.
+  if (lf.includes('page_count') && lf.includes('error')) {
+    db.prepare(`UPDATE library_files SET valid=0, error='no pages — the archive contains no images'
+      WHERE valid=1 AND page_count=0 AND (lower(path) LIKE '%.cbz' OR lower(path) LIKE '%.cbr')`).run();
+  }
   if (lf.length && !lf.includes('series_id')) db.exec('ALTER TABLE library_files ADD COLUMN series_id INTEGER');
   if (lf.length && !lf.includes('issue_id')) db.exec('ALTER TABLE library_files ADD COLUMN issue_id INTEGER');
   if (lf.length && !lf.includes('cv_issue_id')) db.exec('ALTER TABLE library_files ADD COLUMN cv_issue_id INTEGER');
@@ -228,6 +237,10 @@ function migrate(db) {
   db.exec('DROP INDEX IF EXISTS idx_series_library');
   db.exec('CREATE INDEX IF NOT EXISTS idx_series_title ON series(title)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_series_type ON series(type)');
+  // Books keep their author in the publisher slot: OPDS "by author" and the
+  // author pages look series up by it. Publisher alone, not (type, publisher):
+  // the composite one drew text searches into walking every book through it.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_series_publisher ON series(publisher)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_series_followed ON series(followed) WHERE followed=1');
 
   // restrictedSeriesIds runs per request for non-mature roles (and on several
@@ -244,6 +257,12 @@ function migrate(db) {
   // Per-library tag placement override: null = global setting, 'embed' |
   // 'sidecar'. Sidecar keeps archives byte-identical (seeding/share-safe).
   if (libCols.length && !libCols.includes('tag_placement')) db.exec('ALTER TABLE libraries ADD COLUMN tag_placement TEXT');
+  // The library new comic series land in when nothing names one (Settings →
+  // Libraries). At most one row is flagged; none = the first comic library.
+  if (libCols.length && !libCols.includes('is_default')) db.exec('ALTER TABLE libraries ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0');
+  // Per-library metadata sources: an ordered list of provider ids like the
+  // app-wide metadataSources setting; null = use the app-wide list.
+  if (libCols.length && !libCols.includes('metadata_sources')) db.exec('ALTER TABLE libraries ADD COLUMN metadata_sources TEXT');
   const cvcols = db.prepare('PRAGMA table_info(cv_series)').all().map((c) => c.name);
   if (cvcols.length && !cvcols.includes('site_detail_url')) db.exec('ALTER TABLE cv_series ADD COLUMN site_detail_url TEXT');
   // ComicVine-provided alternative names (its `aliases` field, newline-separated).
@@ -278,6 +297,20 @@ function migrate(db) {
   // those columns — an edit survives any number of refreshes until reset.
   if (cvcols.length && !cvcols.includes('user_fields')) db.exec('ALTER TABLE cv_series ADD COLUMN user_fields TEXT');
   if (cvi.length && !cvi.includes('user_fields')) db.exec('ALTER TABLE cv_issues ADD COLUMN user_fields TEXT');
+  // Where a cached record comes from: meta_source names its catalog
+  // ('comicvine', 'mangadex', 'metron', or a plugin's), meta_ref the id that
+  // catalog itself uses (text: MangaDex and BnF ids are not numbers). The
+  // integer comicvine_id stays the row's key everywhere else; it no longer
+  // carries meaning. Metadata lookups route on meta_source (src/metadata.js).
+  for (const [table, have] of [['cv_series', cvcols], ['cv_issues', cvi]]) {
+    if (!have.length) continue;
+    if (!have.includes('meta_source')) db.exec(`ALTER TABLE ${table} ADD COLUMN meta_source TEXT`);
+    if (!have.includes('meta_ref')) db.exec(`ALTER TABLE ${table} ADD COLUMN meta_ref TEXT`);
+  }
+  // Stats counts the detailed rows of a cache that can run to hundreds of MB.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_cvissues_detail ON cv_issues(has_detail) WHERE has_detail=1');
+  migratePeopleIndex(db);
+  backfillBuiltinCatalogs(db);
   // Pack grabs (per-series or 0-day) carry a series_id (null = whole-collection
   // 0-day pack) and kind='pack'; individual-issue grabs stay kind='issue'.
   const grabCols = db.prepare('PRAGMA table_info(grabs)').all().map((c) => c.name);
@@ -312,13 +345,22 @@ function migrate(db) {
   // reading lists, requests and notifications can build on them. `followed`
   // is kept in sync (monitor != 'none') for plugins and the mobile apps.
   if (!cols.includes('monitor')) {
-    db.exec("ALTER TABLE series ADD COLUMN monitor TEXT NOT NULL DEFAULT 'none'");
-    // Existing installs: the old on/off flag maps 1:1 — automation never
-    // searched unfollowed series, so nothing that was fetched stops.
-    db.exec("UPDATE series SET monitor = CASE WHEN followed=1 THEN 'all' ELSE 'none' END");
+    // One transaction: the column's presence is what marks this migration
+    // done, so a crash between the ALTER and the backfill must not leave the
+    // column without the backfill (every followed series would read 'none').
+    db.transaction(() => {
+      db.exec("ALTER TABLE series ADD COLUMN monitor TEXT NOT NULL DEFAULT 'none'");
+      // Existing installs: the old on/off flag maps 1:1 — automation never
+      // searched unfollowed series, so nothing that was fetched stops.
+      db.exec("UPDATE series SET monitor = CASE WHEN followed=1 THEN 'all' ELSE 'none' END");
+    })();
   }
   if (!cols.includes('monitor_from')) db.exec('ALTER TABLE series ADD COLUMN monitor_from TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS idx_series_monitor ON series(monitor)');
+  // The monitored few among a huge catalog: with planner stats, the plain index
+  // above (two or three distinct values) loses to a full series scan; this
+  // partial one keeps the wanted_issues gate on an index walk.
+  db.exec("CREATE INDEX IF NOT EXISTS idx_series_monitored ON series(monitor) WHERE monitor IN ('all','new')");
   db.exec(`CREATE TABLE IF NOT EXISTS issue_picks (
     cv_issue_id INTEGER PRIMARY KEY,
     series_id INTEGER NOT NULL,
@@ -383,6 +425,78 @@ function migrate(db) {
   db.exec('DROP TABLE IF EXISTS tag_log');
 }
 
+// The id blocks the built-in catalogs mint into. Used ONCE per row, to give
+// records cached before meta_source existed their catalog (and, where the
+// number is the catalog's own id, their meta_ref). Plugin catalogs are filled
+// the same way after plugins load (metadata.js backfillPluginCatalogs).
+export const BUILTIN_CATALOG_RANGES = [
+  ['comicvine', 1, 10_000_000],
+  ['mangadex', 10_000_000, 1_000_000_000],
+  ['metron', 1_000_000_000, 1_100_000_000],
+];
+function backfillBuiltinCatalogs(db) {
+  for (const table of ['cv_series', 'cv_issues']) {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+    if (!cols.includes('meta_source')) continue;
+    // Rows still waiting for their catalog: normally none, so this partial
+    // index stays empty and the boot-time checks below cost nothing instead
+    // of a scan of the whole (hundreds of MB) cache.
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_${table}_nosource ON ${table}(comicvine_id) WHERE meta_source IS NULL`);
+    const pending = db.prepare(`SELECT 1 FROM ${table} WHERE meta_source IS NULL LIMIT 1`).get();
+    if (!pending) continue;
+    db.transaction(() => {
+      for (const [name, lo, hi] of BUILTIN_CATALOG_RANGES) {
+        db.prepare(`UPDATE ${table} SET meta_source=? WHERE meta_source IS NULL AND comicvine_id>=? AND comicvine_id<?`).run(name, lo, hi);
+      }
+      db.prepare(`UPDATE ${table} SET meta_ref=CAST(comicvine_id AS TEXT) WHERE meta_ref IS NULL AND meta_source='comicvine'`).run();
+      db.prepare(`UPDATE ${table} SET meta_ref=CAST(comicvine_id - 1000000000 AS TEXT) WHERE meta_ref IS NULL AND meta_source='metron'`).run();
+      // MangaDex's own id is the UUID in the record's page URL, when cached.
+      for (const r of db.prepare(`SELECT comicvine_id id, site_detail_url u FROM ${table} WHERE meta_ref IS NULL AND meta_source='mangadex' AND site_detail_url LIKE '%mangadex.org/%'`).all()) {
+        const m = String(r.u).match(/mangadex\.org\/(?:title|chapter)\/([0-9a-f-]{36})/i);
+        if (m) db.prepare(`UPDATE ${table} SET meta_ref=? WHERE comicvine_id=?`).run(m[1], r.id);
+      }
+    })();
+  }
+}
+
+/** The library a cached series or issue belongs to (through the series that
+ *  holds it), or null when no series in the library points at it. */
+export function libraryOfRecord(db, kind, id) {
+  try {
+    if (kind === 'issue') {
+      return db.prepare('SELECT s.library_id l FROM cv_issues i JOIN series s ON s.cv_id = i.cv_series_id WHERE i.comicvine_id=? AND s.library_id IS NOT NULL LIMIT 1').get(Number(id))?.l ?? null;
+    }
+    return db.prepare('SELECT library_id l FROM series WHERE cv_id=? AND library_id IS NOT NULL LIMIT 1').get(Number(id))?.l ?? null;
+  } catch { return null; }
+}
+
+/** A library's own metadata source list, or null when it uses the app-wide one. */
+export function librarySources(db, libraryId) {
+  if (libraryId == null) return null;
+  try { return db.prepare('SELECT metadata_sources s FROM libraries WHERE id=?').get(Number(libraryId))?.s || null; } catch { return null; }
+}
+
+/** The catalog a cached series or issue was recorded under, or null when the
+ *  row is unknown or predates any way to tell. kind: 'volume' | 'issue'. */
+export function recordedCatalog(db, kind, id) {
+  const table = kind === 'issue' ? 'cv_issues' : 'cv_series';
+  try { return db.prepare(`SELECT meta_source FROM ${table} WHERE comicvine_id=?`).get(Number(id))?.meta_source || null; }
+  catch { return null; }
+}
+
+/** Fill meta_source for rows still blank, using a classifier that knows every
+ *  registered catalog's id block (plugins included). Returns rows updated. */
+export function backfillCatalogs(db, classify) {
+  let n = 0;
+  for (const table of ['cv_series', 'cv_issues']) {
+    const rows = db.prepare(`SELECT comicvine_id id FROM ${table} WHERE meta_source IS NULL`).all();
+    if (!rows.length) continue;
+    const upd = db.prepare(`UPDATE ${table} SET meta_source=? WHERE comicvine_id=? AND meta_source IS NULL`);
+    db.transaction(() => { for (const r of rows) { const c = classify(r.id); if (c) n += upd.run(c, r.id).changes; } })();
+  }
+  return n;
+}
+
 export function openDb(dbPath) {
   const db = new Database(dbPath);
   initSchema(db);
@@ -406,17 +520,34 @@ export function upsertIssue(db, { seriesId, title, issueNumber = null, url }) {
   return db.prepare('SELECT id FROM issues WHERE url = ?').get(url).id;
 }
 
-export function listSeries(db, { search, includeRestricted = true } = {}) {
+// `limit`/`offset` page through the title order; the per-row issue count is a
+// correlated lookup, so a page never aggregates the whole catalog.
+export function listSeries(db, { search, includeRestricted = true, limit = null, offset = 0 } = {}) {
   const clauses = [];
-  if (search) clauses.push('s.title LIKE @q');
+  const params = {};
+  if (search) { clauses.push('s.title LIKE @q'); params.q = `%${search}%`; }
   if (!includeRestricted) clauses.push('s.restricted = 0');
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  let page = '';
+  if (limit != null) { page = 'LIMIT @limit OFFSET @offset'; params.limit = limit; params.offset = offset; }
   return db.prepare(
-    `SELECT s.*, COUNT(i.id) AS issue_count
-     FROM series s LEFT JOIN issues i ON i.series_id = s.id
+    `SELECT s.*, (SELECT COUNT(*) FROM issues i WHERE i.series_id = s.id) AS issue_count
+     FROM series s
      ${where}
-     GROUP BY s.id ORDER BY s.title`
-  ).all(search ? { q: `%${search}%` } : {});
+     ORDER BY s.title ${page}`
+  ).all(params);
+}
+
+// Candidate series for matching a comic FILE to its series by title: only the
+// columns the matcher reads, and only types that hold comic files (the large
+// self-described catalogs such as ebooks can never own a comic archive). The
+// type index is pinned: the planner's stats can't tell that comic rows are a
+// sliver of a catalog holding hundreds of thousands of books.
+export function seriesTitleCandidates(db, word) {
+  const types = SERIES_TYPES.filter((t) => !SELF_DESCRIBED_TYPES.has(t));
+  return db.prepare(
+    `SELECT id, title FROM series INDEXED BY idx_series_type WHERE type IN (${types.map(() => '?').join(',')}) AND title LIKE ?`
+  ).all(...types, `%${word}%`);
 }
 
 export function setSeriesRestricted(db, id, restricted) {
@@ -477,7 +608,7 @@ export function listLibraries(db) {
 export function getLibrary(db, id) {
   return db.prepare('SELECT * FROM libraries WHERE id=?').get(id);
 }
-export function updateLibrary(db, id, { name, type, rootFolder, folderPattern, restricted, sortOrder, tagPlacement } = {}) {
+export function updateLibrary(db, id, { name, type, rootFolder, folderPattern, restricted, sortOrder, tagPlacement, metadataSources } = {}) {
   const lib = getLibrary(db, id);
   if (!lib) throw new Error('unknown library');
   if (type != null && !SERIES_TYPES.includes(type)) throw new Error(`unknown series type "${type}"`);
@@ -489,6 +620,12 @@ export function updateLibrary(db, id, { name, type, rootFolder, folderPattern, r
     restricted !== undefined ? (restricted ? 1 : 0) : lib.restricted,
     sortOrder ?? lib.sort_order,
     tagPlacement !== undefined ? normPlacement(tagPlacement) : lib.tag_placement, id);
+  // Metadata sources: undefined = unchanged; null/'' = back to the app-wide
+  // list; otherwise an ordered list of provider ids (validated by the caller).
+  if (metadataSources !== undefined) {
+    const v = metadataSources == null ? '' : String(metadataSources).split(',').map((x) => x.trim().toLowerCase()).filter((x) => /^[a-z0-9][a-z0-9_-]{0,31}$/.test(x));
+    db.prepare('UPDATE libraries SET metadata_sources=? WHERE id=?').run(v.length ? [...new Set(v)].join(',') : null, id);
+  }
   // A type change re-types the members (the library defines their behavior).
   if (type != null && type !== lib.type) db.prepare('UPDATE series SET type=? WHERE library_id=?').run(type, id);
   // A restricted flag flip re-flags the members — they ride the existing
@@ -515,9 +652,32 @@ export function deleteLibrary(db, id) {
 // The library new series land in by default: the first comic-typed one (the
 // migration's "Comics"), else the first library at all, else none (pre-library
 // installs — the startup migration adopts later).
+// Types a default library may have: new series from Add, matching and imports
+// are comic metadata, so they belong in a comic or manga library.
+export const DEFAULT_LIBRARY_TYPES = ['comic', 'manga'];
 export function defaultLibrary(db) {
   const libs = db.prepare('SELECT * FROM libraries ORDER BY sort_order, id').all();
-  return libs.find((l) => l.type === 'comic') || libs[0] || null;
+  return libs.find((l) => l.is_default && DEFAULT_LIBRARY_TYPES.includes(l.type))
+    || libs.find((l) => l.type === 'comic') || libs[0] || null;
+}
+/** Make a library the default home for new comic series. */
+export function setDefaultLibrary(db, id) {
+  const lib = getLibrary(db, id);
+  if (!lib) throw new Error('unknown library');
+  if (!DEFAULT_LIBRARY_TYPES.includes(lib.type)) throw new Error('only a comic or manga library can be the default');
+  db.transaction(() => {
+    db.prepare('UPDATE libraries SET is_default=0 WHERE is_default=1').run();
+    db.prepare('UPDATE libraries SET is_default=1 WHERE id=?').run(id);
+  })();
+}
+/** Put libraries in the given order (the sidebar and every library list
+ *  follow it). Ids not named keep their relative order after the named ones. */
+export function reorderLibraries(db, ids) {
+  const want = [...new Set((ids || []).map(Number).filter(Number.isFinite))];
+  const all = db.prepare('SELECT id FROM libraries ORDER BY sort_order, id').all().map((r) => r.id);
+  const order = [...want.filter((id) => all.includes(id)), ...all.filter((id) => !want.includes(id))];
+  const set = db.prepare('UPDATE libraries SET sort_order=? WHERE id=?');
+  db.transaction(() => { order.forEach((id, i) => set.run(i + 1, id)); })();
 }
 
 // Move a series into a library (typing it accordingly), or out (null). A
@@ -573,22 +733,20 @@ export function isCvIssueRestricted(db, cvIssueId) {
  *  surface filters them.
  */
 export function issuesFeaturing(db, { kind, name, includeRestricted = false } = {}) {
-  const COLS = {
-    creator: [['credits', '$.name'], ['metron_credits', '$.creator']],
-    character: [['character_credits', '$.name'], ['metron_characters', '$.name']],
-    team: [['team_credits', '$.name'], ['metron_teams', '$.name']],
-  }[kind];
-  if (!COLS || !name) return [];
-  // One scan per column, unioned: json_each cannot span two arrays in one pass,
-  // and over ~42k rows each side answers in tens of milliseconds.
-  const sql = COLS.map(([col, path]) => `
+  if (!PEOPLE_SOURCES[kind] || !name) return [];
+  // Driven by the people index (kind, name); a CV-sourced role wins over a
+  // Metron one when both name the person. Until the index's first fill has
+  // finished, fall back to scanning the credit JSON of every issue.
+  const people = peopleIndexReady(db) ? 'cv_issue_people' : `(${peopleSelect('ci2', 'cv_issues ci2, ', [kind])})`;
+  const hitSql = `
       SELECT ci.comicvine_id AS cv_issue_id, ci.issue_number, ci.name AS title,
              ci.cover_date, ci.image_url, ci.cv_series_id,
-             ${col === 'credits' ? "json_extract(j.value,'$.role')" : col === 'metron_credits' ? "(SELECT group_concat(json_extract(r.value,'$.name'), ', ') FROM json_each(json_extract(j.value,'$.role')) r)" : 'NULL'} AS role
-        FROM cv_issues ci, json_each(ci.${col}) j
-       WHERE ci.${col} IS NOT NULL AND json_extract(j.value, '${path}') = @name`).join(' UNION ');
+             COALESCE(MAX(CASE WHEN p.src = 0 THEN p.role END), MAX(p.role)) AS role
+        FROM ${people} p JOIN cv_issues ci ON ci.comicvine_id = p.cv_issue_id
+       WHERE p.kind = @kind AND p.name = @name
+       GROUP BY ci.comicvine_id`;
   const rows = db.prepare(`
-    WITH hit AS (${sql})
+    WITH hit AS (${hitSql})
     SELECT h.cv_issue_id, h.issue_number, h.title, h.cover_date, h.image_url, h.role,
            s.id AS series_id, COALESCE(cs.name, s.title) AS series, s.year AS series_year,
            EXISTS (SELECT 1 FROM library_files lf WHERE lf.cv_issue_id = h.cv_issue_id AND lf.valid = 1) AS owned
@@ -602,8 +760,97 @@ export function issuesFeaturing(db, { kind, name, includeRestricted = false } = 
     // (843 is the busiest in a 42k-row library, and that grows as metadata is
     // filled in). Truncating silently would quietly lie about the collection;
     // the caller windows the list instead so the DOM stays small.
-    .all({ name: String(name), includeRestricted: includeRestricted ? 1 : 0 });
+    .all({ kind, name: String(name), includeRestricted: includeRestricted ? 1 : 0 });
   return rows.map((r) => ({ ...r, owned: !!r.owned }));
+}
+
+// Where each kind of person lives on a cv_issues row: [column, JSON path of
+// the name, source rank (0 = the primary catalog, 1 = enrichment)].
+const PEOPLE_SOURCES = {
+  creator: [['credits', '$.name', 0], ['metron_credits', '$.creator', 1]],
+  character: [['character_credits', '$.name', 0], ['metron_characters', '$.name', 1]],
+  team: [['team_credits', '$.name', 0], ['metron_teams', '$.name', 1]],
+};
+const PEOPLE_COLS = Object.values(PEOPLE_SOURCES).flat().map(([c]) => c);
+
+// SELECT of every (kind, name, issue, role, src) for the cv_issues row `row`
+// (NEW in a trigger; `ci` with from = 'cv_issues ci, ' for a backfill).
+// Malformed JSON and non-object entries are skipped rather than aborting the write.
+function peopleSelect(row, from = '', kinds = Object.keys(PEOPLE_SOURCES), extra = '') {
+  return kinds.flatMap((kind) => PEOPLE_SOURCES[kind].map(([col, path, src]) => {
+    const role = col === 'credits' ? "json_extract(j.value,'$.role')"
+      : col === 'metron_credits' ? "(SELECT group_concat(json_extract(r.value,'$.name'), ', ') FROM json_each(CASE WHEN json_type(j.value,'$.role') = 'array' THEN json_extract(j.value,'$.role') END) r)"
+      : 'NULL';
+    return `SELECT '${kind}' AS kind, json_extract(j.value, '${path}') AS name, ${row}.comicvine_id AS cv_issue_id, ${role} AS role, ${src} AS src
+      FROM ${from}json_each(CASE WHEN json_valid(${row}.${col}) THEN ${row}.${col} END) j
+     WHERE j.type = 'object' AND json_extract(j.value, '${path}') IS NOT NULL${extra ? ` AND ${extra}` : ''}`;
+  })).join(' UNION ALL ');
+}
+
+// cv_issue_people: one row per person credited on / appearing in an issue,
+// indexed by (kind, name) so a creator or character chip is a lookup. Triggers
+// keep it in step with every write to the credit columns, whatever the path.
+function migratePeopleIndex(db) {
+  const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cv_issue_people'").get();
+  const cvi = db.prepare('PRAGMA table_info(cv_issues)').all().map((c) => c.name);
+  if (!PEOPLE_COLS.every((c) => cvi.includes(c))) return;
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS cv_issue_people (
+      kind TEXT NOT NULL, name TEXT NOT NULL, cv_issue_id INTEGER NOT NULL, role TEXT, src INTEGER NOT NULL DEFAULT 0);
+    CREATE INDEX IF NOT EXISTS idx_people_kind_name ON cv_issue_people(kind, name);
+    CREATE INDEX IF NOT EXISTS idx_people_issue ON cv_issue_people(cv_issue_id);
+    DROP TRIGGER IF EXISTS trg_people_ins;
+    DROP TRIGGER IF EXISTS trg_people_upd;
+    DROP TRIGGER IF EXISTS trg_people_del;
+    CREATE TRIGGER trg_people_ins AFTER INSERT ON cv_issues BEGIN
+      INSERT INTO cv_issue_people (kind, name, cv_issue_id, role, src) ${peopleSelect('NEW')};
+    END;
+    CREATE TRIGGER trg_people_upd AFTER UPDATE OF ${PEOPLE_COLS.join(', ')}, comicvine_id ON cv_issues BEGIN
+      DELETE FROM cv_issue_people WHERE cv_issue_id = OLD.comicvine_id;
+      INSERT INTO cv_issue_people (kind, name, cv_issue_id, role, src) ${peopleSelect('NEW')};
+    END;
+    CREATE TRIGGER trg_people_del AFTER DELETE ON cv_issues BEGIN
+      DELETE FROM cv_issue_people WHERE cv_issue_id = OLD.comicvine_id;
+    END;`);
+  // First boot with the index: what's already cached is filled in afterwards,
+  // in the background (backfillPeopleIndex). The cursor row marks it pending.
+  db.exec('CREATE TABLE IF NOT EXISTS cv_issue_people_fill (next_id INTEGER)');
+  if (!exists) {
+    const lo = db.prepare('SELECT MIN(comicvine_id) AS lo FROM cv_issues').get().lo;
+    if (lo != null) db.prepare('INSERT INTO cv_issue_people_fill (next_id) VALUES (?)').run(lo - 1);
+  }
+}
+
+const peopleReady = new WeakSet();
+function peopleIndexReady(db) {
+  if (peopleReady.has(db)) return true;
+  let pending = true;
+  try { pending = !!db.prepare('SELECT 1 FROM cv_issue_people_fill').get(); } catch { /* no index on this db */ }
+  if (!pending) peopleReady.add(db);
+  return !pending;
+}
+
+// Fill the people index from issues cached before it existed: a few hundred
+// issues per transaction, yielding between them (a big catalog takes a while
+// and must not freeze the server). Resumes from its cursor after a restart.
+export async function backfillPeopleIndex(db, { chunk = 500 } = {}) {
+  const cursor = () => db.prepare('SELECT next_id FROM cv_issue_people_fill').get()?.next_id;
+  const insert = db.prepare(`INSERT INTO cv_issue_people (kind, name, cv_issue_id, role, src)
+    ${peopleSelect('ci', 'cv_issues ci, ', undefined, 'ci.comicvine_id > @lo AND ci.comicvine_id <= @hi')}`);
+  let from;
+  try { from = cursor(); } catch { return; }
+  while (from != null) {
+    const hi = db.prepare('SELECT MAX(comicvine_id) AS hi FROM (SELECT comicvine_id FROM cv_issues WHERE comicvine_id > ? ORDER BY comicvine_id LIMIT ?)').get(from, chunk).hi;
+    db.transaction(() => {
+      if (hi == null) { db.exec('DELETE FROM cv_issue_people_fill'); return; }
+      // Rows the triggers already wrote for this range are replaced, not doubled.
+      db.prepare('DELETE FROM cv_issue_people WHERE cv_issue_id > ? AND cv_issue_id <= ?').run(from, hi);
+      insert.run({ lo: from, hi });
+      db.prepare('UPDATE cv_issue_people_fill SET next_id=?').run(hi);
+    })();
+    from = hi;
+    await new Promise((r) => setImmediate(r));
+  }
 }
 
 export function listIssues(db, { seriesId, status } = {}) {
@@ -773,7 +1020,30 @@ export function recordImport(db, { seriesId = null, seriesTitle = null, issueTit
 // `queue_status` carries the in-flight state (queued/grabbed/failed…) when the
 // issue has already been sent for download, so the page can show a badge
 // instead of a Download button. `sort`: series | newest | oldest | most | fewest.
-export function listWantedIssues(db, { limit = 200, offset = 0, scope = 'wanted', sort = 'series', followedOnly = false, userFollowedOnly = false, hideUnreleased = false, releasedWithinDays = 0, search = '', includeRestricted = true, userId = 0 } = {}) {
+// The full-set COUNT behind the Wanted badge and pager is the expensive half of
+// a page, and the page re-polls every few seconds. The count is reused until
+// the database changes at all (a write on this connection or another one), so
+// it is never stale; a quiet library answers the poll from memory.
+const wantedTotals = new WeakMap(); // db → Map(key → { version, n })
+// Changes whenever anything is written to the database, by this connection or
+// another one: a cache keyed on it can never serve a stale answer.
+export function dbVersion(db) {
+  return `${db.pragma('data_version', { simple: true })}:${db.prepare('SELECT total_changes() AS t').get().t}`;
+}
+function wantedTotal(db, sql, args) {
+  let cache = wantedTotals.get(db);
+  if (!cache) { cache = new Map(); wantedTotals.set(db, cache); }
+  const version = dbVersion(db);
+  const key = sql + JSON.stringify(args);
+  const hit = cache.get(key);
+  if (hit && hit.version === version) return hit.n;
+  const n = db.prepare(sql).get(args).n;
+  if (cache.size > 100) cache.clear();
+  cache.set(key, { version, n });
+  return n;
+}
+
+export function listWantedIssues(db, { limit = 200, offset = 0, scope = 'wanted', sort = 'series', followedOnly = false, userFollowedOnly = false, hideUnreleased = false, releasedWithinDays = 0, search = '', includeRestricted = true, userId = 0, withTotal = true } = {}) {
   // Two DISTINCT "follow" systems meet here:
   //  - the monitoring policy (series.monitor, legacy `followed`) is GLOBAL —
   //    it is what the automation lanes and the RSS/announce watchers fetch, and
@@ -841,7 +1111,7 @@ export function listWantedIssues(db, { limit = 200, offset = 0, scope = 'wanted'
   // when the Following filter put it in the WHERE.
   const totalArgs = { ...args };
   if (!from.includes('@uid')) delete totalArgs.uid;
-  const total = db.prepare(`${cte}SELECT COUNT(*) n ${from}`).get(totalArgs).n;
+  const total = withTotal ? wantedTotal(db, `${cte}SELECT COUNT(*) n ${from}`, totalArgs) : null;
   const items = db.prepare(`${cte}SELECT s.id series_id, COALESCE(cv.name, s.title) series_title, s.monitor, s.monitor_from,
       EXISTS(SELECT 1 FROM user_follows uf WHERE uf.series_id = s.id AND uf.user_id = @uid) followed,
       cv.image_url series_cover,
@@ -900,6 +1170,16 @@ export function listFailedGrabs(db, { limit = 200, offset = 0 } = {}) {
   return { rows, total };
 }
 
+// Pack grabs an in-app source was downloading itself live only in that
+// process: after a restart nothing resumes them, so they would sit "active"
+// forever. Grabs handed to a download client (`clientSources`) are left for
+// the monitor, which picks them back up. Returns how many were failed.
+export function failInterruptedPackGrabs(db, clientSources = []) {
+  const ph = clientSources.map(() => '?').join(',');
+  return db.prepare(`UPDATE grabs SET status='failed', error='app restarted mid-run'
+    WHERE status='active' AND kind='pack'${clientSources.length ? ` AND source NOT IN (${ph})` : ''}`).run(...clientSources).changes;
+}
+
 export function setGrabStatus(db, id, status, { error = null, importedAt = null } = {}) {
   db.prepare(`UPDATE grabs SET status=?, error=?, imported_at=COALESCE(?, imported_at) WHERE id=?`)
     .run(status, error, importedAt, id);
@@ -936,20 +1216,6 @@ export function getSeriesById(db, id) {
 
 export function getSeriesByUrl(db, url) {
   return db.prepare('SELECT * FROM series WHERE url = ?').get(url);
-}
-
-// Manual scanner match overrides: a library folder -> catalog series link that
-// survives re-scans (from the "Fix match" control).
-export function setScanOverride(db, dir, seriesId) {
-  db.prepare("INSERT INTO scan_overrides (dir, series_id, created_at) VALUES (?, ?, datetime('now')) ON CONFLICT(dir) DO UPDATE SET series_id=excluded.series_id, created_at=excluded.created_at")
-    .run(dir, seriesId);
-}
-export function getScanOverride(db, dir) {
-  const r = db.prepare('SELECT series_id FROM scan_overrides WHERE dir = ?').get(dir);
-  return r ? r.series_id : undefined;
-}
-export function clearScanOverride(db, dir) {
-  return db.prepare('DELETE FROM scan_overrides WHERE dir = ?').run(dir).changes;
 }
 
 // A file → ComicVine issue assignment made by hand. The scanner reads a
@@ -1009,12 +1275,15 @@ export function libraryStats(db) {
 // ebook files during a comic scan, whose walker only sees .cbz/.cbr).
 export function pruneLibraryFiles(db, seen, only = null) {
   const keep = seen instanceof Set ? seen : new Set(seen);
-  let n = 0;
+  const gone = [];
   for (const row of db.prepare('SELECT path FROM library_files').all()) {
     if (only && !only.test(row.path)) continue;
-    if (!keep.has(row.path)) { db.prepare('DELETE FROM library_files WHERE path=?').run(row.path); n++; }
+    if (!keep.has(row.path)) gone.push(row.path);
   }
-  return n;
+  // One transaction, not one commit per deleted row.
+  const del = db.prepare('DELETE FROM library_files WHERE path=?');
+  db.transaction(() => { for (const p of gone) del.run(p); })();
+  return gone.length;
 }
 
 // --- Collection (radar) ---
@@ -1151,7 +1420,7 @@ function collLeanCols(guard) {
 // A collection MEMBER = followed OR owns a valid file OR the caller personally
 // follows OR (self-described) has catalog issue rows. The optional scope narrows
 // by mature-visibility / library / search. Returns the WHERE fragment + its params.
-function membershipWhere({ guard, selfTypesLen, includeRestricted = true, library = null, search = '', restrictIds = null, collectionsOnly = false, excludeSelfDescribed = false, ws = null }) {
+function membershipWhere({ guard, selfTypesLen, includeRestricted = true, library = null, search = '', restrictIds = null, excludeIds = null, collectionsOnly = false, excludeSelfDescribed = false, ws = null }) {
   const sql = `WHERE (s.followed=1 OR COALESCE(lf.file_count, 0) > 0
            OR mf.series_id IS NOT NULL
            ${selfTypesLen ? `OR (${guard} AND COALESCE(iss.bc_total, 0) > 0)` : ''})
@@ -1159,12 +1428,14 @@ function membershipWhere({ guard, selfTypesLen, includeRestricted = true, librar
       ${includeRestricted ? '' : 'AND s.restricted = 0'}
       ${library != null ? 'AND s.library_id = @lib' : ''}
       ${restrictIds ? 'AND s.id IN (SELECT value FROM json_each(@restrictIds))' : ''}
+      ${excludeIds ? 'AND s.id NOT IN (SELECT value FROM json_each(@excludeIds))' : ''}
       ${collectionsOnly && selfTypesLen ? `AND ${guard} AND COALESCE(iss.bc_total, 0) >= 2` : ''}
       ${search ? 'AND (s.title LIKE @q OR cv.name LIKE @q OR cv.publisher LIKE @q)' : ''}
       ${ws ? `AND ${WATCH_STATE_WHERE[ws]}` : ''}`;
   const params = {
     ...(library != null ? { lib: library } : {}),
     ...(restrictIds ? { restrictIds: JSON.stringify(restrictIds) } : {}),
+    ...(excludeIds ? { excludeIds: JSON.stringify(excludeIds) } : {}),
     ...(search ? { q: `%${search}%` } : {}),
   };
   return { sql, params };
@@ -1199,7 +1470,11 @@ export const PUB_STATUS_SQL = `CASE
 const COLL_ORDERS = {
   title: 'ORDER BY title',
   added: 'ORDER BY id DESC',
-  missing: 'ORDER BY (cv_total - cv_owned) DESC, title',
+  // +title: the tie-break must not steer the planner onto idx_series_title.
+  // Without planner statistics it walked all of `series` through that index
+  // (a random lookup per row) for an order the index can't give anyway: 4x
+  // slower than a plain scan on a 320k-row catalog. Same order (no collation).
+  missing: 'ORDER BY (cv_total - cv_owned) DESC, +title',
   // Publication year, newest first — books/audiobooks carry it; nulls sort last.
   year: 'ORDER BY CAST(year AS INTEGER) DESC, title',
   'year-asc': 'ORDER BY (year IS NULL), CAST(year AS INTEGER) ASC, title',
@@ -1244,21 +1519,39 @@ function chipPredicateSql(filter, { guardOuter, seriesTypeList, params }) {
 // thread: better-sqlite3 is synchronous, and this is the app's heaviest read —
 // at 320k series it blocks the event loop for ~0.5-1s, stalling every other
 // request (pages, covers) behind it.
-export function buildCollCountSql({ keys = [], filter = 'all', search = '', includeRestricted = true, userId = null, library = null, restrictIds = null, collectionsOnly = false, ws = null } = {}) {
+export function buildCollCountSql({ keys = [], filter = 'all', search = '', includeRestricted = true, userId = null, library = null, restrictIds = null, excludeIds = null, collectionsOnly = false, excludeSelfDescribed = false, jumpLetter = null, buckets = false, ws = null } = {}) {
   const { selfTypes, params: selfParams, guard } = selfTypeGuard('s.');
   const { guard: guardOuter } = selfTypeGuard('');
   const seriesTypes = [...SERIES_TYPES];
   const stParams = {}; seriesTypes.forEach((t, i) => { stParams['ktype' + i] = t; });
   const seriesTypeList = seriesTypes.length ? seriesTypes.map((_, i) => '@ktype' + i).join(',') : `''`;
-  const mem = membershipWhere({ guard, selfTypesLen: selfTypes.length, includeRestricted, library, search, restrictIds, collectionsOnly, ws });
+  const mem = membershipWhere({ guard, selfTypesLen: selfTypes.length, includeRestricted, library, search, restrictIds, excludeIds, collectionsOnly, excludeSelfDescribed, ws });
   const params = { uid: userId ?? -1, ...selfParams, ...stParams, ...mem.params };
   const predCtx = { guardOuter, seriesTypeList, params };
+  // A-Z jump: `__total` becomes the count of matching members that sort before
+  // this letter — i.e. the row offset of the first title in its bucket, under
+  // the title sort's binary `ORDER BY title` (so `title < @jumpLetter` is exact).
+  // The caller only reads `__total`, so the chip selects are skipped.
+  const jump = jumpLetter ? ' AND title < @jumpLetter' : '';
+  if (jumpLetter) params.jumpLetter = jumpLetter;
+  // Buckets mode: one row of 26 offsets, A..Z, each the count of matching
+  // members sorting before that letter (same binary ORDER BY title as the jump).
+  // The A-Z rail fetches these once per scope so a click needs no round trip.
+  if (buckets) {
+    const gate = filter && filter !== 'all' ? `(${chipPredicateSql(filter, predCtx)}) AND ` : '';
+    const sels = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('')
+      .map((L) => `SUM(CASE WHEN ${gate}title < '${L}' THEN 1 ELSE 0 END) "${L}"`);
+    const sql = `WITH ${collCtes(libraryScopeSql(library))},
+      coll AS (${collLeanCols(guard)} ${COLL_JOINS} ${mem.sql})
+      SELECT ${sels.join(', ')} FROM coll`;
+    return { sql, params };
+  }
   const selects = keys.map((k) => k === 'all'
     ? `COUNT(*) "all"`
     : `SUM(CASE WHEN (${chipPredicateSql(k, predCtx)}) THEN 1 ELSE 0 END) "${k}"`);
   const totalSel = filter && filter !== 'all'
-    ? `SUM(CASE WHEN (${chipPredicateSql(filter, predCtx)}) THEN 1 ELSE 0 END) "__total"`
-    : `COUNT(*) "__total"`;
+    ? `SUM(CASE WHEN (${chipPredicateSql(filter, predCtx)})${jump} THEN 1 ELSE 0 END) "__total"`
+    : (jumpLetter ? `SUM(CASE WHEN 1${jump} THEN 1 ELSE 0 END) "__total"` : `COUNT(*) "__total"`);
   selects.push(totalSel);
   const sql = `WITH ${collCtes(libraryScopeSql(library))},
     coll AS (${collLeanCols(guard)} ${COLL_JOINS} ${mem.sql})
@@ -1279,6 +1572,37 @@ export function collCountRowToResult(keys, row) {
 function collCountPass(db, opts = {}) {
   const { sql, params } = buildCollCountSql(opts);
   return collCountRowToResult(opts.keys || [], db.prepare(sql).get(params) || {});
+}
+
+// Row offset of the first series in a letter's bucket, within the current
+// filter/search/library scope — so the A-Z rail can scroll straight to it. The
+// letter is an uppercase A-Z; the '#' bucket (digits/symbols) is offset 0, which
+// the caller handles without asking. Matches the title sort's binary ordering.
+export function collectionJumpOffset(db, { letter, ...opts } = {}) {
+  if (!letter) return 0;
+  const { sql, params } = collectionJumpQuery({ letter, ...opts });
+  return jumpOffsetFromRow(db.prepare(sql).get(params));
+}
+// The SQL behind collectionJumpOffset / collectionBuckets, and their row
+// mappers, so the server can run them on the count worker.
+export function collectionJumpQuery({ letter, ...opts } = {}) {
+  return buildCollCountSql({ ...opts, keys: [], jumpLetter: String(letter).toUpperCase().slice(0, 1) });
+}
+export const jumpOffsetFromRow = (row) => Number(row?.__total) || 0;
+
+// Every letter's row offset in one query, for the A-Z rail: { '#': 0, A, B, …Z }.
+// '#' (digits/symbols) is always the first bucket at 0.
+export function collectionBuckets(db, opts = {}) {
+  const { sql, params } = collectionBucketsQuery(opts);
+  return bucketsFromRow(db.prepare(sql).get(params));
+}
+export function collectionBucketsQuery(opts = {}) {
+  return buildCollCountSql({ ...opts, keys: [], buckets: true });
+}
+export function bucketsFromRow(row) {
+  const out = { '#': 0 };
+  for (const L of 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') out[L] = Number(row?.[L]) || 0;
+  return out;
 }
 
 // Hydrate the full row shape for a bounded, ordered list of series ids — the
@@ -1443,7 +1767,7 @@ export function collectionPage(db, { keys = [], filter = 'all', limit = null, of
     const rows = filter && filter !== 'all' ? all.filter((r) => seriesMatchesFilter(r, filter)) : all;
     return { rows, counts, total: rows.length };
   }
-  const { search = '', sort = 'title', includeRestricted = true, userId = null, library = null, restrictIds = null, collectionsOnly = false, ws = null } = opts;
+  const { search = '', sort = 'title', includeRestricted = true, userId = null, library = null, restrictIds = null, excludeIds = null, collectionsOnly = false, excludeSelfDescribed = false, ws = null } = opts;
   const cap = Math.max(1, Math.min(500, Number(limit) || 200));
   const off = Math.max(0, Number(offset) || 0);
   // Chip counts + this filter's total, one lean pass — but ONLY when chips are
@@ -1451,7 +1775,7 @@ export function collectionPage(db, { keys = [], filter = 'all', limit = null, of
   // scan (the total/counts don't change between pages of the same filter, and the
   // client already holds them). total is null then; the client keeps page 1's.
   const { counts, total } = keys.length
-    ? collCountPass(db, { keys, filter, search, includeRestricted, userId, library, restrictIds, collectionsOnly, ws })
+    ? collCountPass(db, { keys, filter, search, includeRestricted, userId, library, restrictIds, excludeIds, collectionsOnly, excludeSelfDescribed, ws })
     : { counts: {}, total: null };
   // Select the page's ids in sort order (lean scan), then hydrate the full shape.
   const { selfTypes, params: selfParams, guard } = selfTypeGuard('s.');
@@ -1459,7 +1783,7 @@ export function collectionPage(db, { keys = [], filter = 'all', limit = null, of
   const seriesTypes = [...SERIES_TYPES];
   const stParams = {}; seriesTypes.forEach((t, i) => { stParams['ktype' + i] = t; });
   const seriesTypeList = seriesTypes.length ? seriesTypes.map((_, i) => '@ktype' + i).join(',') : `''`;
-  const mem = membershipWhere({ guard, selfTypesLen: selfTypes.length, includeRestricted, library, search, restrictIds, collectionsOnly, ws });
+  const mem = membershipWhere({ guard, selfTypesLen: selfTypes.length, includeRestricted, library, search, restrictIds, excludeIds, collectionsOnly, excludeSelfDescribed, ws });
   const idParams = { uid: userId ?? -1, ...selfParams, ...stParams, ...mem.params, lim: cap, off };
   const pred = chipPredicateSql(filter, { guardOuter, seriesTypeList, params: idParams });
   const orderBy = COLL_ORDERS[sort] || COLL_ORDERS.title;
@@ -1523,6 +1847,8 @@ export function collectionPage(db, { keys = [], filter = 'all', limit = null, of
         ${includeRestricted ? '' : 'AND s.restricted = 0'}
         ${libTerm}
         ${restrictIds ? 'AND s.id IN (SELECT value FROM json_each(@restrictIds))' : ''}
+        ${excludeIds ? 'AND s.id NOT IN (SELECT value FROM json_each(@excludeIds))' : ''}
+        ${excludeSelfDescribed && selfTypes.length ? `AND NOT (${guard})` : ''}
         ${search ? 'AND (s.title LIKE @q OR cv.name LIKE @q OR cv.publisher LIKE @q)' : ''}
         ${ws ? `AND ${WATCH_STATE_WHERE[ws]}` : ''}
         AND (${fastChipPred})
@@ -1790,15 +2116,19 @@ export function upsertCvSeries(db, v) {
     }
   }
   db.prepare(
-    `INSERT INTO cv_series (comicvine_id, name, publisher, start_year, count_of_issues, description, deck, image_url, site_detail_url, aliases, cached_at)
-     VALUES (@id, @name, @publisher, @start_year, @count_of_issues, @description, @deck, @image_url, @site_detail_url, @aliases, datetime('now'))
+    `INSERT INTO cv_series (comicvine_id, name, publisher, start_year, count_of_issues, description, deck, image_url, site_detail_url, aliases, meta_source, meta_ref, cached_at)
+     VALUES (@id, @name, @publisher, @start_year, @count_of_issues, @description, @deck, @image_url, @site_detail_url, @aliases, @meta_source, @meta_ref, datetime('now'))
      ON CONFLICT(comicvine_id) DO UPDATE SET
        name=excluded.name, publisher=excluded.publisher, start_year=excluded.start_year,
        count_of_issues=excluded.count_of_issues, description=excluded.description,
        deck=COALESCE(excluded.deck, cv_series.deck),
        image_url=excluded.image_url, site_detail_url=COALESCE(excluded.site_detail_url, cv_series.site_detail_url),
-       aliases=COALESCE(excluded.aliases, cv_series.aliases), cached_at=excluded.cached_at`
+       aliases=COALESCE(excluded.aliases, cv_series.aliases),
+       meta_source=COALESCE(cv_series.meta_source, excluded.meta_source),
+       meta_ref=COALESCE(cv_series.meta_ref, excluded.meta_ref),
+       cached_at=excluded.cached_at`
   ).run({
+    meta_source: v.meta_source ?? null, meta_ref: v.meta_ref != null ? String(v.meta_ref) : null,
     id: v.id, name: v.name ?? null, publisher: v.publisher ?? null,
     start_year: v.start_year != null ? String(v.start_year) : null,
     count_of_issues: v.count_of_issues ?? null, description: v.description ?? null, deck: v.deck ?? null,
@@ -1861,10 +2191,13 @@ export function upsertCvIssue(db, i) {
   const prev = db.prepare('SELECT issue_number, name, user_fields FROM cv_issues WHERE comicvine_id=?').get(i.id);
   const locked = userLockedFields(prev);
   db.prepare(
-    `INSERT INTO cv_issues (comicvine_id, cv_series_id, issue_number, name, cover_date, store_date, has_detail, cached_at)
-     VALUES (@id, @cv_series_id, @issue_number, @name, @cover_date, @store_date, @has_detail, datetime('now'))
+    `INSERT INTO cv_issues (comicvine_id, cv_series_id, issue_number, name, cover_date, store_date, has_detail, meta_source, meta_ref, cached_at)
+     VALUES (@id, @cv_series_id, @issue_number, @name, @cover_date, @store_date, @has_detail,
+             COALESCE(@meta_source, (SELECT meta_source FROM cv_series WHERE comicvine_id=@cv_series_id)), @meta_ref, datetime('now'))
      ON CONFLICT(comicvine_id) DO UPDATE SET
        cv_series_id=excluded.cv_series_id, issue_number=excluded.issue_number, name=excluded.name,
+       meta_source=COALESCE(cv_issues.meta_source, excluded.meta_source),
+       meta_ref=COALESCE(cv_issues.meta_ref, excluded.meta_ref),
        cover_date=COALESCE(cv_issues.cover_date, excluded.cover_date),
        store_date=COALESCE(cv_issues.store_date, excluded.store_date)`
   ).run({
@@ -1873,6 +2206,7 @@ export function upsertCvIssue(db, i) {
     name: locked.has('name') ? prev.name : (i.name ?? null),
     cover_date: i.cover_date ?? null, store_date: i.store_date ?? null,
     has_detail: i.has_detail ? 1 : 0,
+    meta_source: i.meta_source ?? null, meta_ref: i.meta_ref != null ? String(i.meta_ref) : null,
   });
   return i.id;
 }
@@ -2179,7 +2513,7 @@ export function mergeSeriesRows(db, keepId, dropId) {
     db.prepare('UPDATE issues SET series_id=? WHERE series_id=?').run(keepId, dropId);
     db.prepare('INSERT OR IGNORE INTO user_follows (user_id, series_id) SELECT user_id, ? FROM user_follows WHERE series_id=?').run(keepId, dropId);
     db.prepare('DELETE FROM user_follows WHERE series_id=?').run(dropId);
-    for (const t of ['grabs', 'scan_overrides', 'import_history', 'import_candidates', 'issue_picks']) {
+    for (const t of ['grabs', 'import_history', 'import_candidates', 'issue_picks']) {
       try { db.prepare(`UPDATE ${t} SET series_id=? WHERE series_id=?`).run(keepId, dropId); } catch { /* table or column absent */ }
     }
     db.prepare('DELETE FROM series WHERE id=?').run(dropId);
@@ -2356,11 +2690,6 @@ export function listQueue(db, limit = 200) {
   ).all(limit);
 }
 
-export function countQueue(db) {
-  return db.prepare(`SELECT COUNT(*) n FROM issues i
-     WHERE i.status IN ('queued','downloading','grabbed')`).get().n;
-}
-
 export function queuedCount(db) {
   return db.prepare("SELECT COUNT(*) n FROM issues WHERE status IN ('queued','downloading','grabbed','tagging')").get().n;
 }
@@ -2375,14 +2704,16 @@ export function cancelIssue(db, id) {
 }
 
 // Reset the given issues for re-download (even if 'done'): return their current
-// file paths (so the caller can delete the old files), then clear status to
-// 'pending' and forget the file path so the download writes the correct name.
+// file paths, then clear status to 'pending' and forget the file path. Issues
+// already in flight (downloading/tagging/grabbed) are left alone — resetting
+// them would start a second concurrent download while the first still imports.
+const IN_FLIGHT = "('downloading','tagging','grabbed')";
 export function clearIssuesForRedownload(db, ids) {
   if (!ids || !ids.length) return [];
   const ph = ids.map(() => '?').join(',');
-  const paths = db.prepare(`SELECT file_path FROM issues WHERE id IN (${ph})`)
+  const paths = db.prepare(`SELECT file_path FROM issues WHERE id IN (${ph}) AND status NOT IN ${IN_FLIGHT}`)
     .all(...ids).map((r) => r.file_path).filter(Boolean);
-  db.prepare(`UPDATE issues SET status='pending', file_path=NULL, error=NULL WHERE id IN (${ph})`).run(...ids);
+  db.prepare(`UPDATE issues SET status='pending', file_path=NULL, error=NULL WHERE id IN (${ph}) AND status NOT IN ${IN_FLIGHT}`).run(...ids);
   return paths;
 }
 

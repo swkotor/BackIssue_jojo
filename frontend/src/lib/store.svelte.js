@@ -2,9 +2,11 @@
 // source-enabled flags, and the long-running library ops (scan/tag/match).
 // Components render this; actions here mutate it.
 import { SvelteSet } from 'svelte/reactivity';
-import { apiGet, apiPost } from './api.js';
+import { apiGet, apiGetOk, apiPost, errorText } from './api.js';
 import { subscribe } from './events.svelte.js';
 import { notify } from './toasts.svelte.js';
+import { t } from './i18n.svelte.js';
+import { latestGuard } from './util.js';
 
 // rows holds the LOADED prefix of the collection (an infinite-scroll window that
 // grows as the user scrolls). total is the full count for the active filter — the
@@ -27,7 +29,9 @@ export function setLibrarySort(v) {
   } catch { /* the URL still carries it for this visit */ }
 }
 
-export const rail = $state({ rows: [], counts: {}, total: 0, filter: 'all', sort: 'title', search: '', library: null, facet: '', ws: '', collections: false, selecting: false, loaded: false, loadingMore: false });
+// error: why the last load failed ('' when it worked) — the page shows it
+// instead of an empty library, and keeps any rows it already had.
+export const rail = $state({ rows: [], counts: {}, buckets: {}, total: 0, filter: 'all', sort: 'title', search: '', library: null, facet: '', ws: '', collections: false, selecting: false, loaded: false, loadingMore: false, error: '' });
 // Rows per network page — a few hundred keeps each response a few hundred KB.
 const COLLECTION_PAGE = 200;
 // Shell chrome state (mobile sidebar overlay).
@@ -36,6 +40,11 @@ export const ui = $state({ sidebarOpen: false });
 export const railSelect = new SvelteSet();
 
 export const detail = $state({ series: null, det: null, failed: false });
+// Placeholder title while a series has no name yet (unmatched row, failed
+// load). A sentinel, not display copy: render it through seriesTitle(), which
+// swaps in the reader's wording.
+export const PLACEHOLDER_TITLE = 'Comic';
+export const seriesTitle = (s) => (s?.title === PLACEHOLDER_TITLE ? t('store.untitledSeries') : (s?.title || ''));
 // CV issue ids checked in the open series' issue list.
 export const detailSelected = new SvelteSet();
 
@@ -49,7 +58,70 @@ export const ops = $state({ scan: { running: false }, tag: { running: false }, c
 
 const OP_ENDPOINTS = { scan: '/api/scan-folder', tag: '/api/tag-files', cv: '/api/cv' };
 async function refreshOp(key) {
-  try { ops[key] = await apiGet(OP_ENDPOINTS[key]); } catch { /* keep last */ }
+  try { ops[key] = await apiGetOk(OP_ENDPOINTS[key]); } catch { /* keep last */ }
+}
+
+// Start a long-running op (scan/tag/match). The button shows it running at
+// once (optimistic until the next SSE tick); a refused or failed request
+// rolls that back and says why, rather than leaving the button spinning.
+// failKey is the catalog key for the toast ({error} is filled in).
+export async function startOp(key, url, body, { failKey, ...state } = {}) {
+  if (ops[key].running) return false;
+  ops[key] = { running: true, done: 0, total: 0, ...state };
+  let r;
+  try { r = await apiPost(url, body); } catch (e) { r = { error: errorText(e) }; }
+  if (!r?.error) return true;
+  ops[key] = { running: false };
+  notify(t(failKey, { error: r.error }), 'error');
+  refreshOp(key); // the server may in fact be running one (a 409 "already running")
+  return false;
+}
+
+// Rename one series' files to the configured folder/file pattern: dry-run
+// first to show the count and any collisions, then execute on confirm.
+// confirm is the dialog (passed in: the store has no UI of its own). Resolves
+// the result ({ moved, skipped }) or null when nothing ran.
+export async function refileSeries(id, title, confirm, onBusy = () => {}) {
+  let plan;
+  try {
+    const r = await apiPost(`/api/collection/${id}/refile`, { dryRun: true });
+    if (r?.error) throw new Error(r.error);
+    plan = r?.plan || [];
+  } catch (e) { notify(t('store.planRenameFailed', { error: e?.message || errorText(e) }), 'error'); return null; }
+  const moves = plan.filter((p) => p.status === 'move').length;
+  const collisions = plan.filter((p) => p.status === 'skip:collision').length;
+  if (!moves) {
+    notify(collisions ? t('store.nothingToDoCollide', { count: collisions }) : t('store.filesMatchPattern'), 'info');
+    return null;
+  }
+  if (!(await confirm({
+    title: t('store.renameTitle', { count: moves }),
+    message: t('store.renameMessage', { title: title || t('store.thisSeries'), collisions: collisions ? t('store.renameCollisions', { count: collisions }) : '' }),
+    confirmLabel: t('store.renameFiles'),
+  }))) return null;
+  onBusy(true);
+  let r;
+  try { r = await apiPost(`/api/collection/${id}/refile`, {}); } catch (e) { r = { error: errorText(e) }; }
+  onBusy(false);
+  if (r?.error) { notify(r.error, 'error'); return null; }
+  notify(t('store.renamed', { count: r.moved, skipped: r.skipped ? t('store.renamedSkipped', { count: r.skipped }) : '' }), 'ok');
+  return r;
+}
+
+// Attach a file to one of the series' issues, or clear a hand assignment
+// (cvIssueId null); the choice sticks through rescans. True when it worked;
+// failures are toasted, success toasts okMsg.
+export async function assignFileToIssue(seriesId, path, cvIssueId, okMsg = t('store.fileAssigned')) {
+  let r;
+  try { r = await apiPost(`/api/collection/${seriesId}/assign-file`, { path, cvIssueId }); } catch (e) { r = { error: errorText(e) }; }
+  if (r?.error) { notify(r.error, 'error'); return false; }
+  notify(okMsg, 'ok');
+  return true;
+}
+// One issue as an option in an "assign to issue" picker.
+export function issueChoice(i) {
+  const label = `#${i.number}${i.title && i.title !== '#' + i.number ? ' · ' + i.title : ''}`;
+  return i.owned ? t('store.choiceOwned', { label }) : label;
 }
 export function startOpsTracking() {
   for (const key of Object.keys(OP_ENDPOINTS)) refreshOp(key);
@@ -73,7 +145,7 @@ export async function loadFlags() {
     }
   } catch { /* offline */ }
   // Any enabled source (incl. plugins) → the issue "Search sources" button.
-  try { flags.anySource = ((await apiGet('/api/sources')).sources || []).length > 0; } catch { /* offline */ }
+  try { flags.anySource = ((await apiGetOk('/api/sources')).sources || []).length > 0; } catch { /* offline: keep last */ }
 }
 
 function collectionScope() {
@@ -87,8 +159,9 @@ function collectionScope() {
 // Load (or reload) the FIRST page of the collection — the server filters, sorts
 // and searches in SQL and returns just this page plus the total and the fused,
 // filter-independent chip counts. Called on every filter/sort/search/library
-// change (it resets the infinite-scroll window to the top). Best-effort; a
-// failure keeps the last good list and badges.
+// change (it resets the infinite-scroll window to the top). A failure keeps
+// the last good list and badges and sets rail.error, so the page can say the
+// load failed rather than show an empty library.
 let loadSeq = 0; // discards stale responses when the scope changes mid-flight
 export async function loadCollection() {
   rail.loadingMore = false; // cancel any in-flight append's effect from re-appending onto the old set
@@ -98,14 +171,21 @@ export async function loadCollection() {
   // ~3× the page query itself, so it must never block the first paint of the
   // grid. Until it lands, total falls back to the page size — loadMore resumes
   // once the real total arrives.
-  const countsReq = apiGet('/api/collection/counts?' + scope).catch(() => null);
+  const countsReq = apiGetOk('/api/collection/counts?' + scope).catch(() => null);
+  // A-Z rail offsets, preloaded in parallel so a letter click needs no round
+  // trip. Scope-dependent (filter/search/library), so refetched with each load.
+  const bucketsReq = apiGetOk('/api/collection/jump?' + scope).then((b) => b || {}).catch(() => null);
   try {
-    const r = await apiGet('/api/collection?counts=0&offset=0&limit=' + COLLECTION_PAGE + '&' + scope);
+    const r = await apiGetOk('/api/collection?counts=0&offset=0&limit=' + COLLECTION_PAGE + '&' + scope);
     if (seq !== loadSeq) return;
     rail.rows = r.rows || [];
     rail.total = r.total ?? rail.rows.length;
     rail.loaded = true;
-  } catch { /* keep the last good list */ }
+    rail.error = '';
+  } catch (e) {
+    if (seq !== loadSeq) return;
+    rail.error = errorText(e); // keep the last good list
+  }
   const c = await countsReq;
   if (c && seq === loadSeq) {
     rail.counts = c;
@@ -113,6 +193,8 @@ export async function loadCollection() {
     // filtered total (counts.all when no chip is active).
     if (typeof c[rail.filter] === 'number') rail.total = c[rail.filter];
   }
+  const b = await bucketsReq;
+  if (b && seq === loadSeq) rail.buckets = b;
 }
 
 // Fetch the next page and APPEND it — the infinite-scroll grid calls this as the
@@ -123,17 +205,68 @@ export async function loadMoreCollection() {
   if (rail.rows.length >= rail.total) return; // everything for this filter is loaded
   rail.loadingMore = true;
   const offset = rail.rows.length;
+  const seq = loadSeq, scope = collectionScope();
   try {
-    const r = await apiGet('/api/collection?counts=0&offset=' + offset + '&limit=' + COLLECTION_PAGE + '&' + collectionScope());
-    // Guard against a filter/sort change that landed while this was in flight:
-    // only append if our starting offset still matches the current tail.
+    const r = await apiGetOk('/api/collection?counts=0&offset=' + offset + '&limit=' + COLLECTION_PAGE + '&' + scope);
+    // Guard against a filter/sort/search change that landed while this was in
+    // flight: a reload (loadSeq) or a new scope means these rows belong to a
+    // list that is no longer on screen, even when the tail length matches.
+    if (seq !== loadSeq || scope !== collectionScope()) return;
     if (r.rows?.length && rail.rows.length === offset) rail.rows = [...rail.rows, ...r.rows];
-  } catch { /* keep what we have */ } finally { rail.loadingMore = false; }
+  } catch { /* keep what we have */ } finally { if (seq === loadSeq) rail.loadingMore = false; }
 }
 
-// Open a series by id: fetch the ComicVine-authoritative detail and derive the
-// header info from it (works for matched, unmatched, and error states).
+// Offset (row index) of the first series whose title starts with `letter`, in
+// the current filter/search/library scope — the server counts it in SQL so the
+// A-Z rail can scroll straight there. '#' is handled by the caller as 0.
+export async function collectionJumpOffset(letter) {
+  try {
+    const r = await apiGet('/api/collection/jump?letter=' + encodeURIComponent(letter) + '&' + collectionScope());
+    return Math.max(0, Number(r?.offset) || 0);
+  } catch { return 0; }
+}
+
+// Load pages until the loaded prefix reaches row `n` — the A-Z jump needs a
+// contiguous prefix up to the target, since the grid virtualizes a prefix from
+// row 0. Fetches the missing pages (500 rows each) in parallel, in bounded
+// waves, so a far jump is one round-trip's wait instead of several in series.
+// Aborts cleanly if the scope changes mid-run.
+export async function loadUpTo(n) {
+  if (!rail.loaded) return;
+  const PAGE = 500;
+  const WAVE = 8; // concurrent requests per wave — fast without flooding the server
+  const scope = collectionScope();
+  const target = Math.min(n + 1, rail.total);
+  const start = rail.rows.length;
+  if (start >= target) return;
+  const offsets = [];
+  for (let o = start; o < target; o += PAGE) offsets.push(o);
+  rail.loadingMore = true;
+  try {
+    for (let i = 0; i < offsets.length; i += WAVE) {
+      const batch = offsets.slice(i, i + WAVE);
+      const pages = await Promise.all(batch.map((o) =>
+        apiGet('/api/collection?counts=0&offset=' + o + '&limit=' + PAGE + '&' + scope)
+          .then((r) => r?.rows || null).catch(() => null)));
+      // A scope change (filter/sort/search) or a failed page → stop; keep the
+      // contiguous prefix we have rather than splicing a gap into it.
+      if (scope !== collectionScope() || pages.some((p) => p === null)) return;
+      const merged = pages.flat();
+      if (!merged.length) return;
+      // Only append if our tail still lines up with this wave's first offset.
+      if (rail.rows.length !== batch[0]) return;
+      rail.rows = [...rail.rows, ...merged];
+    }
+  } finally { rail.loadingMore = false; }
+}
+
+// Open a series by id: fetch the authoritative detail and derive the header
+// info from it (works for matched, unmatched, and error states). Only the
+// latest open lands: switching series while a big one is still loading must
+// not paint the slow one's issues under the new one's URL.
+const openSeq = latestGuard();
 export async function openVolume(id) {
+  const isLatest = openSeq();
   const sameSeries = detail.series && detail.series.id === Number(id);
   // Paint the header IMMEDIATELY from the library row we already hold — on a
   // slow device the fetch+parse of a big issue list takes a beat, and showing
@@ -145,7 +278,7 @@ export async function openVolume(id) {
     detail.failed = false;
     detail.series = {
       id: Number(id),
-      title: row ? (row.title || row.folder || 'Comic') : '',
+      title: row ? (row.title || row.folder || PLACEHOLDER_TITLE) : '',
       cover_url: row?.cover_url || null,
       publisher: row?.publisher || null,
       issue_count: row?.total || 0,
@@ -157,10 +290,14 @@ export async function openVolume(id) {
     detailSelected.clear();
   }
   let det = null;
-  try { det = await apiGet('/api/collection/' + id); } catch (e) { det = { error: String(e?.message || e || 'request failed') }; }
+  try { det = await apiGet('/api/collection/' + id); } catch (e) { det = { error: String(e?.message || e || t('store.requestFailed')) }; }
+  if (!isLatest()) return;
   if (!det || det.error) {
-    const reason = String(det?.error || 'no response');
-    detail.series = { id: Number(id), title: 'Comic' }; detail.det = null; detail.failed = true;
+    const reason = String(det?.error || t('store.noResponse'));
+    // A failed RE-load of the page already showing keeps what it shows (a
+    // poll during a server restart must not blank a working page).
+    if (sameSeries && detail.det && !/not found|404/i.test(reason)) return;
+    detail.series = { id: Number(id), title: PLACEHOLDER_TITLE }; detail.det = null; detail.failed = true;
     detail.notFound = /not found|404/i.test(reason); // a missing series reads differently from a dead server
     detail.failReason = reason;
     return;
@@ -169,7 +306,7 @@ export async function openVolume(id) {
   const cv = det.cv, sr = det.series || {};
   detail.series = {
     id: Number(id),
-    title: sr.title || (cv && cv.name) || 'Comic',
+    title: sr.title || (cv && cv.name) || PLACEHOLDER_TITLE,
     cover_url: sr.cover_url,
     publisher: sr.publisher,
     issue_count: cv ? cv.issue_count : (det.issues ? det.issues.length : 0),
@@ -237,6 +374,8 @@ export function patchIssueMeta(cvIssueId, meta) {
 // periodically so covers/titles fill in as the sweep caches them, stopping when
 // every issue has detail, progress stalls (sweep halted/failed), the user
 // navigates away, or a safety cap is hit.
+// Each tick schedules the next only once its reload has landed: a reload of
+// a 2,000-issue series can outlast the interval, and overlapping ones pile up.
 let sweepTimer = null;
 export function watchDetailSweep() {
   if (sweepTimer) return;
@@ -245,8 +384,8 @@ export function watchDetailSweep() {
   let lastMissing = Infinity;
   let stalls = 0;
   let ticks = 0;
-  sweepTimer = setInterval(async () => {
-    const stop = () => { clearInterval(sweepTimer); sweepTimer = null; };
+  const tick = async () => {
+    const stop = () => { sweepTimer = null; };
     if (!detail.series || detail.series.id !== seriesId) return stop();
     if (++ticks > 200) return stop(); // safety cap ≈ 13 min
     await reloadDetail();
@@ -255,14 +394,18 @@ export function watchDetailSweep() {
     if (missing >= lastMissing) { if (++stalls >= 5) return stop(); } // no progress → sweep ended
     else stalls = 0;
     lastMissing = missing;
-  }, 4000);
+    sweepTimer = setTimeout(tick, 4000);
+  };
+  sweepTimer = setTimeout(tick, 4000);
 }
 
 // Patch statuses in place during downloads without losing the user's checkboxes.
 export async function refreshIssueStatuses() {
   if (!detail.series || !detail.det?.issues) return;
+  const seriesId = detail.series.id;
   let issues;
-  try { issues = await apiGet(`/api/series/${detail.series.id}/issues`); } catch { return; }
+  try { issues = await apiGetOk(`/api/series/${seriesId}/issues`); } catch { return; }
+  if (!Array.isArray(issues) || detail.series?.id !== seriesId || !detail.det?.issues) return;
   const byId = new Map(issues.map((i) => [String(i.id), i]));
   for (const i of detail.det.issues) {
     const u = i.id != null ? byId.get(String(i.id)) : null;
@@ -280,8 +423,8 @@ export async function downloadCvIssues(cvIssueIds) {
   if (!ids.length || !detail.series) return;
   try {
     const r = await apiPost(`/api/collection/${detail.series.id}/download`, { cvIssueIds: ids });
-    if (r?.error) return notify('Download failed to queue: ' + r.error, 'error');
-  } catch { return notify('Download failed to queue — is the app reachable?', 'error'); }
+    if (r?.error) return notify(t('store.downloadFailed', { error: r.error }), 'error');
+  } catch { return notify(t('store.downloadFailedUnreachable'), 'error'); }
   refreshIssueStatuses();
 }
 
@@ -292,8 +435,8 @@ export async function redownloadCvIssues(cvIssueIds) {
   if (!ids.length || !detail.series) return;
   try {
     const r = await apiPost(`/api/collection/${detail.series.id}/redownload`, { cvIssueIds: ids });
-    if (r?.error) return notify('Re-download failed: ' + r.error, 'error');
-  } catch { return notify('Re-download failed — is the app reachable?', 'error'); }
+    if (r?.error) return notify(t('store.redownloadFailed', { error: r.error }), 'error');
+  } catch { return notify(t('store.redownloadFailedUnreachable'), 'error'); }
   reloadDetail(); // full re-render (owned→queued transition)
 }
 
@@ -303,7 +446,7 @@ export async function redownloadIssues(issueIds) {
   if (!issueIds.length) return;
   try {
     const r = await apiPost('/api/redownload', { issueIds });
-    if (r?.error) return notify('Re-download failed: ' + r.error, 'error');
-  } catch { return notify('Re-download failed — is the app reachable?', 'error'); }
+    if (r?.error) return notify(t('store.redownloadFailed', { error: r.error }), 'error');
+  } catch { return notify(t('store.redownloadFailedUnreachable'), 'error'); }
   refreshIssueStatuses();
 }

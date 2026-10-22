@@ -1,6 +1,7 @@
 import { normalizeTitle, extractYear, normalizeNumber } from './matcher.js';
 import config from './config.js';
 import { upsertCvSeries, upsertCvIssue, setSeriesCv, seriesNeedingCvMatch, listCvIssues, linkFileCvIssue, getSeriesByCvId, createCvSeries, setFollowed, setMonitor, MONITOR_STATES, defaultLibrary, assignSeriesLibrary, getSeriesById, getCvSeries, setSeriesPath, mergeSeriesRows, fileIssueOverridesForSeries } from './db.js';
+import { classifyId } from './metadata.js';
 import { parseIssueFromFilename } from './scanner.js';
 import { normVolume } from './cv.js';
 import { poolWithResource } from './pool.js';
@@ -22,10 +23,18 @@ function fileIssueKeys(f) {
 
 // Match a series' owned files to CV issues by number and record cv_issue_id on
 // each. This is what makes the collection roll up against CV's issue list.
+// One transaction per series (a series of 500 files is one commit, not 500).
 export function linkFilesToCv(db, seriesId, cvSeriesId) {
+  let tx = linkTxs.get(db);
+  if (!tx) { tx = db.transaction(linkFilesToCvBody); linkTxs.set(db, tx); }
+  return tx(db, seriesId, cvSeriesId);
+}
+const linkTxs = new WeakMap();
+function linkFilesToCvBody(db, seriesId, cvSeriesId) {
   const byNum = new Map();
   const ids = new Set();
-  for (const ci of listCvIssues(db, cvSeriesId)) {
+  const cvRows = db.prepare('SELECT comicvine_id, issue_number FROM cv_issues WHERE cv_series_id=? ORDER BY CAST(issue_number AS REAL), issue_number').all(cvSeriesId);
+  for (const ci of cvRows) {
     ids.add(ci.comicvine_id);
     const k = normalizeNumber(ci.issue_number);
     if (k && !byNum.has(k)) byNum.set(k, ci.comicvine_id);
@@ -35,17 +44,39 @@ export function linkFilesToCv(db, seriesId, cvSeriesId) {
   const overrides = fileIssueOverridesForSeries(db, seriesId);
   // Link ALL files (incl. invalid/corrupt ones) by number, so a corrupt copy maps
   // to its CV issue and surfaces as "corrupt" in the detail — not silently missing.
-  const files = db.prepare('SELECT path, ci_number, name FROM library_files WHERE series_id=?').all(seriesId);
+  const files = db.prepare('SELECT path, ci_number, name, cv_issue_id FROM library_files WHERE series_id=?').all(seriesId);
   let linked = 0;
   for (const f of files) {
     let cvId = overrides.get(f.path) ?? null;
     if (cvId && !ids.has(cvId)) cvId = null;
     if (!cvId) for (const k of fileIssueKeys(f)) { cvId = byNum.get(k) ?? null; if (cvId) break; }
-    linkFileCvIssue(db, f.path, cvId);
+    if ((f.cv_issue_id ?? null) !== cvId) linkFileCvIssue(db, f.path, cvId); // skip no-op rewrites
     if (cvId) linked++;
   }
   return linked;
 }
+
+// Relink many series without freezing the server: a batch of series per
+// transaction, yielding to the event loop between batches. `seriesIds` limits
+// it to those series (default: every matched series).
+export async function relinkMatchedSeries(db, { seriesIds = null, onProgress = () => {} } = {}) {
+  let rows = db.prepare('SELECT id, cv_id FROM series WHERE cv_id IS NOT NULL').all();
+  if (seriesIds) rows = rows.filter((s) => seriesIds.has(s.id));
+  let done = 0, filesLinked = 0;
+  for (let i = 0; i < rows.length; i += RELINK_BATCH) {
+    const batch = rows.slice(i, i + RELINK_BATCH);
+    db.transaction(() => {
+      for (const s of batch) {
+        try { filesLinked += linkFilesToCv(db, s.id, s.cv_id); } catch { /* skip */ }
+      }
+    })();
+    done += batch.length;
+    onProgress({ done, total: rows.length, filesLinked });
+    await new Promise((r) => setImmediate(r));
+  }
+  return { series: rows.length, filesLinked };
+}
+const RELINK_BATCH = 50;
 
 // Score one CV volume against one of our series. Pure — no network.
 // Name is the gate; year and publisher refine confidence.
@@ -108,7 +139,26 @@ export function rankCandidates(series, candidates) {
 export async function cacheCvVolume(db, client, cvId) {
   const v = await client.volume(cvId);
   upsertCvSeries(db, v);
-  for (const iss of v.issues || []) upsertCvIssue(db, { id: iss.id, cv_series_id: v.id, number: iss.number, name: iss.name });
+  // The catalog the library holds this series under (the first record wins).
+  const seriesCatalog = getCvSeries(db, v.id)?.meta_source || v.meta_source || classifyId(v.id);
+  // A provider refreshing a volume first cached under another one hands back
+  // stubs in its own id space. The rows already here keep their ids (files,
+  // wanted rows and reading lists point at them): a foreign stub is matched to
+  // one by number and only a genuinely new number gets a row of its own.
+  const existing = listCvIssues(db, v.id);
+  const known = new Set(existing.map((ci) => ci.comicvine_id));
+  const byNum = new Map();
+  for (const ci of existing) { const k = normalizeNumber(ci.issue_number); if (k && !byNum.has(k)) byNum.set(k, ci.comicvine_id); }
+  for (const iss of v.issues || []) {
+    let id = iss.id;
+    const stubCatalog = iss.meta_source || classifyId(iss.id);
+    if (!known.has(id) && stubCatalog && seriesCatalog && stubCatalog !== seriesCatalog) {
+      const k = normalizeNumber(iss.number);
+      const prior = k ? byNum.get(k) : null;
+      if (prior) id = prior;
+    }
+    upsertCvIssue(db, { id, cv_series_id: v.id, number: iss.number, name: iss.name, meta_source: id === iss.id ? stubCatalog : null });
+  }
   return v;
 }
 
@@ -167,7 +217,7 @@ export function autoLinkCvSeries() { return 0; }
 // published issues), then re-link owned files. Returns the fresh issue count.
 export async function refreshCvVolume(db, client, seriesId) {
   const s = getSeriesById(db, seriesId);
-  if (!s || !s.cv_id) return { ok: false, reason: 'not matched to ComicVine' };
+  if (!s || !s.cv_id) return { ok: false, reason: 'not matched to a metadata record' };
   const v = await cacheCvVolume(db, client, s.cv_id);
   linkFilesToCv(db, seriesId, v.id);
   return { ok: true, issues: (v.issues || []).length };
@@ -235,6 +285,8 @@ export function seriesTagTitle(db, seriesId) {
 // Search + rank one title; when the first pass isn't a clear, right-year,
 // enough-issues winner, fold in that year's volumes by name and rank again.
 async function rankForTitle(client, s, title) {
+  // A library with its own metadata sources searches those.
+  if (s?.library_id != null && typeof client.forLibrary === 'function') client = client.forLibrary(s.library_id);
   let candidates = await client.search(title);
   let r = rankCandidates({ ...s, title }, candidates);
   const year = s.year ? extractYear(String(s.year)) : null;
@@ -384,10 +436,7 @@ export async function runCvMatch(db, client, { onProgress = () => {}, concurrenc
   // Backfill file→CV-issue linkage for every matched series — this catches
   // series matched before linkage existed and files indexed after a match.
   // Pure DB work, no API calls.
-  let relinked = 0;
-  for (const s of db.prepare('SELECT id, cv_id FROM series WHERE cv_id IS NOT NULL').all()) {
-    try { relinked += linkFilesToCv(db, s.id, s.cv_id); } catch { /* skip */ }
-  }
+  const { filesLinked: relinked } = await relinkMatchedSeries(db);
   return { total: list.length, matched, ambiguous, relinked };
 }
 

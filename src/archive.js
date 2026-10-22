@@ -5,6 +5,7 @@ import yauzl from 'yauzl';
 import { load } from 'cheerio';
 import { createExtractorFromData } from 'node-unrar-js';
 import JSZip from 'jszip';
+import { onRarWorker } from './rarWorker.js';
 
 // Must stay in step with the reader plugin's own page test (its pages.js) — it
 // is the thing that decides whether a page is readable, and core calling a page
@@ -154,27 +155,51 @@ async function readRarInfo(path) {
   }
   return withRarSlot(async () => {
     try {
-      const buf = await fs.readFile(path);
-      const extractor = await createExtractorFromData({ data: toArrayBuffer(buf) });
-      const names = [...extractor.getFileList().fileHeaders].filter((h) => !h.flags?.directory).map((h) => h.name);
+      const { names, hasCi, ciXml } = await onRarWorker('info', { path }, () => rarEntriesInline(path));
       const pageCount = names.filter(isImageName).length;
-      const ciNames = names.filter(isCI);
-      let comicInfo = null;
-      if (ciNames.length) {
-        // getFileList already proved the archive is valid; a failed content
-        // extract (e.g. a solid archive) just means metadata is unknown, not corrupt.
-        try {
-          const arr = [...extractor.extract({ files: ciNames }).files];
-          if (arr[0]?.extraction) comicInfo = parseComicInfo(Buffer.from(arr[0].extraction).toString('utf8'));
-        } catch { /* metadata unknown */ }
-      }
+      const comicInfo = ciXml ? parseComicInfo(ciXml) : null;
       const empty = noPagesError(names, path);
-      if (empty) return { ok: false, format: 'cbr', error: empty, pageCount: 0, hasComicInfo: ciNames.length > 0, comicInfo };
-      return { ok: true, format: 'cbr', pageCount, hasComicInfo: ciNames.length > 0, comicInfo };
+      if (empty) return { ok: false, format: 'cbr', error: empty, pageCount: 0, hasComicInfo: hasCi, comicInfo };
+      return { ok: true, format: 'cbr', pageCount, hasComicInfo: hasCi, comicInfo };
     } catch (e) {
       return { ok: false, format: 'cbr', error: String(e?.message || e) };
     }
   });
+}
+
+// The inline (main-thread) forms of the RAR worker's jobs, for when no worker
+// thread can start. Same results as rarWorker.thread.js.
+async function rarEntriesInline(path) {
+  const extractor = await createExtractorFromData({ data: toArrayBuffer(await fs.readFile(path)) });
+  const names = [...extractor.getFileList().fileHeaders].filter((h) => !h.flags?.directory).map((h) => h.name);
+  const ciNames = names.filter(isCI);
+  let ciXml = null;
+  if (ciNames.length) {
+    // getFileList already proved the archive is valid; a failed content
+    // extract (e.g. a solid archive) just means metadata is unknown, not corrupt.
+    try {
+      const arr = [...extractor.extract({ files: ciNames }).files];
+      if (arr[0]?.extraction) ciXml = Buffer.from(arr[0].extraction).toString('utf8');
+    } catch { /* metadata unknown */ }
+  }
+  return { names, hasCi: ciNames.length > 0, ciXml };
+}
+async function rarVerifyInline(path) {
+  const ex = await createExtractorFromData({ data: toArrayBuffer(await fs.readFile(path)) });
+  let extracted = 0;
+  for (const f of ex.extract({}).files) {
+    if (f.fileHeader.flags?.directory) continue;
+    if (f.extraction) extracted++;
+  }
+  return { extracted };
+}
+async function rarToCbzInline(buffer) {
+  const extractor = await createExtractorFromData({ data: toArrayBuffer(buffer) });
+  const zip = new JSZip();
+  for (const f of extractor.extract({}).files) {
+    if (f.extraction && !f.fileHeader.flags?.directory) zip.file(f.fileHeader.name.replace(/\\/g, '/'), f.extraction);
+  }
+  return zip.generateAsync({ type: 'nodebuffer', compression: 'STORE' });
 }
 
 // Detect the real archive format from its magic bytes — comic files are very
@@ -219,12 +244,37 @@ async function readSidecarInfo(archivePath) {
 // is the number of page objects (a whole-file scan — fine at the sizes comics
 // come in, skipped past 256 MB). Feeding PDFs to the ZIP reader flagged every
 // one of them "corrupt: not a zip file".
+// Count "/Type /Page" objects chunk by chunk, so a big PDF is never one huge
+// string scanned in a single turn of the event loop. A match counts once its
+// following character is known (the lookahead), and the carried tail lets a
+// match that straddles two chunks be found whole.
+const PDF_PAGE_RE = /\/Type\s*\/Page(?![s\w])/g;
+async function countPdfPages(p) {
+  const { createReadStream } = await import('node:fs');
+  let tail = '', boundary = 0, n = 0;
+  const count = (text, upTo) => {
+    for (const m of text.matchAll(PDF_PAGE_RE)) {
+      const end = m.index + m[0].length;
+      if (end > boundary && end <= upTo) n++;
+    }
+  };
+  for await (const chunk of createReadStream(p, { highWaterMark: 4 * 1024 * 1024 })) {
+    const text = tail + chunk.toString('latin1');
+    const upTo = text.length - 1;
+    count(text, upTo);
+    tail = text.slice(-256);
+    boundary = upTo - (text.length - tail.length);
+  }
+  count(tail, tail.length);
+  return n;
+}
+
 async function readPdfInfo(p) {
   try {
     const st = await fs.stat(p);
     let pageCount = null;
     if (st.size <= 256 * 1024 * 1024) {
-      const n = ((await fs.readFile(p)).toString('latin1').match(/\/Type\s*\/Page(?![s\w])/g) || []).length;
+      const n = await countPdfPages(p);
       if (n > 0) pageCount = n;
     }
     return { ok: true, format: 'pdf', pageCount, hasComicInfo: false, comicInfo: null };
@@ -257,12 +307,50 @@ export async function readArchiveInfo(path) {
 export async function cbrBufferToCbz(buffer) {
   if (buffer.byteLength > MAX_RAR_BYTES) throw new Error(`too large to convert safely (${Math.round(buffer.byteLength / 1024 / 1024)}MB > ${MAX_RAR_MB}MB ceiling — raise it with MAX_RAR_MB)`);
   return withRarSlot(async () => {
-    const extractor = await createExtractorFromData({ data: toArrayBuffer(buffer) });
-    const zip = new JSZip();
-    for (const f of extractor.extract({}).files) {
-      if (f.extraction && !f.fileHeader.flags?.directory) zip.file(f.fileHeader.name.replace(/\\/g, '/'), f.extraction);
-    }
-    return zip.generateAsync({ type: 'nodebuffer', compression: 'STORE' });
+    // The bytes are copied to the worker, not transferred: the caller keeps
+    // its buffer (it may fall back to filing the original).
+    const out = await onRarWorker('toCbz', { data: toArrayBuffer(buffer) }, () => rarToCbzInline(buffer));
+    return Buffer.isBuffer(out) ? out : Buffer.from(out);
+  });
+}
+
+// RAR entry access for plugins (the reader's CBR pages), on the RAR worker
+// threads, inside the same slots and size ceiling as everything else here.
+// Names are as stored in the archive (backslashes and all) and unsorted: the
+// caller owns its page order. Throws for an archive over the ceiling.
+function assertRarSize(size) {
+  if (size > MAX_RAR_BYTES) throw new Error(`archive too large to open (${Math.round(size / 1024 / 1024)}MB > ${MAX_RAR_MB}MB ceiling — raise it with MAX_RAR_MB)`);
+}
+
+/** Names of every file entry in a RAR archive (nothing is decompressed). */
+export async function listRarEntries(path) {
+  assertRarSize((await fs.stat(path)).size);
+  return withRarSlot(async () => {
+    return onRarWorker('list', { path }, async () => {
+      const ex = await createExtractorFromData({ data: toArrayBuffer(await fs.readFile(path)) });
+      return [...ex.getFileList().fileHeaders].filter((h) => !h.flags?.directory).map((h) => h.name);
+    });
+  });
+}
+
+/** The named entries of a RAR archive (names as listRarEntries returns them),
+ *  or every file entry when `names` is null, as Map(name → Buffer). Only what
+ *  is asked for is decompressed (a solid archive still reads up to it). */
+export async function extractRarEntries(path, names = null) {
+  assertRarSize((await fs.stat(path)).size);
+  const files = names ? [...names] : null;
+  return withRarSlot(async () => {
+    const entries = await onRarWorker('extract', { path, files }, async () => {
+      const ex = await createExtractorFromData({ data: toArrayBuffer(await fs.readFile(path)) });
+      const out = [];
+      for (const f of ex.extract(files ? { files } : {}).files) {
+        if (f.extraction && !f.fileHeader.flags?.directory) out.push([f.fileHeader.name, f.extraction]);
+      }
+      return out;
+    });
+    // Worker results arrive as ArrayBuffers, inline ones as Uint8Arrays: wrap either without copying.
+    const toBuf = (b) => (b instanceof ArrayBuffer ? Buffer.from(b) : Buffer.from(b.buffer, b.byteOffset, b.byteLength));
+    return new Map(entries.map(([name, bytes]) => [name, toBuf(bytes)]));
   });
 }
 
@@ -280,10 +368,22 @@ export async function convertCbrToCbz(path) {
     return { cbzPath, renamed: true };
   }
   await assertRarConvertible(path); // stat check — don't read an oversized file into memory
+  const src = await readArchiveInfo(path);
   const out = await cbrBufferToCbz(await fs.readFile(path));
   const tmp = cbzPath + '.part';
-  await fs.writeFile(tmp, out);
-  await fs.rename(tmp, cbzPath);
+  try {
+    await fs.writeFile(tmp, out);
+    // Prove the copy before the original goes: every page the RAR held must
+    // be readable in the CBZ (the unwrap path checks the same way).
+    const check = await readArchiveInfo(tmp);
+    if (!check.ok || (src.ok && src.pageCount != null && check.pageCount !== src.pageCount)) {
+      throw Object.assign(new Error(`${check.pageCount ?? 0} of ${src.pageCount ?? '?'} pages converted`), { code: 'ESHORTCONVERT' });
+    }
+    await fs.rename(tmp, cbzPath);
+  } catch (e) {
+    await fs.rm(tmp, { force: true }).catch(() => {});
+    throw e;
+  }
   await fs.unlink(path);
   return { cbzPath };
 }
@@ -388,17 +488,11 @@ export async function verifyArchive(path) {
     if (size > MAX_RAR_BYTES) return { ok: true, skipped: 'too large to verify' };
     return withRarSlot(async () => {
     try {
-      const buf = await fs.readFile(path);
-      const ex = await createExtractorFromData({ data: toArrayBuffer(buf) });
       // Extract ALL entries in archive order — solid-archive safe. A per-file
       // subset (extract({ files })) can spuriously fail on solid RARs and flag a
       // perfectly good file as corrupt. getFileList already proved the structure;
       // this confirms the entries actually inflate.
-      let extracted = 0;
-      for (const f of ex.extract({}).files) {
-        if (f.fileHeader.flags?.directory) continue;
-        if (f.extraction) extracted++;
-      }
+      const { extracted } = await onRarWorker('verify', { path }, () => rarVerifyInline(path));
       return extracted > 0 ? { ok: true } : { ok: false, error: 'no readable entries' };
     } catch (e) { return { ok: false, error: String(e?.message || e) }; }
     });

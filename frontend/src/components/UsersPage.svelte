@@ -4,10 +4,12 @@
   // custom roles assembled from the permission catalog (core + plugins).
   import { goBack } from '../lib/router.svelte.js';
   import Icon from '../lib/Icon.svelte';
-  import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api.js';
+  import { apiGet, apiGetOk, apiPost, apiPatch, apiDelete, errorText } from '../lib/api.js';
+  import LoadError from './LoadError.svelte';
   import { auth } from '../lib/auth.svelte.js';
   import { notify } from '../lib/toasts.svelte.js';
-  import { confirmDialog } from './DialogModal.svelte';
+  import { confirmDialog, inputDialog } from './DialogModal.svelte';
+  import { t, currentLang, st, roleName } from '../lib/i18n.svelte.js';
 
   let { active = false } = $props();
   let users = $state([]);
@@ -25,31 +27,35 @@
   const permGroups = $derived.by(() => {
     const groups = new Map();
     for (const p of perms) {
-      const g = p.plugin ? `Plugin: ${p.plugin}` : p.category || 'Other';
+      const g = p.plugin ? t('usersPage.pluginGroup', { plugin: p.plugin }) : (p.category ? st('permissions', p.category) : t('usersPage.otherGroup'));
       if (!groups.has(g)) groups.set(g, []);
       groups.get(g).push(p);
     }
     return [...groups.entries()];
   });
 
+  let loadError = $state('');
   async function refresh() {
     try {
+      // Settings are a separate permission: their absence only hides the
+      // registration toggle's state, it never fails the page.
       const [u, r, p, s] = await Promise.all([
-        apiGet('/api/users'), apiGet('/api/roles'), apiGet('/api/permissions'), apiGet('/api/settings'),
+        apiGetOk('/api/users'), apiGetOk('/api/roles'), apiGetOk('/api/permissions'), apiGet('/api/settings').catch(() => null),
       ]);
       users = u.users || [];
       roles = r.roles || [];
       perms = p.permissions || [];
-      allowRegistration = !!s.allowRegistration;
+      if (s && !s.error) allowRegistration = !!s.allowRegistration;
       loaded = true;
-    } catch { /* keep last */ }
+      loadError = '';
+    } catch (e) { loadError = errorText(e); } // keep the last good lists
   }
   $effect(() => { if (active) refresh(); });
 
   async function setRole(u, role) {
     const r = await apiPatch(`/api/users/${u.id}`, { role });
     if (r.error) { notify(r.error, 'error'); refresh(); return; }
-    notify(`${u.username} is now ${roleLabel(role)}`, 'ok');
+    notify(t('usersPage.roleChanged', { username: u.username, role: roleLabel(role) }), 'ok');
     refresh();
   }
   async function toggleDisabled(u) {
@@ -57,11 +63,29 @@
     if (r.error) { notify(r.error, 'error'); return; }
     refresh();
   }
+  // A readable throwaway password the admin passes on (no look-alike characters).
+  function suggestPassword() {
+    const abc = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    const bytes = crypto.getRandomValues(new Uint8Array(14));
+    return Array.from(bytes, (b) => abc[b % abc.length]).join('');
+  }
+  async function setPassword(u) {
+    const password = await inputDialog({
+      title: t('usersPage.setPasswordTitle', { username: u.username }),
+      message: t('usersPage.setPasswordMessage'),
+      value: suggestPassword(),
+      confirmLabel: t('usersPage.setPassword'),
+    });
+    if (password == null) return;
+    const r = await apiPatch(`/api/users/${u.id}`, { password });
+    if (r.error) { notify(r.error, 'error'); return; }
+    notify(t('usersPage.passwordSet', { username: u.username }), 'ok');
+  }
   async function remove(u) {
     if (!(await confirmDialog({
-      title: `Delete ${u.username}?`,
-      message: 'Their account and sessions are removed permanently.',
-      confirmLabel: 'Delete', danger: true,
+      title: t('usersPage.deleteUserTitle', { username: u.username }),
+      message: t('usersPage.deleteUserMessage'),
+      confirmLabel: t('common.delete'), danger: true,
     }))) return;
     const r = await apiDelete(`/api/users/${u.id}`);
     if (r.error) { notify(r.error, 'error'); return; }
@@ -70,7 +94,7 @@
   async function create() {
     const r = await apiPost('/api/users', nu);
     if (r.error) { notify(r.error, 'error'); return; }
-    notify(`Account "${r.user.username}" created (${roleLabel(r.user.role)}).`, 'ok');
+    notify(t('usersPage.accountCreated', { username: r.user.username, role: roleLabel(r.user.role) }), 'ok');
     nu = { username: '', password: '', role: 'viewer' };
     refresh();
   }
@@ -86,7 +110,7 @@
   const providerLabel = (id) => PROVIDER_LABELS[id] || String(id || '').toUpperCase();
 
   // ---- roles ----
-  const roleLabel = (name) => roles.find((r) => r.name === name)?.label || name;
+  const roleLabel = (name) => roleName(name, roles.find((r) => r.name === name)?.label);
   const permLabel = (key) => perms.find((p) => p.key === key)?.label || key;
   // Presentational role tint/icon — admin star, trusted shield, viewer eye,
   // custom violet shield. Nothing in the data requires this mapping.
@@ -112,15 +136,15 @@
       ? await apiPost('/api/roles', { name: editor.name.trim().toLowerCase(), ...body })
       : await apiPatch(`/api/roles/${editor.name}`, body);
     if (r.error) { notify(r.error, 'error'); return; }
-    notify(editor.isNew ? `Role "${editor.name}" created.` : `Role "${editor.name}" updated.`, 'ok');
+    notify(t(editor.isNew ? 'usersPage.roleCreated' : 'usersPage.roleUpdated', { name: editor.name }), 'ok');
     editor = null;
     refresh();
   }
   async function removeRole(role) {
     if (!(await confirmDialog({
-      title: `Delete the ${role.label} role?`,
-      message: 'Accounts cannot keep a deleted role — this only works once no account uses it.',
-      confirmLabel: 'Delete', danger: true,
+      title: t('usersPage.deleteRoleTitle', { label: role.label }),
+      message: t('usersPage.deleteRoleMessage'),
+      confirmLabel: t('common.delete'), danger: true,
     }))) return;
     const r = await apiDelete(`/api/roles/${role.name}`);
     if (r.error) { notify(r.error, 'error'); return; }
@@ -128,51 +152,54 @@
   }
 
   const isSelf = (u) => u.id === auth.user?.id;
+  const seenText = (u) => u.last_seen ? t('usersPage.seen', { date: new Date(u.last_seen).toLocaleDateString(currentLang()) }) : t('usersPage.neverSignedIn');
 </script>
 
 <main id="users-page" class="scan-page users-page usx">
   <div class="usx__head">
-    <button id="users-back" class="usx__iconbtn" aria-label="Back" onclick={goBack}><Icon name="arrow-left" size={16} /></button>
-    <h2 class="usx__title">Users</h2>
-    <span class="usx__summary">{loaded ? `${users.length} account${users.length === 1 ? '' : 's'}` : ''}</span>
+    <button id="users-back" class="usx__iconbtn" aria-label={t('common.back')} onclick={goBack}><Icon name="arrow-left" size={16} /></button>
+    <h2 class="usx__title">{t('usersPage.title')}</h2>
+    <span class="usx__summary">{loaded ? t('usersPage.accountCount', { count: users.length }) : ''}</span>
     <label class="usx__reg">
       <span class="switch switch--sm"><input type="checkbox" checked={allowRegistration} onchange={toggleRegistration} /><span class="switch__track"></span></span>
-      Allow self-registration <span class="usx__reg-note">(new accounts start as viewers)</span>
+      {t('usersPage.allowRegistration')} <span class="usx__reg-note">{t('usersPage.allowRegistrationNote')}</span>
     </label>
   </div>
 
   <div class="usx__tabs">
-    <button class="usx__tab" class:is-active={tab === 'accounts'} onclick={() => (tab = 'accounts')}><Icon name="user" size={15} /> Accounts<span class="usx__tab-count">{users.length}</span></button>
-    <button class="usx__tab" class:is-active={tab === 'roles'} onclick={() => (tab = 'roles')}><Icon name="shield" size={15} /> Roles<span class="usx__tab-count">{roles.length}</span></button>
+    <button class="usx__tab" class:is-active={tab === 'accounts'} onclick={() => (tab = 'accounts')}><Icon name="user" size={15} /> {t('usersPage.tabAccounts')}<span class="usx__tab-count">{users.length}</span></button>
+    <button class="usx__tab" class:is-active={tab === 'roles'} onclick={() => (tab = 'roles')}><Icon name="shield" size={15} /> {t('usersPage.tabRoles')}<span class="usx__tab-count">{roles.length}</span></button>
   </div>
 
   <div class="usx__scroll">
     <div class="usx__inner">
+      {#if loadError}<LoadError compact={loaded} error={loadError} onretry={refresh} />{/if}
       {#if tab === 'accounts'}
         <div class="usx__table">
           <div class="usx__thead">
-            <span>Account</span><span class="usx__col-seen">Last seen</span><span>Role</span><span class="usx__r">Actions</span>
+            <span>{t('usersPage.colAccount')}</span><span class="usx__col-seen">{t('usersPage.colLastSeen')}</span><span>{t('usersPage.colRole')}</span><span class="usx__r">{t('usersPage.colActions')}</span>
           </div>
           {#each users as u (u.id)}
             <div class="usx__urow" class:is-off={u.disabled}>
               <div class="usx__acct">
                 <span class="usx__avatar" style="background:{roleTone(u.role)};">{u.username.slice(0, 1).toUpperCase()}</span>
                 <div class="usx__acct-main">
-                  <div class="usx__acct-top"><span class="usx__uname">{u.username}</span>{#if isSelf(u)}<span class="usx__you">You</span>{/if}</div>
+                  <div class="usx__acct-top"><span class="usx__uname">{u.username}</span>{#if isSelf(u)}<span class="usx__you">{t('usersPage.you')}</span>{/if}</div>
                   <div class="usx__acct-sub">
-                    {#each u.providers || [] as p (p)}<span class="usx__provider" title="Account linked to {providerLabel(p)}">{providerLabel(p)}</span>{/each}
-                    {#if u.disabled}<span class="usx__disabled">Disabled</span>{/if}
+                    {#each u.providers || [] as p (p)}<span class="usx__provider" title={t('usersPage.linkedTo', { provider: providerLabel(p) })}>{providerLabel(p)}</span>{/each}
+                    {#if u.disabled}<span class="usx__disabled">{t('usersPage.disabled')}</span>{/if}
                   </div>
                 </div>
               </div>
-              <span class="usx__col-seen usx__seen">{u.last_seen ? 'seen ' + new Date(u.last_seen).toLocaleDateString() : 'never signed in'}</span>
+              <span class="usx__col-seen usx__seen">{seenText(u)}</span>
               <select class="usx__rolesel" value={u.role} onchange={(e) => setRole(u, e.currentTarget.value)} disabled={isSelf(u)}>
-                {#each roles as r (r.name)}<option value={r.name}>{r.label}</option>{/each}
+                {#each roles as r (r.name)}<option value={r.name}>{roleName(r.name, r.label)}</option>{/each}
               </select>
               <div class="usx__uactions">
                 {#if !isSelf(u)}
-                  <button class="usx__ghost" onclick={() => toggleDisabled(u)}>{u.disabled ? 'Enable' : 'Disable'}</button>
-                  <button class="usx__del" aria-label="Delete {u.username}" onclick={() => remove(u)}><Icon name="trash" size={14} /></button>
+                  {#if !(u.providers || []).length}<button class="usx__ghost" onclick={() => setPassword(u)}>{t('usersPage.setPassword')}</button>{/if}
+                  <button class="usx__ghost" onclick={() => toggleDisabled(u)}>{u.disabled ? t('usersPage.enable') : t('usersPage.disable')}</button>
+                  <button class="usx__del" aria-label={t('usersPage.deleteUser', { username: u.username })} onclick={() => remove(u)}><Icon name="trash" size={14} /></button>
                 {/if}
               </div>
             </div>
@@ -180,37 +207,37 @@
         </div>
 
         <div class="usx__create">
-          <div class="usx__create-head">Create an account</div>
+          <div class="usx__create-head">{t('usersPage.createAccount')}</div>
           <form class="usx__create-form" onsubmit={(e) => { e.preventDefault(); create(); }}>
-            <label class="usx__field"><span class="usx__label">Username</span><input type="text" placeholder="username" bind:value={nu.username} required minlength="2" maxlength="32" autocomplete="off" /></label>
-            <label class="usx__field"><span class="usx__label">Password</span><input type="password" placeholder="8+ characters" bind:value={nu.password} required minlength="8" autocomplete="new-password" /></label>
-            <label class="usx__field"><span class="usx__label">Role</span><select bind:value={nu.role}>{#each roles as r (r.name)}<option value={r.name}>{r.label}</option>{/each}</select></label>
-            <button class="usx__primary">Create</button>
+            <label class="usx__field"><span class="usx__label">{t('usersPage.username')}</span><input type="text" placeholder={t('usersPage.usernamePlaceholder')} bind:value={nu.username} required minlength="2" maxlength="32" autocomplete="off" /></label>
+            <label class="usx__field"><span class="usx__label">{t('usersPage.password')}</span><input type="password" placeholder={t('usersPage.passwordPlaceholder')} bind:value={nu.password} required minlength="8" autocomplete="new-password" /></label>
+            <label class="usx__field"><span class="usx__label">{t('usersPage.role')}</span><select bind:value={nu.role}>{#each roles as r (r.name)}<option value={r.name}>{roleName(r.name, r.label)}</option>{/each}</select></label>
+            <button class="usx__primary">{t('usersPage.create')}</button>
           </form>
         </div>
       {:else}
         <div class="usx__roles-head">
-          <p class="usx__roles-intro">Roles bundle permissions. Built-in roles are fixed; create custom roles from the permission catalog.</p>
-          <button class="usx__primary usx__primary--icon" onclick={() => openEditor(null)}><Icon name="plus" size={14} /> New role</button>
+          <p class="usx__roles-intro">{t('usersPage.rolesIntro')}</p>
+          <button class="usx__primary usx__primary--icon" onclick={() => openEditor(null)}><Icon name="plus" size={14} /> {t('usersPage.newRole')}</button>
         </div>
 
         {#each roles as r (r.name)}
           <div class="usx__role">
             <div class="usx__role-head">
               <span class="usx__role-ico" style="background:color-mix(in srgb, {roleTone(r.name)} 12%, transparent); color:{roleTone(r.name)};"><Icon name={roleIcon(r.name)} size={16} /></span>
-              <span class="usx__role-name">{r.label}</span>
-              {#if r.builtin}<span class="usx__builtin">Built-in</span>{/if}
-              <span class="usx__role-users">{r.users} account{r.users === 1 ? '' : 's'}</span>
+              <span class="usx__role-name">{r.builtin ? roleName(r.name, r.label) : r.label}</span>
+              {#if r.builtin}<span class="usx__builtin">{t('usersPage.builtIn')}</span>{/if}
+              <span class="usx__role-users">{t('usersPage.roleUsers', { count: r.users })}</span>
               {#if !r.builtin}
                 <div class="usx__role-actions">
-                  <button class="usx__ghost" onclick={() => openEditor(r)}>Edit</button>
-                  <button class="usx__del" aria-label="Delete role" onclick={() => removeRole(r)}><Icon name="trash" size={14} /></button>
+                  <button class="usx__ghost" onclick={() => openEditor(r)}>{t('common.edit')}</button>
+                  <button class="usx__del" aria-label={t('usersPage.deleteRole')} onclick={() => removeRole(r)}><Icon name="trash" size={14} /></button>
                 </div>
               {/if}
             </div>
             <div class="usx__chips">
-              {#if r.permissions.includes('*')}<span class="usx__chip usx__chip--all">Everything</span>
-              {:else if r.permissions.length === 0}<span class="usx__chip-none">No permissions</span>
+              {#if r.permissions.includes('*')}<span class="usx__chip usx__chip--all">{t('usersPage.everything')}</span>
+              {:else if r.permissions.length === 0}<span class="usx__chip-none">{t('usersPage.noPermissions')}</span>
               {:else}{#each r.permissions as k (k)}<span class="usx__chip">{permLabel(k)}</span>{/each}{/if}
             </div>
           </div>
@@ -218,34 +245,34 @@
 
         {#if editor}
           <form class="usx__editor" onsubmit={(e) => { e.preventDefault(); saveRole(); }}>
-            <div class="usx__editor-title">{editor.isNew ? 'New role' : 'Edit role'}</div>
+            <div class="usx__editor-title">{editor.isNew ? t('usersPage.newRole') : t('usersPage.editRole')}</div>
             <div class="usx__editor-ids">
-              <label class="usx__field"><span class="usx__label">Role name</span>
+              <label class="usx__field"><span class="usx__label">{t('usersPage.roleName')}</span>
                 {#if editor.isNew}
-                  <input type="text" class="usx__mono" placeholder="e.g. kids" bind:value={editor.name} required minlength="2" maxlength="32" pattern="[a-z0-9][a-z0-9_\-]+" autocomplete="off" />
+                  <input type="text" class="usx__mono" placeholder={t('usersPage.roleNamePlaceholder')} bind:value={editor.name} required minlength="2" maxlength="32" pattern="[a-z0-9][a-z0-9_\-]+" autocomplete="off" />
                 {:else}
                   <input type="text" class="usx__mono" value={editor.name} disabled />
                 {/if}
               </label>
-              <label class="usx__field"><span class="usx__label">Display label</span><input type="text" placeholder={editor.name || 'Kids'} bind:value={editor.label} maxlength="48" /></label>
+              <label class="usx__field"><span class="usx__label">{t('usersPage.displayLabel')}</span><input type="text" placeholder={editor.name || t('usersPage.displayLabelPlaceholder')} bind:value={editor.label} maxlength="48" /></label>
             </div>
             {#each permGroups as [group, list] (group)}
               <div class="usx__pgroup">
                 <div class="usx__pgroup-head">{group}</div>
                 <div class="usx__perms">
                   {#each list as p (p.key)}
-                    <label class="usx__perm" class:is-on={editor.permissions.has(p.key)} title={p.description}>
+                    <label class="usx__perm" class:is-on={editor.permissions.has(p.key)} title={st('permissions', p.description)}>
                       <input type="checkbox" checked={editor.permissions.has(p.key)} onchange={() => togglePerm(p.key)} hidden />
                       <span class="usx__perm-box">{#if editor.permissions.has(p.key)}<Icon name="check" size={12} />{/if}</span>
-                      <span class="usx__perm-info"><span class="usx__perm-label">{p.label}</span><span class="usx__perm-desc">{p.description}</span></span>
+                      <span class="usx__perm-info"><span class="usx__perm-label">{st('permissions', p.label)}</span><span class="usx__perm-desc">{st('permissions', p.description)}</span></span>
                     </label>
                   {/each}
                 </div>
               </div>
             {/each}
             <div class="usx__editor-actions">
-              <button type="button" class="usx__ghost" onclick={() => { editor = null; }}>Cancel</button>
-              <button class="usx__primary">{editor.isNew ? 'Create role' : 'Save role'}</button>
+              <button type="button" class="usx__ghost" onclick={() => { editor = null; }}>{t('common.cancel')}</button>
+              <button class="usx__primary">{editor.isNew ? t('usersPage.createRole') : t('usersPage.saveRole')}</button>
             </div>
           </form>
         {/if}
@@ -276,8 +303,10 @@
   .usx__inner { max-width: 860px; margin: 0 auto; }
 
   /* accounts table */
-  .usx__table { border: 1px solid var(--line); border-radius: 13px; background: rgba(255,255,255,.012); overflow: hidden; margin-bottom: 22px; }
-  .usx__thead, .usx__urow { display: grid; grid-template-columns: 1.5fr 1fr 150px auto; gap: 12px; align-items: center; padding: 11px 16px; }
+  /* One column template for every row (subgrid), so rows with different
+     action buttons still line up. */
+  .usx__table { display: grid; grid-template-columns: 1.5fr 1fr 150px max-content; column-gap: 12px; border: 1px solid var(--line); border-radius: 13px; background: rgba(255,255,255,.012); overflow: hidden; margin-bottom: 22px; }
+  .usx__thead, .usx__urow { grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; row-gap: 8px; align-items: center; padding: 11px 16px; }
   .usx__thead { padding: 10px 16px; border-bottom: 1px solid var(--line); font: 600 10px var(--font-body); text-transform: uppercase; letter-spacing: .06em; color: var(--faint); }
   .usx__r { text-align: right; }
   .usx__urow { border-bottom: 1px solid #221e2c; }
@@ -348,8 +377,9 @@
   .usx__editor-actions .usx__ghost { height: 36px; padding: 0 16px; }
 
   @media (max-width: 720px) {
-    .usx__thead, .usx__urow { grid-template-columns: 1fr 150px auto; }
-    .usx__col-seen { display: none; }
+    .usx__table { grid-template-columns: minmax(0, 1fr) 150px; }
+    .usx__col-seen, .usx__thead .usx__r { display: none; }
+    .usx__uactions { grid-column: 1 / -1; }
     .usx__create-form { grid-template-columns: 1fr; }
     .usx__editor-ids, .usx__perms { grid-template-columns: 1fr; }
   }

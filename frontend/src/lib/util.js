@@ -1,6 +1,6 @@
-export const fmt = (n) => (n ?? 0).toLocaleString('en-US');
+import { currentLang, t } from './i18n.js';
 
-export const pad3 = (n) => (/^\d+$/.test(String(n)) ? String(n).padStart(3, '0') : String(n ?? ''));
+export const fmt = (n) => (n ?? 0).toLocaleString(currentLang());
 
 export function escapeHtml(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -86,11 +86,11 @@ export function fmtAgo(ms) {
 }
 
 export function fmtIn(ms) {
-  if (ms <= 0) return 'due now';
+  if (ms <= 0) return t('common.dueNow');
   const m = Math.round(ms / 60000);
-  if (m < 60) return 'in ' + m + 'm';
+  if (m < 60) return t('common.inTime', { time: m + 'm' });
   const h = Math.floor(m / 60);
-  return 'in ' + h + 'h' + (m % 60 ? ' ' + (m % 60) + 'm' : '');
+  return t('common.inTime', { time: h + 'h' + (m % 60 ? ' ' + (m % 60) + 'm' : '') });
 }
 
 // Strip HTML tags to plain text (ComicVine deck/description can contain markup).
@@ -119,18 +119,32 @@ export function safeUrl(url) {
   return SAFE_SCHEMES.has(scheme) ? s : '';
 }
 
-// Minimal sanitizer for ComicVine's HTML description: strip active content.
+// Sanitizer for description HTML (from the metadata service, or edited by a
+// library manager). An allowlist: formatting tags keep a few inert
+// attributes; any other element is unwrapped to its text, and elements whose
+// content is code or a separate document are dropped whole. A blocklist kept
+// missing things (form action, formaction, SVG animate, base href).
+const KEEP_TAGS = new Set(['P', 'BR', 'B', 'STRONG', 'I', 'EM', 'U', 'S', 'SMALL', 'SUB', 'SUP', 'SPAN', 'DIV',
+  'A', 'UL', 'OL', 'LI', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'BLOCKQUOTE', 'HR', 'IMG', 'FIGURE', 'FIGCAPTION',
+  'TABLE', 'THEAD', 'TBODY', 'TFOOT', 'TR', 'TH', 'TD', 'CAPTION', 'DL', 'DT', 'DD', 'CITE', 'Q', 'CODE', 'PRE']);
+const DROP_TAGS = new Set(['SCRIPT', 'STYLE', 'IFRAME', 'FRAME', 'OBJECT', 'EMBED', 'LINK', 'META', 'BASE',
+  'SVG', 'MATH', 'TEMPLATE', 'NOSCRIPT', 'FORM', 'INPUT', 'BUTTON', 'TEXTAREA', 'SELECT', 'AUDIO', 'VIDEO', 'TITLE']);
+const KEEP_ATTRS = { A: ['href', 'title'], IMG: ['src', 'alt', 'title', 'width', 'height'], TD: ['colspan', 'rowspan'], TH: ['colspan', 'rowspan'] };
 export function sanitizeHtml(html) {
   const tpl = document.createElement('template');
   tpl.innerHTML = String(html || '');
-  tpl.content.querySelectorAll('script,style,iframe,object,embed,link,meta').forEach((el) => el.remove());
-  tpl.content.querySelectorAll('*').forEach((el) => {
+  // Deepest first, so unwrapping a parent never revisits moved children.
+  for (const el of [...tpl.content.querySelectorAll('*')].reverse()) {
+    const tag = el.tagName.toUpperCase();
+    if (DROP_TAGS.has(tag)) { el.remove(); continue; }
+    if (!KEEP_TAGS.has(tag)) { el.replaceWith(...el.childNodes); continue; }
+    const allowed = KEEP_ATTRS[tag] || [];
     for (const a of [...el.attributes]) {
-      if (/^on/i.test(a.name)) { el.removeAttribute(a.name); continue; }
+      if (!allowed.includes(a.name.toLowerCase())) el.removeAttribute(a.name);
       // href/src must resolve to an allowed scheme (control-char-safe check).
-      if (/^(href|src|xlink:href)$/i.test(a.name) && !safeUrl(a.value)) el.removeAttribute(a.name);
+      else if ((a.name === 'href' || a.name === 'src') && !safeUrl(a.value)) el.removeAttribute(a.name);
     }
-  });
+  }
   return tpl.innerHTML;
 }
 
@@ -213,4 +227,45 @@ export function fmtDay(value) {
   if (isNaN(d)) return String(value);
   const sameYear = d.getFullYear() === new Date().getFullYear();
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', ...(sameYear ? {} : { year: 'numeric' }) });
+}
+
+/** Last-request-wins guard for async loaders. Make one per loader; call it
+ *  before the await and check the returned function after:
+ *    const seq = latestGuard();            // module/component level
+ *    const isLatest = seq();               // each call
+ *    const r = await apiGet(…); if (!isLatest()) return;
+ *  A slower, older response is then dropped instead of overwriting a newer one. */
+export function latestGuard() {
+  let n = 0;
+  return () => { const mine = ++n; return () => mine === n; };
+}
+
+/** Columns and row stride of a rendered grid/list, from its item elements
+ *  (columns = items sharing the first one's top; stride = the gap to the
+ *  next row). null until two items exist; stride null when it reads as 0. */
+export function measureGrid(items) {
+  if (!items || items.length < 2) return null;
+  const top0 = items[0].offsetTop;
+  let c = 1;
+  while (c < items.length && items[c].offsetTop === top0) c++;
+  const next = items[c] || items[1];
+  const d = next.offsetTop - top0;
+  return { cols: Math.max(1, c), stride: d > 10 ? d : null };
+}
+
+/** HTML for `text` with every case-insensitive match of `q` wrapped in
+ *  <mark class={cls}>. Splits the raw text and escapes each piece, so a search
+ *  for "amp" never lands inside an escaped entity. */
+export function highlightHtml(text, q, cls = '') {
+  const raw = String(text ?? '');
+  if (!q) return escapeHtml(raw);
+  const rx = new RegExp(String(q).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'ig');
+  const open = cls ? `<mark class="${escapeHtml(cls)}">` : '<mark>';
+  let out = '', last = 0, m;
+  while ((m = rx.exec(raw))) {
+    if (!m[0].length) { rx.lastIndex++; continue; }
+    out += escapeHtml(raw.slice(last, m.index)) + open + escapeHtml(m[0]) + '</mark>';
+    last = m.index + m[0].length;
+  }
+  return out + escapeHtml(raw.slice(last));
 }

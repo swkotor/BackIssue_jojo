@@ -19,6 +19,9 @@ const VOLUME_PREFIX = '4050';
 const ISSUE_PREFIX = '4000';
 const ARC_PREFIX = '4045';
 const POLITE_MS = 250;
+// Per request; a stalled connection otherwise waits out the HTTP stack's
+// 5-minute default on every retry.
+const METADATA_TIMEOUT_MS = 60_000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -65,7 +68,7 @@ export async function ensureInstanceKey(config, base, doFetch) {
     const url = `${origin}/api/register`;
     // The image's release attestation rides along: the service uses it to
     // tier the instance key (official builds get the full service).
-    const resp = await doFetch(url, { method: 'POST', headers: { 'User-Agent': UA, ...attestHeaders() } });
+    const resp = await doFetch(url, { method: 'POST', headers: { 'User-Agent': UA, ...attestHeaders() }, signal: AbortSignal.timeout(METADATA_TIMEOUT_MS) });
     if (!resp.ok) {
       instanceKeyPromise = null; // allow retry on the next call
       throw new Error(`metadata service registration failed (HTTP ${resp.status} from ${url})`);
@@ -124,11 +127,23 @@ export async function sendSupportPackage(config, buffer, { version = '', note = 
   return { code: data.code, expiresInDays: data.expires_in_days ?? null };
 }
 
-export function makeCvClient(config, { fetchImpl, key, politeMs } = {}) {
+// Other providers (Metron, plugin-registered ones) answer through a dispatcher
+// that metadata.js installs at boot: makeCvClient asks it first, so every
+// caller, plugins included, gets the active provider's client without knowing
+// one exists. null from the dispatcher means "a built-in source: carry on".
+let dispatcher = null;
+export function installMetadataDispatcher(fn) { dispatcher = typeof fn === 'function' ? fn : null; }
+
+export function makeCvClient(config, opts = {}) {
+  if (dispatcher && !opts.noDispatch) { const other = dispatcher(config, opts); if (other) return other; }
+  const { fetchImpl, key, politeMs, source } = opts;
   // Direct-ComicVine mode is an explicit user preference AND needs a key;
   // otherwise the hosted metadata service (or a self-hosted cvBaseUrl) with a
-  // self-provisioned instance key — no configuration required.
-  const directCv = config?.metadataSource === 'comicvine' && !!(key || cvKey(config.comicvineKeys));
+  // self-provisioned instance key — no configuration required. The metadata
+  // dispatcher names the source it wants ('hosted' | 'comicvine'); a caller
+  // without one is read from the legacy single-source setting.
+  const wantDirect = source ? source === 'comicvine' : config?.metadataSource === 'comicvine';
+  const directCv = wantDirect && !!(key || cvKey(config.comicvineKeys));
   const doFetch = fetchImpl || fetch;
   let base;
   let fixedKey = null;
@@ -154,19 +169,20 @@ export function makeCvClient(config, { fetchImpl, key, politeMs } = {}) {
     const url = `${base}${pathAndQuery}${sep}api_key=${encodeURIComponent(apiKey)}&format=json`;
     let resp;
     try {
-      resp = await doFetch(url, { headers: { 'User-Agent': UA, ...attestHeaders() } });
+      // A timed-out request is a fetch error like any other: retried below.
+      resp = await doFetch(url, { headers: { 'User-Agent': UA, ...attestHeaders() }, signal: AbortSignal.timeout(METADATA_TIMEOUT_MS) });
     } catch (e) {
       if (attempt < 3) { await sleep(500); return call(pathAndQuery, attempt + 1); }
       throw e;
     }
     if (resp.status === 420 || resp.status === 503 || resp.status === 429) {
       if (attempt < 2) { await sleep(1000); return call(pathAndQuery, attempt + 1); }
-      throw rateLimitError(`ComicVine HTTP ${resp.status} (rate limited)`);
+      throw rateLimitError(`metadata service HTTP ${resp.status} (rate limited)`);
     }
-    if (!resp.ok) throw new Error(`ComicVine HTTP ${resp.status}`);
+    if (!resp.ok) throw new Error(`metadata service HTTP ${resp.status}`);
     const data = await resp.json();
-    if (data.status_code === 107) throw rateLimitError('ComicVine rate limit exceeded (107)');
-    if (data.status_code !== 1) throw new Error(`ComicVine error ${data.status_code}: ${data.error}`);
+    if (data.status_code === 107) throw rateLimitError('metadata service rate limit exceeded (107)');
+    if (data.status_code !== 1) throw new Error(`metadata service error ${data.status_code}: ${data.error}`);
     return data;
   }
 

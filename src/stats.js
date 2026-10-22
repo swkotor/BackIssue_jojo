@@ -2,10 +2,13 @@
 // over the existing schema — no new tables. "Collection series" means the same
 // scope the sidebar uses: a series you follow OR own at least one valid file for.
 import { cvKey } from './cv.js';
+import { enabledMetadataProviders } from './metadata.js';
 import { SELF_DESCRIBED_TYPES } from './db.js';
 
 // A series counts toward the collection if followed or backed by a valid file.
-const IN_COLLECTION = `(s.followed=1 OR EXISTS(SELECT 1 FROM library_files lf WHERE lf.series_id=s.id AND lf.valid=1))`;
+// The IN-list form lets SQLite walk just those series; a correlated EXISTS
+// probed every row of a catalog that can hold hundreds of thousands.
+const IN_COLLECTION = `(s.followed=1 OR s.id IN (SELECT series_id FROM library_files WHERE valid=1))`;
 
 // SQL fragment: is s a self-described (plugin-typed) series? Those carry their
 // own metadata — they're "resolved", never lumped in with unmatched comics.
@@ -95,9 +98,15 @@ export function collectionStats(db, config = {}, { includeRestricted = true } = 
     SUM(CASE WHEN valid=1 AND cv_issue_id IS NOT NULL THEN 1 ELSE 0 END) linked,
     SUM(CASE WHEN valid=1 AND cv_issue_id IS NULL THEN 1 ELSE 0 END) unlinked
     FROM library_files`).get();
+  // The sources actually in use, in order (the app-wide list). Only usable
+  // ones are returned, falling back to the built-in service.
+  let inUse = [];
+  try { inUse = enabledMetadataProviders(config).map((p) => p.id); } catch { inUse = ['hosted']; }
+  const primary = inUse[0] || 'hosted';
   const comicvine = {
-    keys: cvKey(config.comicvineKeys) ? 1 : 0,
-    source: config.metadataSource === 'comicvine' ? 'comicvine' : 'hosted',
+    keys: primary === 'hosted' ? (cvKey(config.comicvineKeys) ? 1 : 0) : 1,
+    source: primary === 'hosted' ? 'hosted' : primary === 'comicvine' ? 'comicvine' : 'other',
+    sources: inUse.length || 1,
     volumes: cv.volumes || 0,
     issues: cv.issues || 0,
     detailed: cv.detailed || 0,

@@ -4,16 +4,20 @@ import JSZip from 'jszip';
 import { getCvIssue, getCvSeries, setCvIssueDetail, getLibraryFile } from './db.js';
 import { logWarn } from './logstore.js';
 import { convertCbrToCbz, sidecarPath } from './archive.js';
+import { writeComicInfoInPlace } from './cbzTag.js';
 import { normalizeNumber } from './matcher.js';
-import { cvKey } from './cv.js';
+import { isMintedId } from './metron.js';
+import { BUILTIN_CATALOG_RANGES } from './db.js';
 import config from './config.js';
 
 // Native metadata tagger: builds a standard ComicInfo.xml from our cached
 // ComicVine data and writes it into the CBZ. Replaces ComicTagger — matching is
 // already solved (library files carry cv_issue_id), so tagging is just data.
 
+// Tagging reads the cached record through whichever metadata sources are in
+// use (the hosted service included), so it needs no key of its own.
 export function taggingEnabled() {
-  return config.tagOnDownload === 'on' && !!cvKey(config.comicvineKeys);
+  return config.tagOnDownload === 'on';
 }
 
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[c]));
@@ -103,7 +107,15 @@ export function buildComicInfoXml({ series, issue }) {
 
   add('Publisher', series.publisher);
   add('Web', issue.site_detail_url || series.site_detail_url);
-  add('Notes', `Tagged by BackIssue from ComicVine issue ${issue.comicvine_id ?? issue.id}.`);
+  // The ComicVine id in Notes is what other taggers key on, so it is written
+  // only for a record from ComicVine. A row cached before catalogs were
+  // recorded falls back to ComicVine's own id block.
+  const noteId = issue.comicvine_id ?? issue.id;
+  const source = issue.meta_source || series.meta_source || null;
+  const [, cvLo, cvHi] = BUILTIN_CATALOG_RANGES.find(([n]) => n === 'comicvine');
+  const fromCv = source ? source === 'comicvine' : (!isMintedId(noteId) && Number(noteId) >= cvLo && Number(noteId) < cvHi);
+  const cvRef = issue.meta_ref || noteId;
+  add('Notes', fromCv ? `Tagged by BackIssue from ComicVine issue ${cvRef}.` : 'Tagged by BackIssue.');
 
   return `<?xml version="1.0" encoding="utf-8"?>\n<ComicInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\n${tags.join('\n')}\n</ComicInfo>`;
 }
@@ -171,9 +183,19 @@ export async function tagCbzBuffer(buffer, xml) {
   return zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
 }
 
-// Rewrite a CBZ on disk with the given ComicInfo.xml (atomic temp → rename).
+// Write ComicInfo.xml into a CBZ on disk. Normally only the zip's tail is
+// rewritten (cbzTag.js), so a multi-GB file never enters memory. An archive
+// that can't be tagged that way (zip64) is rebuilt in memory as before
+// (atomic temp → rename), but only when it is small enough to do safely.
+const REBUILD_MAX_BYTES = 512 * 1024 * 1024;
 export async function writeComicInfo(cbzPath, xml) {
   if (!/\.cbz$/i.test(cbzPath)) throw new Error('can only tag .cbz files');
+  try { return await writeComicInfoInPlace(cbzPath, xml); }
+  catch (e) {
+    if (e?.code !== 'NOT_SIMPLE_ZIP') throw e;
+    const { size } = await fs.stat(cbzPath);
+    if (size > REBUILD_MAX_BYTES) throw new Error(`${e.message}, and the file is too large to rebuild in memory (${Math.round(size / 1048576)}MB)`);
+  }
   const buffer = await fs.readFile(cbzPath);
   const out = await tagCbzBuffer(buffer, xml);
   const tmp = path.join(path.dirname(cbzPath), `.tag-${process.pid}-${path.basename(cbzPath)}`);

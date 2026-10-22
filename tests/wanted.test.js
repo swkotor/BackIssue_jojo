@@ -189,7 +189,7 @@ test('migration: an old database maps followed to the policy, and a merge keeps 
 test('GET /api/wanted serves the paged list; ?followed=1 is the caller\'s ☆ stars; scope + sort are honoured', async () => {
   const { setUserFollow } = await import('../src/db.js');
   const { db, saga } = seed();
-  const app = createApp({ db, state: { queue: {} } });
+  const app = createApp({ openApiBeforeSetup: true, db, state: { queue: {} } });
   const s = await new Promise((res) => { const x = app.listen(0, () => res(x)); });
   const base = `http://localhost:${s.address().port}`;
   try {
@@ -326,4 +326,26 @@ test('a pick is fulfilled when its issue lands: reported once with who asked, th
   upsertLibraryFile(db, { path: '/s2.cbz', dir: '/', name: 's2.cbz', size: 1, mtime: 1, valid: 1, series_id: saga });
   linkFileCvIssue(db, '/s2.cbz', 2);
   assert.deepEqual(seriesCollectionDetail(db, saga).picks, { want: 0, skip: 0 });
+});
+
+test('Download all skips restricted series for someone who cannot see them', async () => {
+  const users = await import('../src/users.js');
+  const { db, saga } = seed();
+  db.prepare('UPDATE series SET restricted=1 WHERE id=?').run(saga); // Saga's wanted #2, #3 are now mature-only
+  users.initUserTables(db);
+  const u = users.createUser(db, { username: 'careful', password: 'password123', role: 'admin' });
+  db.prepare('UPDATE users SET hide_mature=1 WHERE id=?').run(u.id); // hides mature content for themself
+  const cookie = 'bi_session=' + users.createSession(db, u.id);
+  let started = 0;
+  const app = createApp({ openApiBeforeSetup: true, db, state: { queue: {} }, runDownloads: async () => { started++; } });
+  const s = await new Promise((res) => { const x = app.listen(0, () => res(x)); });
+  const base = `http://localhost:${s.address().port}`;
+  try {
+    const list = await (await fetch(`${base}/api/wanted`, { headers: { cookie } })).json();
+    assert.equal(list.total, 0, 'the Wanted list hides them');
+    const r = await (await fetch(`${base}/api/wanted/download-all`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: '{}' })).json();
+    assert.equal(r.queued || 0, 0, 'and Download all must not queue them either');
+    const queued = db.prepare("SELECT COUNT(*) c FROM issues WHERE series_id=? AND status='pending'").get(saga).c;
+    assert.equal(queued, 0);
+  } finally { s.close(); }
 });

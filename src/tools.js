@@ -8,9 +8,9 @@ import { poolWithResource } from './pool.js';
 import { convertCbrToCbz, verifyArchive, readArchiveInfo, sniffFormat, repackRarAsZip, sidecarPath, unwrapNestedArchive } from './archive.js';
 import { removeSupersededFiles, removeExtraCopies, indexLibrary } from './library.js';
 import { walkFiles } from './sources/usenet.js';
-import { pruneLibraryFiles, SELF_DESCRIBED_TYPES } from './db.js';
+import { pruneLibraryFiles, SELF_DESCRIBED_TYPES, ensureCvIssueRow } from './db.js';
 import { libraryStats } from './db.js';
-import { linkFilesToCv, refreshCvVolume } from './cvmatch.js';
+import { linkFilesToCv, refreshCvVolume, relinkMatchedSeries } from './cvmatch.js';
 import { tagFileFromCv } from './metatagger.js';
 import { fileStemFromPattern } from './naming.js';
 import { deleteLibraryFile, getLibraryFile } from './db.js';
@@ -116,11 +116,35 @@ export async function unwrapNestedArchives(db, onProgress = () => {}) {
       } else skipped++;
     } catch (e) {
       failed++;
-      logWarn('tools', `unwrap failed: ${p} — ${e?.message || e}`);
+      logWarn(`unwrap failed: ${p} — ${e?.message || e}`, 'tools');
     }
     onProgress({ done: ++done, total: files.length, message: `${unwrapped} unwrapped` });
   });
   return { total: files.length, unwrapped, skipped, failed };
+}
+
+// Re-download every corrupt comic file. Nested archives are unwrapped first
+// (fixed in place, nothing to fetch); each remaining corrupt file linked to an
+// issue is queued through `queue`, the same reset-and-queue as the series
+// page's Re-download. The corrupt file stays until a valid copy is indexed,
+// so an issue no source has loses nothing. Files not linked to any issue
+// can't be fetched and are only counted. Book and audiobook series are left
+// out: their files come from their own plugins' downloads.
+export async function redownloadCorrupt(db, onProgress = () => {}, { queue = () => {} } = {}) {
+  const unwrap = await unwrapNestedArchives(db, (p) => onProgress({ ...p, message: `unwrapping: ${p.message || ''}` }));
+  const rows = db.prepare(`SELECT lf.series_id sid, lf.issue_id iid, lf.cv_issue_id cvid, s.type, ci.issue_number num, ci.name nm
+      FROM library_files lf JOIN series s ON s.id = lf.series_id
+      LEFT JOIN cv_issues ci ON ci.comicvine_id = lf.cv_issue_id
+     WHERE lf.valid = 0`).all().filter((r) => !SELF_DESCRIBED_TYPES.has(r.type || 'comic'));
+  const ids = new Set();
+  let notMatched = 0;
+  for (const r of rows) {
+    const id = r.cvid ? ensureCvIssueRow(db, { seriesId: r.sid, cvIssueId: r.cvid, number: r.num, title: r.nm }) : r.iid;
+    if (id) ids.add(Number(id)); else notMatched++;
+  }
+  if (ids.size) await queue([...ids]);
+  onProgress({ done: rows.length, total: rows.length, message: `${ids.size} queued` });
+  return { unwrapped: unwrap.unwrapped, queued: ids.size, notMatched };
 }
 
 // Duplicate copies across every comic. Invalid files a good copy already
@@ -207,8 +231,10 @@ export async function verifyLibrary(db, onProgress = () => {}, { corruptOnly = f
 // everything.
 // Temp files our own writers create (atomic-write .part, tagger .tag-*) can be
 // stranded by a crash mid-write. Sweep ones old enough that no writer can still
-// own them. Uses the shared recursive walker.
-const TEMP_FILE_RE = /(\.part$|^\.tag-)/;
+// own them. Uses the shared recursive walker. Only OUR names: a library tree
+// can be shared with a browser, JDownloader or aria2, whose own .part files
+// are someone else's partial downloads.
+export const TEMP_FILE_RE = /(\.(?:cbz|cbr|pdf|xml)\.part$|^\.tag-\d+-)/i;
 const TEMP_MAX_AGE_MS = 24 * 3600 * 1000;
 async function sweepTempFiles(dir) {
   let swept = 0;
@@ -305,13 +331,10 @@ export async function backupDatabase(db, dbPath, onProgress = () => {}) {
 // Re-map owned files to ComicVine issues for every matched series (useful after
 // issue-number parsing improvements, or to repair a stale rollup).
 export async function relinkAllCv(db, onProgress = () => {}) {
-  const series = db.prepare('SELECT id, cv_id FROM series WHERE cv_id IS NOT NULL').all();
-  let done = 0, filesLinked = 0;
-  for (const s of series) {
-    try { filesLinked += linkFilesToCv(db, s.id, s.cv_id); } catch { /* skip */ }
-    onProgress({ done: ++done, total: series.length, message: `${filesLinked} linked` });
-  }
-  return { seriesRelinked: series.length, filesLinked };
+  const r = await relinkMatchedSeries(db, {
+    onProgress: (p) => onProgress({ done: p.done, total: p.total, message: `${p.filesLinked} linked` }),
+  });
+  return { seriesRelinked: r.series, filesLinked: r.filesLinked };
 }
 
 // Ghost series: legacy scrape-era catalog rows — never ComicVine-matched, not a

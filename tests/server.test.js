@@ -8,12 +8,12 @@ function makeApp() {
   const sid = upsertSeries(db, { title: 'Batman', url: '/c/batman', publisher: 'DC', coverUrl: '' });
   upsertIssue(db, { seriesId: sid, title: 'Batman #1', issueNumber: '1', url: '/i/b1' });
   const calls = { crawl: 0, downloads: [], updates: [] };
-  const app = createApp({
+  const app = createApp({ openApiBeforeSetup: true,
     db,
     runDownloads: async (ids) => { calls.downloads.push(ids); },
     prepareRedownload: async (ids) => { calls.prepared = ids; },
     runCvMatch: () => { calls.cvMatch = (calls.cvMatch || 0) + 1; },
-    cvSearch: async (q) => { calls.cvSearch = q; return [{ id: 7, name: 'Earth X', start_year: '1999', publisher: 'Marvel', count_of_issues: 12 }]; },
+    cvSearch: async (q, opts) => { calls.cvSearch = q; calls.cvSearchOpts = opts; return [{ id: 7, name: 'Earth X', start_year: '1999', publisher: 'Marvel', count_of_issues: 12 }]; },
     cvIssueInfo: async (cvIssueId) => { calls.issueInfo = cvIssueId; return { cv_issue_id: cvIssueId, number: '1', name: 'One', credits: [], files: [] }; },
     cvVolumeInfo: async (id) => { calls.volumeInfo = id; return { id, name: 'Aquaman and The Others', start_year: '2014', count_of_issues: 11, publisher: 'DC Comics' }; },
     cleanupSeriesFiles: async (id) => { calls.cleaned = id; return { removed: 3, detail: { issues: [] } }; },
@@ -23,10 +23,6 @@ function makeApp() {
     runTool: (tool, opts) => { calls.tool = tool; calls.toolOpts = opts; return { started: true }; },
     stats: () => ({ files: { total: 5 }, collection: { series: 2 } }),
     listSources: () => [{ id: 'usenet', label: 'usenet' }, { id: 'torrent', label: 'torrent' }],
-    usenetSearch: async (q) => { calls.usenetSearch = q; return { results: [{ title: 'Saga 001 (2012)', size: 42000000, nzbUrl: 'http://nz/1.nzb', indexer: 'nz' }] }; },
-    usenetGrab: async (b) => { calls.usenetGrab = b; return { grabbed: true }; },
-    torrentSearch: async (b) => { calls.torrentSearch = b; return { results: [{ title: 'Saga v1 (001-054) pack', size: 3e9, seeders: 40, indexer: 'p', downloadUrl: 'magnet:?xt=urn:btih:x' }] }; },
-    torrentGrabPack: async (b) => { calls.torrentGrabPack = b; return { grabbed: true }; },
     searchSources: async (b) => { calls.searchSources = b; return { results: [{ source: 'usenet', rid: 'usenet:0', title: 'Saga 012', size: 42e6, meta: 'nz', score: 100 }], searched: ['Saga 012'], errors: [], sources: ['usenet'] }; },
     manualGrabResult: (b) => { calls.manualGrab = b; return { queued: true, issueId: 99 }; },
     grabSourcePack: (b) => { calls.grabPack = b; return { grabbed: true, grabId: 5 }; },
@@ -41,7 +37,7 @@ function makeApp() {
     skipImportCandidate: (id) => { calls.importSkip = id; return { id, status: 'skipped' }; },
     cvSetManual: async (id, cvId) => { calls.cvSet = { id, cvId }; return { series: { id }, cv: { id: cvId } }; },
     addFromCv: async (cvId, opts = {}) => {
-      calls.addedCv = cvId;
+      calls.addedCv = cvId; calls.addOpts = opts;
       // like the real add: the series gets the requested policy ('none' for a
       // "for these issues" add), else the default
       const row = db.prepare('SELECT id FROM series WHERE cv_id=?').get(cvId);
@@ -114,20 +110,6 @@ test('client routes serve the app shell; unknown /api 404s', async () => {
   } finally {
     s.close();
   }
-});
-
-test('POST /api/download queues issues and invokes runDownloads', async () => {
-  const { app, calls, db } = makeApp();
-  const s = await listen(app);
-  const issueId = db.prepare('SELECT id FROM issues LIMIT 1').get().id;
-  const r = await fetch(`http://localhost:${s.address().port}/api/download`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ issueIds: [issueId] }),
-  });
-  const body = await r.json();
-  assert.equal(body.queued, 1);
-  assert.deepEqual(calls.downloads[0], [issueId]);
-  s.close();
 });
 
 test('GET /api/settings returns current settings; POST saves them', async () => {
@@ -390,21 +372,6 @@ test('POST /api/collection/:id/aliases saves alternative names', async () => {
   s.close();
 });
 
-test('usenet: manual search returns releases; grab validates + forwards', async () => {
-  const { app, calls } = makeApp();
-  const s = await listen(app);
-  const base = `http://localhost:${s.address().port}`;
-  const search = await (await fetch(`${base}/api/usenet/search`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ query: 'Saga 1' }) })).json();
-  assert.equal(calls.usenetSearch.query, 'Saga 1');
-  assert.equal(search.results[0].nzbUrl, 'http://nz/1.nzb');
-  // grab requires seriesId + cvIssueId + nzbUrl
-  assert.equal((await fetch(`${base}/api/usenet/grab`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).status, 400);
-  const grab = await (await fetch(`${base}/api/usenet/grab`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ seriesId: 3, cvIssueId: 71, nzbUrl: 'http://nz/1.nzb', releaseTitle: 'Saga 001' }) })).json();
-  assert.equal(grab.grabbed, true);
-  assert.equal(calls.usenetGrab.nzbUrl, 'http://nz/1.nzb');
-  s.close();
-});
-
 test('sources: GET /api/sources lists enabled sources in priority order', async () => {
   const { app } = makeApp();
   const s = await listen(app);
@@ -416,7 +383,7 @@ test('sources: GET /api/sources lists enabled sources in priority order', async 
 
 test('an async route that throws returns 500 JSON instead of hanging (express 5)', async () => {
   const db = openDb(':memory:');
-  const app = createApp({
+  const app = createApp({ openApiBeforeSetup: true,
     db, state: { queue: {} },
     cleanupSeriesFiles: async () => { throw new Error('disk exploded'); },
   });
@@ -521,7 +488,7 @@ test('legacy basic-auth config migrates to an admin user; basic still works', as
   try {
     // createApp() runs the migration: authUser/authPass become the first admin.
     config.authUser = 'me'; config.authPass = 's3cretpass';
-    const app = createApp({ db, state: { queue: {} }, stats: () => ({ ok: 1 }) });
+    const app = createApp({ openApiBeforeSetup: true, db, state: { queue: {} }, stats: () => ({ ok: 1 }) });
     const s = await listen(app);
     const base = `http://localhost:${s.address().port}`;
     try {
@@ -541,21 +508,6 @@ test('legacy basic-auth config migrates to an admin user; basic still works', as
   } finally {
     config.authUser = ''; config.authPass = '';
   }
-});
-
-test('manual torrent pack search + grab routes', async () => {
-  const { app, calls } = makeApp();
-  const s = await listen(app);
-  const base = `http://localhost:${s.address().port}`;
-  const sr = await (await fetch(`${base}/api/torrent/search`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ seriesId: 3 }) })).json();
-  assert.deepEqual(calls.torrentSearch, { seriesId: 3 });
-  assert.equal(sr.results[0].seeders, 40);
-  const bad = await fetch(`${base}/api/torrent/grab-pack`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ seriesId: 3 }) });
-  assert.equal(bad.status, 400); // downloadUrl required
-  const ok = await (await fetch(`${base}/api/torrent/grab-pack`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ seriesId: 3, downloadUrl: 'magnet:?x', releaseTitle: 'pack' }) })).json();
-  assert.equal(ok.grabbed, true);
-  assert.equal(calls.torrentGrabPack.seriesId, 3);
-  s.close();
 });
 
 test('CV redownload re-queues an issue whose row is already done (the delete-then-cannot-queue bug)', async () => {
@@ -777,6 +729,25 @@ test('releases/download refreshes the volume once when the issue is not cached y
     r = await fetch(`${base}/api/releases/download`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ seriesId: 9, number: '2' }) });
     assert.equal(r.status, 404);
     assert.equal(calls.refreshed, 9);
-    assert.match((await r.json()).error, /isn't listed on ComicVine yet/);
+    assert.match((await r.json()).error, /isn't listed at the metadata source yet/);
+  } finally { s.close(); }
+});
+
+test('search and add use the right library metadata sources when the caller names none', async () => {
+  const { app, db, calls } = makeApp();
+  const comics = Number(db.prepare("INSERT INTO libraries (name, type, sort_order) VALUES ('Comics', 'comic', 1)").run().lastInsertRowid);
+  const manga = Number(db.prepare("INSERT INTO libraries (name, type, sort_order) VALUES ('Manga', 'manga', 0)").run().lastInsertRowid);
+  const mangaSeries = Number(db.prepare("INSERT INTO series (title, url, library_id) VALUES ('Berserk', '/c/berserk', ?)").run(manga).lastInsertRowid);
+  const s = await listen(app);
+  const base = `http://localhost:${s.address().port}`;
+  try {
+    await fetch(`${base}/api/cv/search?q=Saga`);
+    assert.equal(calls.cvSearchOpts.libraryId, comics, 'no library named: the default library new series land in');
+    await fetch(`${base}/api/cv/search?q=Berserk&seriesId=${mangaSeries}`);
+    assert.equal(calls.cvSearchOpts.libraryId, manga, "re-matching a series: that series' library");
+    await fetch(`${base}/api/cv/search?q=Saga&libraryId=${manga}`);
+    assert.equal(calls.cvSearchOpts.libraryId, manga, 'an explicit library wins');
+    await fetch(`${base}/api/collection/add-cv`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ comicvineId: 77 }) });
+    assert.equal(calls.addOpts.libraryId, comics, 'an add fetches through the library it lands in');
   } finally { s.close(); }
 });

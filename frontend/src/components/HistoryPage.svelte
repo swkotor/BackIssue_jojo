@@ -2,9 +2,11 @@
   import Icon from '../lib/Icon.svelte';
   import { untrack } from 'svelte';
   import { goBack, navigate, route, setQuery } from '../lib/router.svelte.js';
-  import { apiGet, apiPost, apiDelete } from '../lib/api.js';
+  import { apiGetOk, apiPost, apiDelete, errorText } from '../lib/api.js';
   import { subscribe } from '../lib/events.svelte.js';
-  import { fmt } from '../lib/util.js';
+  import { fmt, latestGuard } from '../lib/util.js';
+  import LoadError from './LoadError.svelte';
+  import { t, st, currentLang } from '../lib/i18n.svelte.js';
 
   let { active = false } = $props();
 
@@ -13,44 +15,36 @@
   let total = $state(0);
   let sources = $state([]);
   let loaded = $state(false);
+  let loadError = $state('');
   let findText = $state(''); // client-side filter over the loaded page
 
+  // Last request wins (a filter switch can land while the refresh is out).
+  // A failure keeps the last good page and says so.
+  const historySeq = latestGuard();
   async function renderHistory({ append = false } = {}) {
+    const isLatest = historySeq();
     const offset = append ? items.length : 0;
-    if (filter === 'failed') {
-      // Failed downloads — durable (the queue clears; this record doesn't).
-      let h;
-      try { h = await apiGet(`/api/history/failed?limit=200&offset=${offset}`); } catch { return; }
-      if (h.error) return;
-      items = append ? items.concat(h.rows) : h.rows;
-      total = h.total;
-      loaded = true;
-      return;
-    }
-    if (filter === 'blacklist') {
-      // Blacklisted releases — failed usenet posts skipped on future searches.
-      let h;
-      try { h = await apiGet(`/api/blacklist?limit=200&offset=${offset}`); } catch { return; }
-      if (h.error) return;
-      items = append ? items.concat(h.rows) : h.rows;
-      total = h.total;
-      loaded = true;
-      return;
-    }
-    const qs = `limit=200&offset=${offset}` + (filter !== 'all' ? `&source=${encodeURIComponent(filter)}` : '');
+    // Failed downloads — durable (the queue clears; this record doesn't).
+    // Blacklisted releases — failed usenet posts skipped on future searches.
+    const url = filter === 'failed' ? `/api/history/failed?limit=200&offset=${offset}`
+      : filter === 'blacklist' ? `/api/blacklist?limit=200&offset=${offset}`
+      : `/api/history?limit=200&offset=${offset}` + (filter !== 'all' ? `&source=${encodeURIComponent(filter)}` : '');
     let h;
-    try { h = await apiGet('/api/history?' + qs); } catch { return; }
-    if (h.error) return;
-    items = append ? items.concat(h.items) : h.items;
-    total = h.total;
+    try { h = await apiGetOk(url); }
+    catch (e) { if (isLatest()) { loadError = errorText(e); loaded = true; } return; }
+    if (!isLatest()) return;
+    const rows = (filter === 'failed' || filter === 'blacklist' ? h.rows : h.items) || [];
+    items = append ? items.concat(rows) : rows;
+    total = h.total ?? items.length;
     // Source filter chips — derived from the data, so any source (incl. plugins) shows.
-    sources = h.sources || [];
+    if (filter !== 'failed' && filter !== 'blacklist') sources = h.sources || [];
     loaded = true;
+    loadError = '';
   }
 
   // The source filter lives in the URL (?src=usenet) — shareable + Back/Forward.
   $effect(() => {
-    if (!active) { items = []; loaded = false; return; }
+    if (!active) { historySeq(); items = []; loaded = false; loadError = ''; return; }
     const p = new URLSearchParams(route.search);
     untrack(() => {
       filter = p.get('src') || 'all';
@@ -74,7 +68,7 @@
 
   const isFailed = $derived(filter === 'failed');
   const isBlock = $derived(filter === 'blacklist');
-  const modeNoun = $derived(isFailed ? 'failure' : isBlock ? 'blocked release' : 'import');
+  const summaryText = $derived(isFailed ? t('historyPage.nFailures', { count: total }) : isBlock ? t('historyPage.nBlocked', { count: total }) : t('historyPage.nImports', { count: total }));
 
   const srcColor = (s) => s === 'usenet' ? 'var(--green)' : s === 'torrent' ? 'var(--cyan)' : s === 'web' ? 'var(--accent)' : '#6f6885';
 
@@ -93,10 +87,10 @@
 
   function dayLabel(d) {
     const now = new Date();
-    if (d.toDateString() === now.toDateString()) return 'Today';
+    if (d.toDateString() === now.toDateString()) return t('common.today');
     const y = new Date(now); y.setDate(now.getDate() - 1);
-    if (d.toDateString() === y.toDateString()) return 'Yesterday';
-    return d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+    if (d.toDateString() === y.toDateString()) return t('common.yesterday');
+    return d.toLocaleDateString(currentLang(), { weekday: 'short', month: 'short', day: 'numeric' });
   }
   // Group the loaded rows by calendar day, preserving order.
   const days = $derived.by(() => {
@@ -114,30 +108,30 @@
     const srcCounts = {};
     for (const it of items) { const k = it.source || 'unknown'; srcCounts[k] = (srcCounts[k] || 0) + 1; }
     const bySrc = Object.entries(srcCounts).map(([k, n]) => ({ label: k, value: fmt(n), tone: srcColor(k) }));
-    if (isFailed) return [{ label: 'Failures', value: fmt(total), tone: 'var(--red)' }, ...bySrc];
-    if (isBlock) return [{ label: 'Blocked', value: fmt(total), tone: 'var(--amber)' }];
-    return [{ label: 'Imports', value: fmt(total), tone: 'var(--green)' }, ...bySrc];
+    if (isFailed) return [{ label: t('historyPage.statFailures'), value: fmt(total), tone: 'var(--red)' }, ...bySrc];
+    if (isBlock) return [{ label: t('historyPage.statBlocked'), value: fmt(total), tone: 'var(--amber)' }];
+    return [{ label: t('historyPage.statImports'), value: fmt(total), tone: 'var(--green)' }, ...bySrc];
   });
 
   const empty = $derived(
-    isFailed ? { icon: 'alert-triangle', title: 'No failed downloads', body: 'Downloads that error out are recorded here — the record persists even after the queue clears.' }
-    : isBlock ? { icon: 'ban', title: 'Nothing blocked', body: 'Failed usenet releases land here so future searches skip them. Remove one to make it eligible again.' }
-    : { icon: 'clock', title: 'Nothing imported yet', body: 'This fills in as downloads land. Imports handled by the background monitor are tracked here.' });
+    isFailed ? { icon: 'alert-triangle', title: t('historyPage.emptyFailedTitle'), body: t('historyPage.emptyFailedBody') }
+    : isBlock ? { icon: 'ban', title: t('historyPage.emptyBlockedTitle'), body: t('historyPage.emptyBlockedBody') }
+    : { icon: 'clock', title: t('historyPage.emptyImportsTitle'), body: t('historyPage.emptyImportsBody') });
 </script>
 
 <main id="history-page" class="scan-page history-page histx">
   <div class="histx__top">
     <div class="histx__head">
-      <button id="history-back" class="histx__iconbtn" aria-label="Back" onclick={goBack}><Icon name="arrow-left" size={16} /></button>
-      <h2 class="histx__title">History</h2>
-      <span id="history-summary" class="histx__summary">{fmt(total)} {modeNoun}{total === 1 ? '' : 's'}</span>
+      <button id="history-back" class="histx__iconbtn" aria-label={t('common.back')} onclick={goBack}><Icon name="arrow-left" size={16} /></button>
+      <h2 class="histx__title">{t('historyPage.title')}</h2>
+      <span id="history-summary" class="histx__summary">{summaryText}</span>
       <div class="histx__right">
         <div class="histx__find">
           <Icon name="search" size={15} />
-          <input placeholder="Filter…" bind:value={findText} spellcheck="false" />
+          <input placeholder={t('historyPage.filterPlaceholder')} bind:value={findText} spellcheck="false" />
         </div>
         {#if isBlock && items.length}
-          <button id="blacklist-clear" class="histx__clear" onclick={clearBlacklist}>Clear all</button>
+          <button id="blacklist-clear" class="histx__clear" onclick={clearBlacklist}>{t('historyPage.clearAll')}</button>
         {/if}
       </div>
     </div>
@@ -154,18 +148,21 @@
     <div class="histx__chips">
       {#each ['all', ...sources] as sc (sc)}
         <button class="histx__chip" class:is-active={filter === sc} onclick={() => setQuery({ src: sc === 'all' ? null : sc })}>
-          {#if sc !== 'all' && filter !== sc}<span class="histx__chip-dot" style="background:{srcColor(sc)};"></span>{/if}{sc === 'all' ? 'All' : sc}
+          {#if sc !== 'all' && filter !== sc}<span class="histx__chip-dot" style="background:{srcColor(sc)};"></span>{/if}{sc === 'all' ? t('historyPage.chipAll') : sc}
         </button>
       {/each}
       <div class="histx__divider"></div>
-      <button class="histx__chip histx__chip--fail" class:is-active={isFailed} onclick={() => setQuery({ src: 'failed' })}><Icon name="alert-triangle" size={14} /> Failed</button>
-      <button class="histx__chip histx__chip--block" class:is-active={isBlock} onclick={() => setQuery({ src: 'blacklist' })}><Icon name="ban" size={14} /> Blocklist</button>
+      <button class="histx__chip histx__chip--fail" class:is-active={isFailed} onclick={() => setQuery({ src: 'failed' })}><Icon name="alert-triangle" size={14} /> {t('historyPage.chipFailed')}</button>
+      <button class="histx__chip histx__chip--block" class:is-active={isBlock} onclick={() => setQuery({ src: 'blacklist' })}><Icon name="ban" size={14} /> {t('historyPage.chipBlocklist')}</button>
     </div>
   </div>
 
   <div class="histx__scroll">
     <div id="history-list" class="histx__inner">
-      {#if loaded && !filtered.length}
+      {#if loadError}
+        <LoadError compact={items.length > 0} error={loadError} onretry={() => renderHistory()} />
+      {/if}
+      {#if loaded && !filtered.length && !loadError}
         <div class="histx__empty">
           <div class="histx__empty-art"><Icon name={empty.icon} size={26} /></div>
           <div class="histx__empty-title">{empty.title}</div>
@@ -177,7 +174,7 @@
         <div class="histx__day">{d.label}</div>
         {#each d.rows as { it, ts } (it.id ?? (it.series_id + '' + ts.getTime()))}
           {@const tone = isFailed ? 'var(--red)' : isBlock ? 'var(--amber)' : 'var(--green)'}
-          <div class="histx__row" title={it.path || ts.toLocaleString()}>
+          <div class="histx__row" title={it.path || ts.toLocaleString(currentLang())}>
             <span class="histx__ico" style="color:{tone}; background:color-mix(in srgb, {tone} 12%, transparent);">
               <Icon name={isFailed ? 'close' : isBlock ? 'ban' : 'check'} size={15} />
             </span>
@@ -188,20 +185,20 @@
                 {:else}<span class="histx__t">{it.series_title || it.title || it.title_norm || '?'}</span>{/if}
                 <span class="histx__num">{it.issue_number != null && it.issue_number !== '' ? ` #${it.issue_number}` : ''}</span>
               </div>
-              {#if isFailed && it.error}<div class="histx__detail histx__detail--err">{it.error}</div>
+              {#if isFailed && it.error}<div class="histx__detail histx__detail--err">{st('errors', it.error)}</div>
               {:else if isBlock && it.title && it.title !== it.series_title}<div class="histx__detail histx__detail--mono">{it.title}{#if it.reason} · {it.reason}{/if}</div>
               {:else if isBlock && it.reason}<div class="histx__detail">{it.reason}</div>{/if}
             </div>
-            <span class="histx__time" title={ts.toLocaleString()}>{ts.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+            <span class="histx__time" title={ts.toLocaleString(currentLang())}>{ts.toLocaleTimeString(currentLang(), { hour: '2-digit', minute: '2-digit' })}</span>
             {#if isBlock}
-              <button class="histx__remove" title="Remove from blocklist — allow auto-grab again" onclick={() => removeBlacklisted(it.id)}>Remove</button>
+              <button class="histx__remove" title={t('historyPage.removeFromBlocklist')} onclick={() => removeBlacklisted(it.id)}>{t('common.remove')}</button>
             {/if}
             <span class="histx__src" style="color:{srcColor(it.source)}; border-color:color-mix(in srgb, {srcColor(it.source)} 45%, transparent); background:color-mix(in srgb, {srcColor(it.source)} 12%, transparent);">{it.source || '?'}</span>
           </div>
         {/each}
       {/each}
 
-      <button id="history-more" class="histx__more" hidden={items.length >= total} onclick={() => renderHistory({ append: true })}>Load more</button>
+      <button id="history-more" class="histx__more" hidden={items.length >= total} onclick={() => renderHistory({ append: true })}>{t('historyPage.loadMore')}</button>
     </div>
   </div>
 </main>
@@ -257,6 +254,7 @@
   .histx__time { font: 11px var(--font-mono); color: #6f6885; flex: none; }
   .histx__remove { opacity: .4; height: 28px; padding: 0 11px; border: 1px solid var(--line); background: transparent; color: var(--muted); border-radius: 7px; font: 600 11.5px var(--font-body); cursor: pointer; flex: none; transition: opacity .12s; }
   .histx__row:hover .histx__remove { opacity: 1; }
+  @media (hover: none), (pointer: coarse) { .histx__remove { opacity: 1; } }
   .histx__remove:hover { color: var(--text); }
   .histx__src { font: 600 10px var(--font-body); text-transform: uppercase; letter-spacing: .04em; border: 1px solid; border-radius: 5px; padding: 2px 7px; flex: none; }
 

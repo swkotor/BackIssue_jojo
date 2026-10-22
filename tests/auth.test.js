@@ -31,15 +31,23 @@ test('password hashing round-trips and rejects wrong passwords', () => {
   assert.ok(!verifyPassword('wrong', h));
 });
 
-test('zero users = open mode; first registration becomes admin and closes it', async () => {
+test('zero users: only sign-up is reachable; first registration becomes admin', async () => {
   const { app } = makeApp();
   const s = await listen(app);
   const base = `http://localhost:${s.address().port}`;
   try {
-    // open mode: API reachable without credentials, me() says so
+    // Before the first account: me() says setup is pending, and nothing else
+    // in the API (or a plugin route, or a change) answers without an account.
     const me0 = await (await fetch(`${base}/api/auth/me`)).json();
     assert.equal(me0.openMode, true);
-    assert.equal((await fetch(`${base}/api/series`)).status, 200);
+    const locked = await fetch(`${base}/api/series`);
+    assert.equal(locked.status, 401);
+    assert.equal((await locked.json()).setupRequired, true);
+    assert.equal((await fetch(`${base}/api/settings`)).status, 401);
+    assert.equal((await fetch(`${base}/api/settings`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).status, 401);
+    assert.equal((await fetch(`${base}/api/users`)).status, 401);
+    assert.equal((await fetch(`${base}/plugins/anything/client/ui.js`)).status, 401);
+    assert.equal((await fetch(`${base}/api/auth/providers`)).status, 200, 'the sign-up screen still loads');
 
     // first registration → admin, gets a session cookie
     const reg = await fetch(`${base}/api/auth/register`, {
@@ -269,9 +277,9 @@ test('shell injection: plugin tags ride the served shell only for a session', as
   const s = await listen(app);
   const base = `http://localhost:${s.address().port}`;
   try {
-    // open mode: the shell carries the plugin bootstrap inline
-    const open = await (await fetch(`${base}/`)).text();
-    assert.match(open, /__BI_PLUGINS_INLINE__/, 'open mode gets inline plugin assets');
+    // no accounts yet: the create-account page is plugin-free too
+    const setup = await (await fetch(`${base}/`)).text();
+    assert.ok(!setup.includes('__BI_PLUGINS_INLINE__'), 'the setup page carries no plugin assets');
 
     // accounts exist: an anonymous shell is plugin-free, a session's is not
     const reg = await fetch(`${base}/api/auth/register`, {
@@ -316,6 +324,22 @@ test('login throttling: five failures lock the key; Basic honors the lock', asyn
 
     // other users are unaffected (per ip+username key)
     assert.equal((await fetch(`${base}/api/users`, { headers: adminH })).status, 200);
+  } finally { clearAuthThrottle(); s.close(); }
+});
+
+test('login throttling: one address spraying many usernames is locked too', async () => {
+  const { clearAuthThrottle } = await import('../src/users.js');
+  clearAuthThrottle();
+  const { s, base } = await appWithAdmin();
+  try {
+    const attempt = (username) => fetch(`${base}/api/auth/login`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username, password: 'wrong-wrong' }),
+    });
+    // A different username each time never trips the per-username key...
+    for (let i = 0; i < 30; i++) assert.equal((await attempt(`nobody${i}`)).status, 401);
+    // ...but the address as a whole is now locked.
+    assert.equal((await attempt('nobody-else')).status, 429);
   } finally { clearAuthThrottle(); s.close(); }
 });
 
@@ -366,7 +390,7 @@ test('basicAuth routes send a WWW-Authenticate challenge on 401; the SPA does no
   // readers know to send credentials. Core routes must NOT — a browser would
   // pop a native Basic dialog otherwise.
   const db = openDb(':memory:');
-  const app = createApp({
+  const app = createApp({ openApiBeforeSetup: true,
     db, state: { queue: {} },
     getSettings: () => ({}), saveSettings: (b) => b,
     prepareRedownload: async () => {}, runDownloads: async () => {},
@@ -497,4 +521,171 @@ test('HTTP Basic falls back to a credential provider (WHMCS/LDAP), so OPDS clien
     assert.equal(selfSet.status, 403);
     assert.match((await selfSet.json()).error, /external service/);
   } finally { clearAuthThrottle(); s.close(); }
+});
+
+test('SSO-only: password login off also refuses non-admin passwords over HTTP Basic', async () => {
+  const config = (await import('../src/config.js')).default;
+  const users = await import('../src/users.js');
+  const { app, db } = makeApp();
+  users.initUserTables(db);
+  users.createUser(db, { username: 'boss', password: 'adminpass1', role: 'admin' });
+  users.createUser(db, { username: 'reader', password: 'viewerpass1', role: 'viewer' });
+  const s = await listen(app);
+  const base = `http://localhost:${s.address().port}`;
+  const basic = (u, p) => ({ authorization: 'Basic ' + Buffer.from(`${u}:${p}`).toString('base64') });
+  const saved = config.passwordLoginDisabled;
+  try {
+    assert.equal((await fetch(`${base}/api/series`, { headers: basic('reader', 'viewerpass1') })).status, 200, 'Basic works while passwords are allowed');
+    config.passwordLoginDisabled = true;
+    const login = await fetch(`${base}/api/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'reader', password: 'viewerpass1' }) });
+    assert.equal(login.status, 403, 'the sign-in form refuses the password');
+    assert.equal((await fetch(`${base}/api/series`, { headers: basic('reader', 'viewerpass1') })).status, 401, 'and so does Basic');
+    assert.equal((await fetch(`${base}/api/series`, { headers: basic('boss', 'adminpass1') })).status, 200, 'admins keep the escape hatch');
+    const providers = await (await fetch(`${base}/api/auth/providers`)).json();
+    assert.equal(providers.apiKeyBasic, true, 'clients learn an API key is the way in');
+    // An API key as the Basic password still gets a non-admin in (OPDS readers).
+    const readerId = db.prepare("SELECT id FROM users WHERE username='reader'").get().id;
+    const apiKey = users.createApiKey(db, readerId);
+    assert.equal((await fetch(`${base}/api/series`, { headers: basic('reader', apiKey) })).status, 200, 'API key over Basic works');
+    assert.equal((await fetch(`${base}/api/series`, { headers: basic('', apiKey) })).status, 200, 'blank username is fine');
+    assert.equal((await fetch(`${base}/api/series`, { headers: basic('boss', apiKey) })).status, 401, "another user's name with this key is refused");
+    assert.equal((await fetch(`${base}/api/series`, { headers: basic('reader', 'bi_' + '0'.repeat(40)) })).status, 401, 'an unknown key is refused');
+  } finally { config.passwordLoginDisabled = saved; s.close(); }
+});
+
+test('admin sets a local user\'s password: the new one works, the old one and their sessions do not', async () => {
+  const users = await import('../src/users.js');
+  const { app, db } = makeApp();
+  users.initUserTables(db);
+  const boss = users.createUser(db, { username: 'boss2', password: 'adminpass1', role: 'admin' });
+  const locked = users.createUser(db, { username: 'forgot', password: 'oldpassword1', role: 'viewer' });
+  const oldSession = users.createSession(db, locked.id);
+  const s = await listen(app);
+  const base = `http://localhost:${s.address().port}`;
+  const adminH = { 'content-type': 'application/json', cookie: 'bi_session=' + users.createSession(db, boss.id) };
+  const login = (password) => fetch(`${base}/api/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'forgot', password }) });
+  try {
+    const r = await fetch(`${base}/api/users/${locked.id}`, { method: 'PATCH', headers: adminH, body: JSON.stringify({ password: 'brandNewPass9' }) });
+    assert.equal(r.status, 200);
+    assert.equal((await login('brandNewPass9')).status, 200, 'the new password signs in');
+    assert.equal((await login('oldpassword1')).status, 401, 'the old one no longer does');
+    assert.equal(users.sessionUser(db, oldSession), null, 'their existing sessions were signed out');
+    const short = await fetch(`${base}/api/users/${locked.id}`, { method: 'PATCH', headers: adminH, body: JSON.stringify({ password: 'short' }) });
+    assert.equal(short.status, 400, 'too short is refused');
+  } finally { s.close(); }
+});
+
+test('libraries: creating, editing or deleting one needs settings.manage, since it decides folders on disk', async () => {
+  const users = await import('../src/users.js');
+  const { app, db } = makeApp();
+  users.initUserTables(db);
+  const admin = users.createUser(db, { username: 'root1', password: 'adminpass1', role: 'admin' });
+  const trusted = users.createUser(db, { username: 'helper', password: 'helperpass1', role: 'trusted' });
+  const H = (u) => ({ 'content-type': 'application/json', cookie: 'bi_session=' + users.createSession(db, u.id) });
+  const s = await listen(app);
+  const base = `http://localhost:${s.address().port}`;
+  try {
+    const post = (u, path, body) => fetch(`${base}${path}`, { method: 'POST', headers: H(u), body: JSON.stringify(body) });
+    assert.equal((await fetch(`${base}/api/libraries`, { headers: H(trusted) })).status, 200, 'viewing the list is fine');
+    assert.equal((await post(trusted, '/api/libraries', { name: 'Sneaky', type: 'comic', rootFolder: '/etc' })).status, 403, 'a library manager cannot point a library at a folder');
+    const made = await post(admin, '/api/libraries', { name: 'Comics', type: 'comic' });
+    assert.equal(made.status, 200);
+    const id = db.prepare("SELECT id FROM libraries WHERE name='Comics'").get().id;
+    assert.equal((await post(trusted, `/api/libraries/${id}`, { name: 'Comics', type: 'comic', rootFolder: '/etc' })).status, 403);
+    assert.equal((await fetch(`${base}/api/libraries/${id}`, { method: 'DELETE', headers: H(trusted) })).status, 403);
+    assert.equal((await fetch(`${base}/api/libraries/${id}`, { method: 'DELETE', headers: H(admin) })).status, 200);
+  } finally { s.close(); }
+});
+
+test('login page lists an auth provider only once it is set up, with its current label', async () => {
+  let ready = false; let label = 'SSO';
+  pluginApi.registerAuthProvider({ id: 'test-sso', label: 'SSO', loginPath: '/api/test-sso/login', isEnabled: () => ready, getLabel: () => label });
+  const { app } = makeApp();
+  const s = await listen(app);
+  const base = `http://localhost:${s.address().port}`;
+  const listed = async () => (await (await fetch(`${base}/api/auth/providers`)).json()).providers.find((p) => p.id === 'test-sso');
+  try {
+    assert.equal(await listed(), undefined, 'no button before it is configured');
+    ready = true; label = 'Company login';
+    assert.equal((await listed())?.label, 'Company login', 'shown once set up, with the label as it is now');
+  } finally { s.close(); }
+});
+
+test('the account switch for mature content holds over Basic, for local and provider accounts', async () => {
+  // OPDS apps sign in with HTTP Basic. An account that hid mature content for
+  // itself must not get it back that way, and toggling takes effect at once.
+  const { clearAuthThrottle } = await import('../src/users.js');
+  clearAuthThrottle();
+  pluginApi.registerCredentialProvider(async (username, password) =>
+    username === 'grown@x.com' && password === 'remote-pass'
+      ? { provider: 'mock-mature-billing', subject: 'm-1', email: 'grown@x.com', name: 'Grown', defaultRole: 'admin' }
+      : null);
+  const { app, db } = makeApp();
+  const s = await listen(app);
+  const base = `http://localhost:${s.address().port}`;
+  try {
+    await fetch(`${base}/api/auth/register`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'adminpass1' }),
+    });
+    db.prepare("INSERT INTO series (title, url, restricted) VALUES ('Plain', 'u:plain', 0), ('Mature', 'u:mature', 1)").run();
+    const titles = async (auth) => (await (await fetch(`${base}/api/series`, { headers: { authorization: auth } })).json()).map((x) => x.title).sort();
+    const toggle = (auth, hide) => fetch(`${base}/api/auth/hide-mature`, {
+      method: 'POST', headers: { authorization: auth, 'content-type': 'application/json' }, body: JSON.stringify({ hide }),
+    });
+
+    const local = 'Basic ' + Buffer.from('admin:adminpass1').toString('base64');
+    assert.deepEqual(await titles(local), ['Mature', 'Plain']);
+    assert.equal((await toggle(local, true)).status, 200);
+    assert.deepEqual(await titles(local), ['Plain'], 'password Basic honors the switch');
+
+    const remote = 'Basic ' + Buffer.from('grown@x.com:remote-pass').toString('base64');
+    assert.deepEqual(await titles(remote), ['Mature', 'Plain']);
+    assert.equal((await toggle(remote, true)).status, 200);
+    assert.deepEqual(await titles(remote), ['Plain'], 'provider Basic honors it too, without waiting out its cache');
+    await toggle(remote, false);
+    assert.deepEqual(await titles(remote), ['Mature', 'Plain']);
+  } finally { s.close(); }
+});
+
+test('libraries: reorder and pick the default; both admin-only, and new series land in the default', async () => {
+  const users = await import('../src/users.js');
+  const { defaultLibrary, createCvSeries, assignSeriesLibrary } = await import('../src/db.js');
+  pluginApi.registerLibraryType({ id: 'ebook', label: 'Books' }); // as the ebooks plugin does
+  const { app, db } = makeApp();
+  users.initUserTables(db);
+  const admin = users.createUser(db, { username: 'root2', password: 'adminpass1', role: 'admin' });
+  const trusted = users.createUser(db, { username: 'helper2', password: 'helperpass1', role: 'trusted' });
+  const H = (u) => ({ 'content-type': 'application/json', cookie: 'bi_session=' + users.createSession(db, u.id) });
+  const s = await listen(app);
+  const base = `http://localhost:${s.address().port}`;
+  try {
+    const post = (u, path, body) => fetch(`${base}${path}`, { method: 'POST', headers: H(u), body: JSON.stringify(body || {}) });
+    for (const [name, type] of [['Comics', 'comic'], ['Indie', 'comic'], ['Books', 'ebook']]) await post(admin, '/api/libraries', { name, type });
+    const id = (name) => db.prepare('SELECT id FROM libraries WHERE name=?').get(name).id;
+    const names = async () => (await (await fetch(`${base}/api/libraries`, { headers: H(admin) })).json()).libraries.map((l) => l.name);
+    assert.deepEqual(await names(), ['Comics', 'Indie', 'Books']);
+    assert.equal(defaultLibrary(db).name, 'Comics', 'no choice yet: the first comic library');
+
+    assert.equal((await post(trusted, '/api/libraries/order', { ids: [id('Books')] })).status, 403);
+    const moved = await post(admin, '/api/libraries/order', { ids: [id('Books'), id('Indie')] });
+    assert.equal(moved.status, 200);
+    assert.deepEqual(await names(), ['Books', 'Indie', 'Comics'], 'named ids first, the rest after');
+    assert.equal(defaultLibrary(db).name, 'Indie', 'reordering alone moves the fallback default');
+
+    assert.equal((await post(trusted, `/api/libraries/${id('Comics')}/default`)).status, 403);
+    assert.equal((await post(admin, `/api/libraries/${id('Books')}/default`)).status, 400, 'a book library cannot take comic series');
+    const set = await post(admin, `/api/libraries/${id('Comics')}/default`);
+    assert.equal((await set.json()).defaultId, id('Comics'));
+    assert.equal(defaultLibrary(db).name, 'Comics', 'the chosen default wins over order');
+    await post(admin, '/api/libraries/order', { ids: [id('Indie')] });
+    assert.equal(defaultLibrary(db).name, 'Comics', 'and survives a reorder');
+
+    const sid = createCvSeries(db, { cvId: 4242, title: 'New Thing' });
+    assignSeriesLibrary(db, sid, defaultLibrary(db).id);
+    assert.equal(db.prepare('SELECT library_id FROM series WHERE id=?').get(sid).library_id, id('Comics'));
+
+    db.prepare('UPDATE libraries SET type=? WHERE id=?').run('ebook', id('Comics'));
+    assert.equal(defaultLibrary(db).name, 'Indie', 'a default retyped away from comics falls back');
+  } finally { s.close(); }
 });

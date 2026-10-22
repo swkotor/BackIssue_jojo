@@ -1,11 +1,12 @@
 // Session state + auth actions. The app boots by asking /api/auth/me:
-//   openMode  — no accounts exist yet; the app runs unauthenticated (classic
-//               single-user appliance) and the sidebar offers to secure it.
+//   openMode  — no accounts exist yet; the app shows only the create-account
+//               screen, and the server refuses the rest of the API until then.
 //   user      — the signed-in account { id, username, role, permissions }.
 // The server resolves the role to a permission list ('*' = everything);
-// components use can()/isTrusted/isAdmin to hide affordances the server
+// components use can()/isTrusted to hide affordances the server
 // would 403 anyway — the middleware is the real enforcement.
-import { apiGet, apiPost } from './api.js';
+import { apiGet, apiPost, onSessionLost } from './api.js';
+import { currentLang, setLanguage, matchLanguage } from './i18n.svelte.js';
 
 export const auth = $state({
   ready: false,
@@ -21,7 +22,6 @@ export const can = (perm) => {
 };
 // Legacy aliases, mapped onto the permissions the old tiers implied.
 export const isTrusted = () => can('library.manage');
-export const isAdmin = () => can('users.manage');
 
 export async function loadMe() {
   try {
@@ -29,6 +29,10 @@ export async function loadMe() {
     auth.openMode = !!r.openMode;
     auth.user = r.user || null;
     auth.registration = !!r.registration;
+    // Signing in without a reload: switch to the account's language now (a
+    // fresh page load gets it from the server shell before anything renders).
+    const want = matchLanguage(r.user?.lang);
+    if (want && want !== currentLang()) await setLanguage(want);
   } catch {
     auth.openMode = false;
     auth.user = null;
@@ -58,10 +62,10 @@ export async function logout() {
   location.href = '/';
 }
 
-// api.js calls this on any 401 — the session expired or was revoked.
+// api.js calls this on any 401 — the session expired or was revoked. Before
+// the first account exists every API call is refused (setup pending), which
+// isn't a lost session: stay on the create-account screen.
 export function sessionLost() {
-  if (auth.ready && (auth.user || auth.openMode)) {
-    auth.user = null;
-    auth.openMode = false;
-  }
+  if (auth.ready && auth.user) auth.user = null;
 }
+onSessionLost(sessionLost);

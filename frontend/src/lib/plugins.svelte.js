@@ -12,6 +12,7 @@ import { auth } from './auth.svelte.js';
 import { detailSelected } from './store.svelte.js';
 import { navigate } from './router.svelte.js';
 import { status } from './status.svelte.js';
+import { t, th, st, currentLang, addMessages } from './i18n.svelte.js';
 
 // Flips when plugin assets have loaded — the Settings page watches it so
 // plugin-injected fields get populated even if Settings was opened first.
@@ -51,6 +52,22 @@ export function renderSeriesView(view, container, { series, issues, refresh }) {
   } catch (e) { console.warn('plugin series view failed', e); }
 }
 
+// Plugin-owned tabs on the Wanted page (e.g. wanted books and audiobooks).
+// Each is { id, label, render(container, ctx) }; the page shows a Comics tab
+// plus one per entry, and hands the active plugin tab a plain container to
+// draw into (cleared between calls). Reactive so a late registration shows.
+export const wantedTabs = $state([]);
+export function renderWantedTab(tab, container) {
+  try {
+    tab.render(container, {
+      get: bi.api.get, post: bi.api.post,
+      del: async (path) => (await fetch(path, { method: 'DELETE' })).json(),
+      can: bi.api.can, icon: bi.api.icon, toast: bi.api.toast,
+      openSeries: bi.api.openSeries,
+    });
+  } catch (e) { console.warn('plugin wanted tab failed', e); }
+}
+
 // Plugin-provided LIBRARY FILTERS. A plugin that owns a library type can supply
 // facet groups (author / decade / format / status / …) that core's Filters modal
 // renders over the REAL grid — core stays the grid renderer, the plugin is a pure
@@ -86,13 +103,22 @@ const bi = {
     // '' for an unknown name. e.g. api.icon('download'), api.icon('star', { fill: true }).
     icon: (name, opts) => iconSvg(name, opts),
     // Host toast system — plugins report outcomes the same way core does.
-    // type: 'info' | 'ok' | 'error'.
+    // type: 'info' | 'ok' | 'warn' | 'error'.
     toast: (msg, type) => notify(msg, type),
     // Neutralize javascript:/data: URLs on plugin-rendered links (returns ''
     // to drop an unsafe scheme). Plugins building <a href> from CV/user data
     // MUST route it through here.
     safeUrl: (u) => safeUrl(u),
     slot: (id) => document.getElementById(id),
+    // Translations. t('ns.key', params) looks up core's catalogs plus any the
+    // plugin registered; th() is the same for innerHTML (params escaped, only
+    // <b>/<i>/<code>/<br> allowed through); lang() is the active code.
+    // registerMessages({ en: { myplugin: { key: 'text' } }, fr: { … } }) adds a
+    // plugin's own strings — call it before rendering anything.
+    t: (key, params) => t(key, params),
+    th: (key, params) => th(key, params),
+    lang: () => currentLang(),
+    registerMessages(catalogs) { addMessages(catalogs); },
     // The already-resolved session ({ openMode, user } with permissions) —
     // spares plugin clients an /api/auth/me roundtrip on boot. May be
     // pre-resolution (user null, openMode false): fall back to fetching.
@@ -126,6 +152,12 @@ const bi = {
     // and holds the opaque `selection`; the matching series are resolved on the
     // server by the plugin's registerCollectionFilter. ctx = { get, post, type,
     // libraryId }.
+    // Add a tab to the Wanted page: { id, label, render(container, ctx) }.
+    // label may be a function (re-read on every render, so it can follow the
+    // language). ctx = { get, post, del, can, icon, toast, openSeries }.
+    registerWantedTab(tab) {
+      if (tab && tab.id && typeof tab.render === 'function' && !wantedTabs.some((x) => x.id === tab.id)) wantedTabs.push(tab);
+    },
     registerLibraryFilters(provider) {
       if (provider && Array.isArray(provider.types) && typeof provider.groups === 'function') libraryFilters.push(provider);
     },
@@ -181,7 +213,7 @@ const bi = {
         if (section) {
           const head = document.createElement('div');
           head.className = 'sidenav__head';
-          head.textContent = section;
+          head.textContent = st('menuSections', section);
           group.appendChild(head);
         }
         area.appendChild(group);

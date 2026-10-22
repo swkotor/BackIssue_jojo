@@ -1,20 +1,25 @@
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import config from './config.js';
 import { findComicFiles, parseIssueFromFilename, COMIC_RE } from './scanner.js';
 import { readArchiveInfo, verifyArchive, sidecarPath } from './archive.js';
 import { upsertLibraryFile, getLibraryFile, pruneLibraryFiles, libraryStats, linkLibraryFile, deleteLibraryFile, getCvIssue } from './db.js';
 import { normalizeNumber } from './matcher.js';
 import { poolWithResource } from './pool.js';
-import { linkFile } from './collection.js';
-import { linkFilesToCv } from './cvmatch.js';
+import { linkFile, issueForFile } from './collection.js';
+import { linkFilesToCv, relinkMatchedSeries } from './cvmatch.js';
 
 // After a fresh download lands for an issue, remove any OTHER file in the series
 // that represents the SAME issue — a re-download replaces the old copy (incl. a
 // stale/corrupt .cbr the new .cbz supersedes). Matches by CV issue id and by
 // normalized issue number, so it also catches files that were never CV-linked.
+// Never on a broken download (the old copy is the only good one), never a file
+// linked to a DIFFERENT issue, and a number match needs both or neither to be
+// an annual (Batman Annual 001 is not Batman #1).
+const isAnnual = (name) => /\bannual\b/i.test(String(name || ''));
 async function supersedeOldFiles(db, newPath, seriesId) {
   const row = getLibraryFile(db, newPath);
-  if (!row || seriesId == null) return 0;
+  if (!row || seriesId == null || !row.valid) return 0;
   let num = null;
   if (row.cv_issue_id != null) { const ci = getCvIssue(db, row.cv_issue_id); if (ci) num = normalizeNumber(ci.issue_number); }
   if (!num) num = normalizeNumber(row.ci_number || parseIssueFromFilename(row.name));
@@ -22,7 +27,9 @@ async function supersedeOldFiles(db, newPath, seriesId) {
   let removed = 0;
   for (const f of siblings) {
     const sameCv = row.cv_issue_id != null && f.cv_issue_id === row.cv_issue_id;
-    const sameNum = num && normalizeNumber(f.ci_number || parseIssueFromFilename(f.name)) === num;
+    const otherIssue = row.cv_issue_id != null && f.cv_issue_id != null && f.cv_issue_id !== row.cv_issue_id;
+    const sameNum = !otherIssue && num && isAnnual(f.name) === isAnnual(row.name)
+      && normalizeNumber(f.ci_number || parseIssueFromFilename(f.name)) === num;
     if (!sameCv && !sameNum) continue;
     try { await fs.unlink(f.path); } catch { /* already gone */ }
     deleteLibraryFile(db, f.path);
@@ -86,6 +93,19 @@ export async function removeExtraCopies(db, seriesId, { dryRun = false } = {}) {
   return { removed: removed.length, kept, deleted: removed };
 }
 
+// A folder the walk could not read (a share hiccup, EIO, a permission blip)
+// says nothing about its files: count every indexed file under it as seen so
+// the prune keeps them, rather than dropping the subtree and re-wanting it.
+function keepUnreadable(db, seen, dirs = []) {
+  if (!dirs.length) return;
+  const under = db.prepare('SELECT path FROM library_files WHERE substr(path, 1, ?) = ?');
+  for (const d of dirs) {
+    const prefix = d.replace(/[\\/]+$/, '') + path.sep;
+    for (const r of under.all(prefix.length, prefix)) seen.add(r.path);
+  }
+  console.warn(`Library scan: could not read ${dirs.length} folder(s), their files were kept: ${dirs.slice(0, 5).join(', ')}${dirs.length > 5 ? ', …' : ''}`);
+}
+
 // Walk the library, read each new/changed file's metadata + health into
 // library_files, skip unchanged files (mtime+size), and prune deleted ones.
 // `collect` (optional): accumulate seen paths there and SKIP pruning — the
@@ -98,6 +118,9 @@ export async function indexLibrary({ db, dir, deep = false, onProgress = () => {
   if (!dirOk) return { total: 0, error: `folder not found: ${dir}` };
   const files = await findComicFiles(dir);
   const seen = collect ?? new Set();
+  const memo = new Map(); // series/issue lookups shared by this scan's files
+  const touched = new Set(); // series whose files this scan added, changed or linked
+  keepUnreadable(db, seen, files.failedDirs);
   let done = 0;
   await poolWithResource(
     files, config.libraryConcurrency || 8,
@@ -109,7 +132,10 @@ export async function indexLibrary({ db, dir, deep = false, onProgress = () => {
       const mtime = Math.floor(st.mtimeMs);
       const size = st.size;
       const existing = getLibraryFile(db, f.path);
-      if (existing && existing.mtime === mtime && existing.size === size && (!deep || existing.verified)) {
+      // A comic archive recorded as valid with no pages was indexed before
+      // page-less archives were flagged: read it again rather than trust it.
+      const stalePageless = existing && existing.valid === 1 && existing.page_count === 0 && /\.(cbz|cbr)$/i.test(f.path);
+      if (existing && !stalePageless && existing.mtime === mtime && existing.size === size && (!deep || existing.verified)) {
         // Unchanged on disk — skip the re-read, but re-link if it isn't linked yet
         // (e.g. files indexed before linking existed). Uses the stored metadata, no I/O.
         if (existing.series_id == null) {
@@ -117,8 +143,9 @@ export async function indexLibrary({ db, dir, deep = false, onProgress = () => {
             path: existing.path, dir: existing.dir, name: existing.name,
             ci_series: existing.ci_series, ci_volume: existing.ci_volume,
             ci_number: existing.ci_number, has_metadata: existing.has_metadata,
-          });
+          }, memo);
           linkLibraryFile(db, existing.path, link.seriesId, link.issueId);
+          if (link.seriesId) touched.add(link.seriesId);
         }
         onProgress({ done: ++done, total: files.length, read: 0 });
         return;
@@ -147,8 +174,11 @@ export async function indexLibrary({ db, dir, deep = false, onProgress = () => {
       // that already have a series keep it (upsertLibraryFile preserves it);
       // this mirrors the unchanged-file path above.
       if (existing?.series_id == null) {
-        const link = linkFile(db, { path: f.path, dir: f.dir, name: f.name, ci_series: ci.series, ci_volume: ci.volume, ci_number: ci.number, has_metadata: info.hasComicInfo ? 1 : 0 });
+        const link = linkFile(db, { path: f.path, dir: f.dir, name: f.name, ci_series: ci.series, ci_volume: ci.volume, ci_number: ci.number, has_metadata: info.hasComicInfo ? 1 : 0 }, memo);
         linkLibraryFile(db, f.path, link.seriesId, link.issueId);
+        if (link.seriesId) touched.add(link.seriesId);
+      } else {
+        touched.add(existing.series_id); // its number/metadata may have changed
       }
       onProgress({ done: ++done, total: files.length, read: 1 });
     },
@@ -156,11 +186,9 @@ export async function indexLibrary({ db, dir, deep = false, onProgress = () => {
   );
   if (!collect) pruneLibraryFiles(db, seen, COMIC_RE); // multi-root callers prune once, at the end; comic files only — other indexers own their own rows
   // Now that files are attributed to series (above), link them to CV issues for
-  // every matched series so the collection's owned/missing rolls up against
-  // ComicVine. Pure DB, no I/O.
-  for (const s of db.prepare('SELECT id, cv_id FROM series WHERE cv_id IS NOT NULL').all()) {
-    try { linkFilesToCv(db, s.id, s.cv_id); } catch { /* skip */ }
-  }
+  // the matched series this scan touched so the collection's owned/missing rolls
+  // up against ComicVine. Pure DB, no I/O. (Boot and the relink tool cover all.)
+  await relinkMatchedSeries(db, { seriesIds: touched });
   return libraryStats(db);
 }
 
@@ -173,6 +201,7 @@ export async function indexFolderForSeries({ db, dir, seriesId, cvId = null, dee
   const dirOk = await fs.stat(dir).then((s) => s.isDirectory()).catch(() => false);
   if (!dirOk) return { total: 0, error: `folder not found: ${dir}` };
   const files = await findComicFiles(dir);
+  const memo = new Map();
   let done = 0;
   await poolWithResource(
     files, config.libraryConcurrency || 8,
@@ -194,11 +223,10 @@ export async function indexFolderForSeries({ db, dir, seriesId, cvId = null, dee
           valid, error, verified,
         });
       }
-      // Force attribution to THIS comic; borrow the source issue id from the
-      // matcher when it agrees on the series (owned still rolls up via CV).
+      // Force attribution to THIS comic (the folder is its location) and match
+      // the file to one of its issues by number (owned still rolls up via CV).
       const row = getLibraryFile(db, f.path);
-      const link = linkFile(db, row);
-      linkLibraryFile(db, f.path, seriesId, link.seriesId === seriesId ? link.issueId : null);
+      linkLibraryFile(db, f.path, seriesId, issueForFile(db, seriesId, row, memo));
       onProgress({ done: ++done, total: files.length });
     },
     () => {},
@@ -250,13 +278,19 @@ export async function indexDownloadedFile(db, { path: p, seriesId, issueId = nul
 // One-time cleanup for libraries indexed under the old global model: attribute
 // any orphaned files to their catalog series, CV-link matched series, then prune
 // files that don't belong to a tracked comic (followed or ComicVine-matched).
+// Series that just gained files are CV-linked here; the relink of every
+// matched series is left to the caller (relinkMatchedSeries), which yields so
+// boot isn't frozen behind it.
 export function reconcileLibrary(db) {
   let attributed = 0;
+  const memo = new Map();
+  const gained = new Set();
   for (const f of db.prepare('SELECT * FROM library_files WHERE series_id IS NULL').all()) {
-    const link = linkFile(db, f);
-    if (link.seriesId) { linkLibraryFile(db, f.path, link.seriesId, link.issueId); attributed++; }
+    const link = linkFile(db, f, memo);
+    if (link.seriesId) { linkLibraryFile(db, f.path, link.seriesId, link.issueId); attributed++; gained.add(link.seriesId); }
   }
   for (const s of db.prepare('SELECT id, cv_id FROM series WHERE cv_id IS NOT NULL').all()) {
+    if (!gained.has(s.id)) continue;
     try { linkFilesToCv(db, s.id, s.cv_id); } catch { /* skip */ }
   }
   // Members of an explicit library are tracked by definition (libraries own

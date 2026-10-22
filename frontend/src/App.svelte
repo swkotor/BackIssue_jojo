@@ -1,34 +1,29 @@
 <script>
   import { untrack } from 'svelte';
   import { route, navigate, goBack, OVERLAY_PATHS, activeDrawer } from './lib/router.svelte.js';
-  import { rail, railSelect, detail, loadCollection, openVolume, clearDetail, loadFlags, startOpsTracking, librarySort } from './lib/store.svelte.js';
+  import { rail, railSelect, detail, flags, loadCollection, openVolume, clearDetail, loadFlags, startOpsTracking, librarySort, PLACEHOLDER_TITLE } from './lib/store.svelte.js';
   import Icon from './lib/Icon.svelte';
   import { startStatusPolling } from './lib/status.svelte.js';
   import { startEvents } from './lib/events.svelte.js';
   import { loadClientPlugins } from './lib/plugins.svelte.js';
   import { closeTopModal } from './lib/modals.svelte.js';
+  import { t } from './lib/i18n.svelte.js';
 
   import Header from './components/Header.svelte';
   import Sidebar from './components/Sidebar.svelte';
   import LibraryPage from './components/LibraryPage.svelte';
   import SeriesDetail from './components/SeriesDetail.svelte';
+  // Settings, System (the tools grid) and Profile hold plugin mount points,
+  // so they load with the app; the other section pages are their own chunks
+  // (LazyPage), fetched on first open.
   import SettingsPage from './components/SettingsPage.svelte';
   import SystemPage from './components/SystemPage.svelte';
-  import WantedPage from './components/WantedPage.svelte';
-  import HistoryPage from './components/HistoryPage.svelte';
-  import StatsPage from './components/StatsPage.svelte';
-  import ImportPage from './components/ImportPage.svelte';
-  import PluginsPage from './components/PluginsPage.svelte';
-  import UsersPage from './components/UsersPage.svelte';
-  import ListsPage from './components/ListsPage.svelte';
-  import PublishersPage from './components/PublishersPage.svelte';
   import ProfilePage from './components/ProfilePage.svelte';
+  import LazyPage from './components/LazyPage.svelte';
   import LoginPage from './components/LoginPage.svelte';
   import AccountModal from './components/AccountModal.svelte';
   import HelpModal from './components/HelpModal.svelte';
   import { auth, loadMe, can } from './lib/auth.svelte.js';
-  import QueuePage from './components/QueuePage.svelte';
-  import ReleasesDrawer from './components/ReleasesDrawer.svelte';
   import AddModal from './components/AddModal.svelte';
   import CvPickerModal from './components/CvPickerModal.svelte';
   import IssueModal from './components/IssueModal.svelte';
@@ -38,12 +33,26 @@ import EditMetadataModal from './components/EditMetadataModal.svelte';
   import PackSearchModal from './components/PackSearchModal.svelte';
   import IndexerModal from './components/IndexerModal.svelte';
   import DialogModal from './components/DialogModal.svelte';
-  import Onboarding from './components/Onboarding.svelte';
   import Toasts from './components/Toasts.svelte';
   import ContextMenu from './components/ContextMenu.svelte';
 
-  // Section pages are always mounted (plugin slots inject into them) —
-  // a body class picks which one is visible (app.css hides .home under it).
+  const PAGES = {
+    wanted: () => import('./components/WantedPage.svelte'),
+    history: () => import('./components/HistoryPage.svelte'),
+    stats: () => import('./components/StatsPage.svelte'),
+    import: () => import('./components/ImportPage.svelte'),
+    plugins: () => import('./components/PluginsPage.svelte'),
+    queue: () => import('./components/QueuePage.svelte'),
+    releases: () => import('./components/ReleasesDrawer.svelte'),
+    users: () => import('./components/UsersPage.svelte'),
+    lists: () => import('./components/ListsPage.svelte'),
+    publishers: () => import('./components/PublishersPage.svelte'),
+  };
+  const loadOnboarding = () => import('./components/Onboarding.svelte');
+  const onboardingOpen = $derived(flags.needsOnboarding || new URLSearchParams(route.search).has('onboarding'));
+
+  // Section pages stay mounted once shown (plugin slots inject into the eager
+  // ones) — a body class picks which one is visible (app.css hides .home under it).
   const PAGE_CLASSES = {
     '/settings': 'settings', '/system': 'systempage',
     '/wanted': 'wanted', '/history': 'history', '/stats': 'stats', '/import': 'import',
@@ -85,17 +94,19 @@ import EditMetadataModal from './components/EditMetadataModal.svelte';
   const page = $derived(denied || unknown ? null : route.path);
 
   // Browser tab, history and Back button name the page, not just the app.
+  // Catalog keys, resolved inside the effect so the tab title follows the
+  // language.
   const PAGE_TITLES = {
-    '/settings': 'Settings', '/system': 'System', '/wanted': 'Wanted', '/queue': 'Queue', '/releases': 'Releases',
-    '/history': 'History', '/lists': 'Reading lists', '/import': 'Import', '/stats': 'Stats', '/plugins': 'Plugins',
-    '/users': 'Users', '/profile': 'Profile', '/publishers': 'Publishers',
+    '/settings': 'app.pageSettings', '/system': 'app.pageSystem', '/wanted': 'app.pageWanted', '/queue': 'app.pageQueue', '/releases': 'app.pageReleases',
+    '/history': 'app.pageHistory', '/lists': 'app.pageLists', '/import': 'app.pageImport', '/stats': 'app.pageStats', '/plugins': 'app.pagePlugins',
+    '/users': 'app.pageUsers', '/profile': 'app.pageProfile', '/publishers': 'app.pagePublishers',
   };
   $effect(() => {
-    let name = PAGE_TITLES[route.path] || '';
-    if (volumeId) name = detail.series?.title && detail.series.title !== 'Comic' ? detail.series.title : 'Series';
-    else if (unknown) name = 'Page not found';
-    else if (route.path === '/' && route.search.includes('collections=1')) name = 'Collections';
-    document.title = name ? `${name} · BackIssue` : 'BackIssue';
+    let name = PAGE_TITLES[route.path] ? t(PAGE_TITLES[route.path]) : '';
+    if (volumeId) name = detail.series?.title && detail.series.title !== PLACEHOLDER_TITLE ? detail.series.title : t('app.pageSeries');
+    else if (unknown) name = t('app.notFoundTitle');
+    else if (route.path === '/' && route.search.includes('collections=1')) name = t('app.pageCollections');
+    document.title = name ? `${name} · ${t('common.appName')}` : t('common.appName');
   });
 
   // Queue/Releases were drawers (?drawer=) for a while — keep old links working.
@@ -168,6 +179,10 @@ import EditMetadataModal from './components/EditMetadataModal.svelte';
     if (can('library.manage')) startOpsTracking();
     if (can('settings.manage')) loadFlags();
     loadClientPlugins();
+    // Warm the section-page chunks once the app is idle, so the first click
+    // on one doesn't wait on the network (fetch only; nothing mounts).
+    const warm = () => { for (const load of Object.values(PAGES)) load().catch(() => {}); };
+    if ('requestIdleCallback' in window) requestIdleCallback(warm, { timeout: 5000 }); else setTimeout(warm, 3000);
     // The rail effect above loads the collection as soon as auth resolves
     // (it watches `authed` too), so a second call here fetched page 1 and
     // the chip counts twice on every reload — ~200 KB and two round trips
@@ -210,10 +225,10 @@ import EditMetadataModal from './components/EditMetadataModal.svelte';
         <div class="nopage" id="nopage">
           <div class="nopage__card">
             <div class="nopage__art"><Icon name={denied ? 'shield' : 'search'} size={24} /></div>
-            <div class="nopage__title">{denied ? 'You don’t have access to this page' : 'Page not found'}</div>
-            <div class="nopage__text">{denied ? 'Your account isn’t allowed to open it. Ask an admin if you think it should be.' : 'There is nothing at this address. It may have moved, or the link is wrong.'}</div>
+            <div class="nopage__title">{denied ? t('app.noAccessTitle') : t('app.notFoundTitle')}</div>
+            <div class="nopage__text">{denied ? t('app.noAccessText') : t('app.notFoundText')}</div>
             <div class="nopage__code">{route.path}</div>
-            <div class="nopage__actions"><button class="btn" onclick={() => navigate('/')}><Icon name="home" size={14} /> Go to Home</button></div>
+            <div class="nopage__actions"><button class="btn" onclick={() => navigate('/')}><Icon name="home" size={14} /> {t('app.goHome')}</button></div>
           </div>
         </div>
       {/if}
@@ -224,17 +239,17 @@ import EditMetadataModal from './components/EditMetadataModal.svelte';
 
       <SettingsPage active={page === '/settings'} />
       <SystemPage active={page === '/system'} />
-      <WantedPage active={page === '/wanted'} />
-      <HistoryPage active={page === '/history'} />
-      <StatsPage active={page === '/stats'} />
-      <ImportPage active={page === '/import'} />
-      <PluginsPage active={page === '/plugins'} />
+      <LazyPage load={PAGES.wanted} active={page === '/wanted'} />
+      <LazyPage load={PAGES.history} active={page === '/history'} />
+      <LazyPage load={PAGES.stats} active={page === '/stats'} />
+      <LazyPage load={PAGES.import} active={page === '/import'} />
+      <LazyPage load={PAGES.plugins} active={page === '/plugins'} />
 
-      <QueuePage active={page === '/queue'} />
-      <ReleasesDrawer active={page === '/releases'} />
-      <UsersPage active={page === '/users'} />
-      <ListsPage active={page === '/lists'} />
-      <PublishersPage active={page === '/publishers'} />
+      <LazyPage load={PAGES.queue} active={page === '/queue'} />
+      <LazyPage load={PAGES.releases} active={page === '/releases'} />
+      <LazyPage load={PAGES.users} active={page === '/users'} />
+      <LazyPage load={PAGES.lists} active={page === '/lists'} />
+      <LazyPage load={PAGES.publishers} active={page === '/publishers'} />
       <ProfilePage active={page === '/profile'} />
     </main>
   </div>
@@ -252,7 +267,7 @@ import EditMetadataModal from './components/EditMetadataModal.svelte';
 <PackSearchModal />
 <IndexerModal />
 <DialogModal />
-<Onboarding />
+<LazyPage load={loadOnboarding} active={onboardingOpen} />
 
 <Toasts />
 <ContextMenu />

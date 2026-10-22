@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { issueNumberFromTitle } from './matcher.js';
-import { listSeries, listIssues, getSeriesById, getScanOverride } from './db.js';
+import { seriesTitleCandidates } from './db.js';
 import { scoreMatch, normalizeNumber, normalizeTitle, extractYear } from './matcher.js';
 import { detectEdition } from './editions.js';
 import { readArchiveInfo } from './archive.js';
@@ -23,16 +23,6 @@ export function issueKey(title, number) {
   if (n) return n;
   const slug = String(title).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
   return slug ? 'name:' + slug : '';
-}
-
-// Human-readable label for the report: "Annual 1", "TPB 2", "12", or — for a
-// numberless issue — its title.
-export function issueLabel(title, number) {
-  const ed = detectEdition(title);
-  if (ed) return ed.type + (ed.num != null ? ' ' + ed.num : '');
-  const n = normalizeNumber(number);
-  if (n) return String(number);
-  return String(title || '');
 }
 
 // Parse the issue number out of a comic filename. Handles "Series V1999 #001",
@@ -192,45 +182,17 @@ function comicVineIds(ci) {
   return out;
 }
 
-// List series-level folders, including empty ones. The depth of series folders
-// is discovered from the files (each comic file's dir IS a series folder), so we
-// enumerate every sibling folder under those same publishers. Layout-agnostic:
-// works whether scanDir is the library root or a single publisher folder. Skips
-// hidden/system dirs (., @eaDir, ...).
-export async function findSeriesFolders(files) {
-  const parents = new Set(files.map((f) => path.dirname(f.dir))); // publisher dirs
-  const ok = (name) => !/^[.@]/.test(name);
-  const out = [];
-  for (const parent of parents) {
-    let entries;
-    try { entries = await fs.readdir(parent, { withFileTypes: true }); } catch { continue; }
-    for (const e of entries) {
-      if (e.isDirectory() && ok(e.name)) out.push(path.join(parent, e.name));
-    }
-  }
-  return out;
-}
-
-// Catalog issues whose edition-aware key isn't on disk. Editions (Annual/TPB/
-// Special) match only their own kind, never the regular run.
-export function findMissing(issues, present) {
-  const missing = [];
-  for (const i of issues) {
-    const key = issueKey(i.title, i.issue_number);
-    if (key === '') continue; // no usable number/edition -> skip
-    if (!present.has(key)) missing.push({ id: i.id, number: i.issue_number, title: i.title, label: issueLabel(i.title, i.issue_number) });
-  }
-  return missing;
-}
-
 // Recursively collect comic archives under dir. Unreadable/permission-denied
-// folders are skipped, not fatal.
+// folders are skipped, not fatal — but listed on the result's `failedDirs`, so
+// a caller that prunes "files not seen" can leave those subtrees alone (a
+// transient share error is not a deletion).
 export async function findComicFiles(dir) {
   const out = [];
+  out.failedDirs = [];
   async function walk(d) {
     let entries;
     try { entries = await fs.readdir(d, { withFileTypes: true }); }
-    catch { return; }
+    catch { out.failedDirs.push(d); return; }
     for (const e of entries) {
       const p = path.join(d, e.name);
       if (e.isDirectory()) await walk(p);
@@ -242,63 +204,18 @@ export async function findComicFiles(dir) {
 }
 
 // Best catalog series for a scanned folder name (local catalog only, no network).
-export function matchCatalogSeries(db, name, year) {
+// `memo` (optional Map) caches the candidate list per search word for a scan.
+export function matchCatalogSeries(db, name, year, memo = null) {
   const word = normalizeTitle(name).split(' ')[0];
   if (!word) return null;
   let best = null;
-  for (const c of listSeries(db, { search: word })) {
+  const k = `w:${word}`;
+  let candidates = memo?.get(k);
+  if (!candidates) { candidates = seriesTitleCandidates(db, word); memo?.set(k, candidates); }
+  for (const c of candidates) {
     const { confidence } = scoreMatch({ name, year }, c.title);
     if (!best || RANK[confidence] > RANK[best.confidence]) best = { seriesId: c.id, title: c.title, confidence };
   }
   return best && RANK[best.confidence] >= RANK.low ? best : null;
 }
 
-// Walk a library folder, match each series to the catalog, and report missing.
-export async function scanLibrary({ db, dir, onProgress = () => {} }) {
-  const files = await findComicFiles(dir);
-  const groups = groupSeries(files, await findSeriesFolders(files));
-  const series = [];
-  let done = 0;
-  for (const g of groups) {
-    // A saved manual override (from "Fix match") wins over the fuzzy match.
-    let match = null;
-    const overrideId = getScanOverride(db, g.dir);
-    if (overrideId != null) {
-      const orow = getSeriesById(db, overrideId);
-      if (orow) match = { seriesId: overrideId, title: orow.title, confidence: 'manual' };
-    }
-    if (!match) match = matchCatalogSeries(db, g.seriesName, extractYear(g.seriesName));
-    if (!match) {
-      series.push({ seriesName: g.seriesName, publisher: g.publisher, dir: g.dir, present: [...g.present], have: g.present.size, total: null, matchedTitle: null, confidence: 'none', matched: null, missing: [], unmatched: true });
-    } else {
-      const all = listIssues(db, { seriesId: match.seriesId });
-      const row = getSeriesById(db, match.seriesId);
-      series.push({
-        seriesName: g.seriesName, publisher: g.publisher, dir: g.dir, present: [...g.present],
-        have: g.present.size, total: all.length, matchedTitle: match.title, confidence: match.confidence,
-        matched: { id: row.id, title: row.title, url: row.url, publisher: row.publisher, cover_url: row.cover_url, followed: row.followed, issue_count: all.length },
-        missing: findMissing(all, g.present), unmatched: false,
-      });
-    }
-    onProgress({ done: ++done, total: groups.length, seriesName: g.seriesName });
-  }
-  series.sort((a, b) => (a.publisher || '').localeCompare(b.publisher || '') || a.seriesName.localeCompare(b.seriesName));
-  return { dir, series };
-}
-
-// Re-link a scan report entry to a manually chosen catalog series, recomputing
-// total/missing/matched against that series using the entry's stored present
-// keys. Mutates and returns the entry, or null if the series doesn't exist.
-export function relinkScanEntry(db, entry, seriesId) {
-  const row = getSeriesById(db, seriesId);
-  if (!row) return null;
-  const all = listIssues(db, { seriesId });
-  const present = new Set(entry.present || []);
-  entry.matchedTitle = row.title;
-  entry.confidence = 'manual';
-  entry.unmatched = false;
-  entry.total = all.length;
-  entry.missing = findMissing(all, present);
-  entry.matched = { id: row.id, title: row.title, url: row.url, publisher: row.publisher, cover_url: row.cover_url, followed: row.followed, issue_count: all.length };
-  return entry;
-}
